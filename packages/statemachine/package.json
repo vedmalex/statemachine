@@ -1,0 +1,33 @@
+{
+  "name": "@vedmalex/statemachine",
+  "version": "1.0.0-beta.0",
+  "description": "Hierarchical state machine for TypeScript with monitoring, validation, and persistence (lite-only DI-free surface).",
+  "keywords": ["state-machine", "statemachine", "hierarchical", "lite", "wasm-friendly"],
+  "author": "vedmalex (Vedanta-krit das)",
+  "license": "MIT",
+  "sideEffects": false,
+  "type": "module",
+  "module": "./dist/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "src", "types", "README.md", "LICENSE"],
+  "scripts": {
+    "clean": "rm -rf dist types tsconfig.tsbuildinfo",
+    "build": "bun run clean && tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run build && test -f dist/index.js && test -f types/index.d.ts"
+  },
+  "dependencies": {},
+  "peerDependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.2.16",
+    "typescript": "^5.6.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
