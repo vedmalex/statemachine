@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!--
+  CONTRACT: this fixture MUST live exactly one directory above dist/.
+  The relative import `../dist/index.js` resolves from this file's URL.
+  If relocating this file, update the import path accordingly OR switch
+  to a static-server fixture with absolute paths.
+-->
+<html>
+<head><meta charset="utf-8"><title>statemachine browser smoke</title></head>
+<body>
+<script type="module">
+  import { createMachine } from '../dist/index.js'
+  try {
+    const m = createMachine({ name: 'browser-smoke', initialState: 's', states: { s: {} }, events: {} })
+    if (typeof m !== 'object' || m === null) throw new Error('createMachine returned non-object')
+    window.__statemachineSmokePassed = true
+  } catch (e) {
+    console.error('Browser smoke:', e.message)
+  }
+</script>
+</body>
+</html>

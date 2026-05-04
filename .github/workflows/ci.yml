@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+defaults:
+  run:
+    working-directory: packages/statemachine
+
+jobs:
+  tier-a-bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: latest }
+      - run: bun install
+        working-directory: .
+      - run: bun run build
+      - run: bun run test
+      - run: bun run knip
+      - run: bun run test:cjs-smoke
+      - run: node test/verify-dist.cjs
+
+  tier-a-node:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ matrix.node-version }}" }
+      - run: npm install
+        working-directory: .
+      - run: npm run build
+      - run: npm test
+      - run: npm run knip
+      - run: npm run test:cjs-smoke
+      - run: node test/verify-dist.cjs
+      - if: matrix.node-version == 20
+        run: npm run test:coverage
+      - if: matrix.node-version == 20
+        run: npm run api:check
+      - if: matrix.node-version == 20
+        run: git diff --exit-code etc/statemachine.api.md
+
+  tier-b-deno:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: denoland/setup-deno@v1
+        with: { deno-version: vx.x.x }
+      - run: npm install
+        working-directory: .
+      - run: npm run build
+      - run: npm run test:deno-smoke
+
+  tier-b-browser:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm install
+        working-directory: .
+      - run: npm run build
+      - run: npx playwright install chromium --with-deps
+      - run: npm run test:browser

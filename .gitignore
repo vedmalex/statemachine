@@ -5,3 +5,4 @@ types/
 *.tsbuildinfo
 .DS_Store
 coverage/
+temp/

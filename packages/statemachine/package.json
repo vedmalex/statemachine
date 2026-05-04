@@ -5,33 +5,55 @@
   "keywords": ["state-machine", "statemachine", "hierarchical", "lite", "wasm-friendly"],
   "author": "vedmalex (Vedanta-krit das)",
   "license": "MIT",
+  "homepage": "https://github.com/vedmalex/statemachine#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vedmalex/statemachine.git",
+    "directory": "packages/statemachine"
+  },
+  "bugs": {
+    "url": "https://github.com/vedmalex/statemachine/issues"
+  },
   "sideEffects": false,
   "type": "module",
+  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./types/index.d.ts",
   "exports": {
     ".": {
       "types": "./types/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     }
   },
   "files": ["dist", "types", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
   "scripts": {
-    "clean": "rm -rf dist types tsconfig.tsbuildinfo coverage",
-    "build": "bun run clean && tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist types coverage tsconfig.tsbuildinfo",
+    "build": "npm run clean && tsup && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "test:cjs-smoke": "node test/cjs-smoke/smoke.cjs",
+    "test:deno-smoke": "deno run -A test/deno-smoke.ts",
+    "test:browser": "playwright test",
     "knip": "knip --no-progress",
-    "prepublishOnly": "bun run build && test -f dist/index.js && test -f types/index.d.ts"
+    "api:check": "api-extractor run --local --verbose",
+    "prepublishOnly": "npm run build && node test/verify-dist.cjs"
   },
   "dependencies": {},
   "peerDependencies": {},
   "devDependencies": {
+    "@changesets/cli": "^2.31.0",
+    "@microsoft/api-extractor": "^7.58.7",
+    "@playwright/test": "^1.59.1",
     "@types/bun": "^1.2.16",
+    "@types/node": "^25.6.0",
     "@vitest/coverage-istanbul": "^4.1.5",
     "@vitest/coverage-v8": "^4.1.5",
     "knip": "^6.11.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.6.0",
     "vitest": "^4.1.5"
   },

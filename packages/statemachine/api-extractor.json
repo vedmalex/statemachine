@@ -1,0 +1,22 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/api-extractor/v7/api-extractor.schema.json",
+  "mainEntryPointFilePath": "<projectFolder>/types/index.d.ts",
+  "compiler": {
+    "tsconfigFilePath": "<projectFolder>/tsconfig.build.json"
+  },
+  "apiReport": {
+    "enabled": true,
+    "reportFolder": "<projectFolder>/etc/",
+    "reportFileName": "statemachine.api.md"
+  },
+  "dtsRollup": {
+    "enabled": false
+  },
+  "docModel": { "enabled": false },
+  "tsdocMetadata": { "enabled": false },
+  "messages": {
+    "extractorMessageReporting": {
+      "default": { "logLevel": "warning" }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install
+        working-directory: .
+      - run: npm run build
+        working-directory: packages/statemachine
+      - run: node test/verify-dist.cjs
+        working-directory: packages/statemachine
+      - run: npm run knip
+        working-directory: packages/statemachine
+      - run: npx changeset publish
+        working-directory: packages/statemachine
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
