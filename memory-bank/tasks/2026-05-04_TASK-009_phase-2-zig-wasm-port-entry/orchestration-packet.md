@@ -38,15 +38,21 @@ This packet drives Phase 2 entry decomposition. It is the canonical input for `m
 
 ```
 TASK-010 Zig toolchain + WASM build (A)
-  └── TASK-011 Core types port (B) ──┐
-       └── TASK-012 StateMachine core (C) ──┐
-            ├── TASK-013 EP shims (D) ──────┤
-            └── TASK-014 ABI parity tests (E)
-                 └── TASK-015 Multi-runtime smoke (F)
+  └── TASK-011 Core types port (B)
+        ├── TASK-012 StateMachine core (C) ──┐
+        │                                    │
+        └── TASK-013 EP shims (D) ───────────┤
+                                             │
+              TASK-014 ABI parity tests (E) ◄┘   (E waits for both C and D)
+                └── TASK-015 Multi-runtime smoke (F)
                       └── TASK-016 Bundle + perf (G)
 ```
 
-Critical path: A → B → C → E → F → G. Parallel cluster: D || (C+E).
+Critical path: A → B → C → E → F → G. Parallel cluster after B: C || D (both depend on B; E waits for both).
+
+> **Note (DA finding F-VAN-C2-2 fix)**: D was previously drawn as a child of C; corrected to show D as a sibling of C, both depending on B. Cluster C dispatch instructions in §`Execution timeline` (TASK-012 + TASK-013 parallel after B.ARCHIVE) match this corrected DAG.
+
+> **Note (DA finding F-VAN-C2-1)**: TASK-012 is currently sized as T4:standard but will be re-evaluated in CREATIVE/PLAN as a likely T5:epic candidate. If escalated, TASK-012 should be decomposed into sub-tasks (e.g., flat-state core, nested/parallel state regions, adapter integration) before subagent dispatch.
 
 ### Stop conditions
 

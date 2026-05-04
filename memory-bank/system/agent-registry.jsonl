@@ -3,3 +3,8 @@
 {"event":"agent_registered","id":"mb3-tester","role":"QA verification + qa.md authoring","ts":"2026-05-04"}
 {"event":"agent_registered","id":"mb3-planner","role":"CREATIVE/PLAN authoring assistant","ts":"2026-05-04"}
 {"event":"agent_registered","id":"mb3-smart-executor","role":"orchestration packet execution","ts":"2026-05-04"}
+{"event":"agent_heartbeat","id":"mb3-critic","status":"offline","lastHeartbeat":"2026-05-04","ts":"2026-05-04T13:55:34Z"}
+{"event":"agent_heartbeat","id":"mb3-implementer","status":"offline","lastHeartbeat":"2026-05-04","ts":"2026-05-04T13:55:34Z"}
+{"event":"agent_heartbeat","id":"mb3-tester","status":"offline","lastHeartbeat":"2026-05-04","ts":"2026-05-04T13:55:34Z"}
+{"event":"agent_heartbeat","id":"mb3-planner","status":"offline","lastHeartbeat":"2026-05-04","ts":"2026-05-04T13:55:34Z"}
+{"event":"agent_heartbeat","id":"mb3-smart-executor","status":"offline","lastHeartbeat":"2026-05-04","ts":"2026-05-04T13:55:34Z"}
