@@ -5,6 +5,15 @@
  * Post TD-T3-4 pruning, symbols from this module are not reachable from `dist/index.js` —
  * the deprecation has no public deprecation cycle, only source-tree intent.
  *
+ * Governance treatments (multi-treatment file, per TASK-003 CODE_REVIEW F-CR3-8):
+ *   - tsconfig.json `include: ["src/**\/*"]` — typechecked under strict TS for now
+ *   - vitest.config.ts `coverage.exclude` — excluded from coverage instrumentation
+ *   - knip.json `ignore` — excluded from unused-export warnings
+ *   - package.json `files: ["dist", "types", ...]` — NOT shipped to npm (since TASK-003 CODE_REVIEW F-CR3-1)
+ *
+ * Removal trigger: when no in-tree code references the file (currently `src/tests/security.test.ts`
+ * does), delete the file plus its test plus all four governance-list entries above.
+ *
  * Security module for safe function serialization and validation
  * Replaces unsafe `new Function()` usage with secure alternatives
  */

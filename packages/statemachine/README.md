@@ -42,9 +42,15 @@ The Phase 1 bootstrap copied several modules as-is from the legacy `@grainjs/sta
 
 - **`TimerScheduler.getInstance()`** in `src/scheduler.ts` — module-level singleton — owner: TASK-004 (singleton elimination).
 - **`globalStateMachineMonitor`** in `src/monitoring.ts` and the `IMonitor` interface signature mismatch — tracked as `ISS-007` (signature alignment) and `ISS-008` (singleton removal) — owner: TASK-004.
-- **`globalErrorHandler`** re-exported from `src/index.ts` via `error_handling.ts` — owner: TASK-004.
+- **`globalErrorHandler`** in `src/error_handling.ts` — owner: TASK-004 (re-export was removed from `src/index.ts` in TASK-003 CODE_REVIEW per Q7; only the internal symbol remains pending TASK-004 removal).
 
-A full review trail (Sustainability lens) for the Phase 1 bootstrap lives at `memory-bank/tasks/2026-05-03_TASK-002_core-extraction-and-monorepo-bootstrap/code-review.md` in the MB3 work tree (see root README).
+## Build-time constraints
+
+- **`tsconfig.moduleResolution = "bundler"`** — TASK-003 TD-T3-5 / F-CR-4 conditional closure. Downstream tasks (TASK-005 CI/CD + CJS) MUST keep an import-rewriting bundler (`tsup`, `esbuild`, `rollup` with `node-resolve`, `vite build` library mode). Flipping to a non-rewriting toolchain (raw `tsc --module commonjs`) requires upgrading `moduleResolution` to `"node16"`/`"nodenext"` first and migrating all internal imports to use `.js` extensions explicitly.
+- **knip ignore-list cap = 5 entries** — TASK-003 PLAN F-PL-5 governance. Adding a 6th ignore requires either removing an existing one OR opening a new DA review against the Sustainability lens. Currently 2/5 used (`ValidationConfig`, `MonitoringConfig`).
+- **`@stable` public surface** — 5 firm symbols (`createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`). Changing their signatures is a 1.0.0-stable breaking change. The `src/tests/public_surface.test.ts` ratchet test enforces non-regression at CI time.
+
+A full review trail for Phase 1 lives in the MB3 work tree (see root README): `memory-bank/tasks/2026-05-03_TASK-002_.../code-review.md` (bootstrap) and `memory-bank/tasks/2026-05-03_TASK-003_.../code-review.md` (quality baseline).
 
 ## License
 

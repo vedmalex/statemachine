@@ -250,16 +250,9 @@ export interface StateMachineConfig<T extends object = object> {
   onError?: KeysOf<T, ErrorHandler<T>>
 }
 
-export type Adaptee<T extends object> = T extends StateMachineConfig<infer Obj>
-  ? Adapter<Obj>
-  : never
-
-export type Configuree<T extends object> = T extends StateMachineConfig<
-  infer Obj
->
-  ? Obj
-  : never
-export type Config<T extends object> = StateMachineConfig<T>
+// `Adaptee<T>`, `Configuree<T>`, and `Config<T>` type-utilities were removed in TASK-003 CODE_REVIEW.
+// They had zero internal usage and were not exported from the curated public surface (TD-T3-4).
+// If a downstream consumer use case emerges, re-introduce as `export type` and add to `src/index.ts`.
 
 // New interface for state persistence
 export interface StatePersistenceAdapter {

@@ -15,7 +15,7 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "src", "types", "README.md", "LICENSE"],
+  "files": ["dist", "types", "README.md", "LICENSE"],
   "scripts": {
     "clean": "rm -rf dist types tsconfig.tsbuildinfo coverage",
     "build": "bun run clean && tsc -p tsconfig.build.json",
