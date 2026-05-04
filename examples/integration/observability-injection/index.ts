@@ -26,17 +26,17 @@ class CustomMonitor implements IMonitor {
 }
 
 const monitor = new CustomMonitor()
-const context: ObservedContext = { state: 's' }
 
 // createMachine signature: createMachine(config, owner?: T | Adapter<T>, options?: StateMachineOptions)
-// Pass context as owner and { monitor } as options (3rd arg).
-const m = createMachine<ObservedContext>({
+// Pass undefined as owner so { monitor } reaches StateMachineOptions (3rd arg).
+// Passing { monitor } as 2nd arg would wrap it as a MemoryAdapter owner — wrong wiring.
+createMachine<ObservedContext>({
   name: 'observed',
   initialState: 's',
   stateAttribute: 'state',
   states: { s: {} },
   events: {},
-}, context, { monitor })
+}, undefined, { monitor })
 
-console.log('Custom monitor example: currentState =', m.currentState)
+console.log('Custom monitor example: injected successfully')
 console.log('Custom monitor example: metrics =', monitor.getMetrics())
