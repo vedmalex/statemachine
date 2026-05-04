@@ -381,6 +381,7 @@ describe('TimerScheduler branch coverage', () => {
   afterEach(() => {
     scheduler.clear()
     scheduler.stop()
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -1177,6 +1178,7 @@ describe('PerformanceMonitor branch coverage', () => {
   })
 
   afterEach(() => {
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -1272,6 +1274,7 @@ describe('HealthChecker branch coverage', () => {
   })
 
   afterEach(() => {
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -1341,6 +1344,7 @@ describe('StateMachineMonitor full cycle', () => {
   })
 
   afterEach(() => {
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -1762,6 +1766,7 @@ describe('TimerScheduler full branch coverage', () => {
   afterEach(() => {
     scheduler.clear()
     scheduler.stop()
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -2304,6 +2309,7 @@ describe('StateMachine resumeTimers with invoke', () => {
 
   afterEach(() => {
     // TASK-004: no global singleton to clean up; each SM has its own scheduler
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
@@ -2375,6 +2381,7 @@ describe('StateMachine setTimer with active TimerScheduler', () => {
   afterEach(() => {
     sharedScheduler.clear()
     sharedScheduler.stop()
+    vi.clearAllTimers()
     vi.useRealTimers()
   })
 
