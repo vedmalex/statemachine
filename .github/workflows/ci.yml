@@ -39,7 +39,8 @@ jobs:
         working-directory: .
       - run: npm run build
       - run: npm test
-      - run: npm run knip
+      - if: matrix.node-version == 20
+        run: npm run knip
       - run: npm run test:cjs-smoke
       - run: node test/verify-dist.cjs
       - if: matrix.node-version == 20
