@@ -6,24 +6,41 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      # setup-node creates ~/.npmrc with `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`.
+      # bun publish honors the same .npmrc, so this is the canonical way to authenticate
+      # both `npm publish` and `bun publish` in GitHub Actions.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
       - uses: oven-sh/setup-bun@v2
-      # `bun install` supports workspace:* protocol natively (npm install does not — see https://github.com/oven-sh/bun/blob/main/docs/pm/workspaces.mdx).
-      # Examples in examples/integration/* depend on the package via workspace:*; that resolves only under bun's package manager.
+
+      # bun install supports workspace:* protocol natively (npm install does not).
       - run: bun install
         working-directory: .
+
       - run: bun run build
         working-directory: packages/statemachine
       - run: node test/verify-dist.cjs
         working-directory: packages/statemachine
       - run: bun run knip
         working-directory: packages/statemachine
-      # bun publish automatically strips catalog and workspace protocols from package.json before publishing
-      # (https://github.com/oven-sh/bun/blob/main/docs/pm/cli/publish.mdx).
-      # workspace:* → resolved to actual version at publish time.
-      - run: bun publish --access public
+
+      # bun publish:
+      # - automatically strips workspace: protocol from package.json before publishing
+      #   (workspace:* → resolved to actual version)
+      # - reads the ~/.npmrc auth token from NODE_AUTH_TOKEN (created by setup-node above)
+      # - --tag beta routes the publish to the `beta` dist-tag instead of default `latest`,
+      #   which is required for pre-release versions like 1.0.0-beta.1
+      - run: bun publish --access public --tag beta
         working-directory: packages/statemachine
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
