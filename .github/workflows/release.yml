@@ -13,14 +13,6 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # setup-node creates ~/.npmrc with `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`.
-      # bun publish honors the same .npmrc, so this is the canonical way to authenticate
-      # both `npm publish` and `bun publish` in GitHub Actions.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
-
       - uses: oven-sh/setup-bun@v2
 
       # bun install supports workspace:* protocol natively (npm install does not).
@@ -34,13 +26,21 @@ jobs:
       - run: bun run knip
         working-directory: packages/statemachine
 
+      # Write ~/.npmrc with the resolved token directly (NOT ${NODE_AUTH_TOKEN} placeholder).
+      # bun publish does NOT perform env-var substitution in .npmrc; it reads the file literally.
+      # actions/setup-node's auto-generated .npmrc uses the placeholder syntax which only npm
+      # CLI expands at runtime. For bun publish to authenticate, the resolved token must be
+      # written into the file directly.
+      - name: Configure npm auth for bun publish
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          echo "registry=https://registry.npmjs.org/" >> ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       # bun publish:
       # - automatically strips workspace: protocol from package.json before publishing
-      #   (workspace:* → resolved to actual version)
-      # - reads the ~/.npmrc auth token from NODE_AUTH_TOKEN (created by setup-node above)
-      # - --tag beta routes the publish to the `beta` dist-tag instead of default `latest`,
-      #   which is required for pre-release versions like 1.0.0-beta.1
+      # - reads ~/.npmrc (now with literal resolved token) for auth
+      # - --tag beta routes pre-release versions to the `beta` dist-tag instead of default `latest`
       - run: bun publish --access public --tag beta
         working-directory: packages/statemachine
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
