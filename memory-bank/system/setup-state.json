@@ -1,0 +1,9 @@
+{
+  "phase": "ready",
+  "mb3Initialized": "2026-05-04",
+  "mb3Version": "3.0",
+  "primaryPackage": "packages/statemachine",
+  "mbPlacement": "root",
+  "previousWorkTree": "/Users/vedmalex/work/grainjs-prod/packages/statemachine/memory-bank/",
+  "migrationNote": "Phase 1 (RM-001-P01) artifacts remain at the legacy work tree for historical reference. All new tasks (TASK-009+) are authored in this work tree."
+}

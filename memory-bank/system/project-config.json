@@ -1,0 +1,20 @@
+{
+  "projectName": "@vedmalex/statemachine",
+  "projectRoot": "/Users/vedmalex/work/statemachine",
+  "mbPlacement": "root",
+  "sourceRoots": [
+    "packages/statemachine/src/",
+    "examples/integration/"
+  ],
+  "excludePatterns": [
+    "node_modules",
+    "dist",
+    "types",
+    "coverage",
+    "docs/api-html",
+    ".git",
+    "*.lock",
+    "bun.lock"
+  ],
+  "primaryPackage": "packages/statemachine"
+}
