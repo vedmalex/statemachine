@@ -5,3 +5,4 @@
 {"event":"task_archived","id":"TASK-006","name":"API docs, extension-point catalog, examples cookbook, ABI tests","tier":"T4:standard","status":"archived","tag":"task-006-docs-stable","commit":"2df4074","ts":"2026-05-04"}
 {"event":"task_archived","id":"TASK-007","name":"First 1.0.0-beta.x publish to public npm with stability policy","tier":"T2:quick","status":"archived","tag":"task-007-published-stable","commit":"b0492df","npm_published":"@vedmalex/statemachine@1.0.0-beta.1","ts":"2026-05-04"}
 {"event":"task_archived","id":"TASK-008","name":"Init MB3 in standalone monorepo (post-roadmap)","tier":"T2:quick","status":"archived","commit":"<pending>","ts":"2026-05-04"}
+{"event":"task_created","id":"TASK-009","name":"Phase 2 entry — zig-wasm-port","tier":"T5:epic","status":"active","phase":"VAN","parent":"TASK-001","roadmap_phase":"RM-001-P02","ts":"2026-05-04"}

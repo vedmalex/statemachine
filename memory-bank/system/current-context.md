@@ -33,11 +33,19 @@ Full Phase 1 task artifacts (creative-decisions/plan/tech_spec/implementation/qa
 
 ## Active Task
 
-None — Phase 1 closed; awaiting next operator-initiated task.
+**TASK-009 — Phase 2 entry: zig-wasm-port (RM-001-P02)** — Phase: VAN.
+
+Path: `memory-bank/tasks/2026-05-04_TASK-009_phase-2-zig-wasm-port-entry/`
+
+Inputs prepared:
+- `_task.md` — scope, open questions Q-T9-1..Q-T9-10, child-task hypothesis (TASK-010..016)
+- `orchestration-packet.md` — Phase 2 starter packet for `mb3-smart-executor`
+
+Next: VAN exit → CREATIVE → PLAN (locks child-task DAG) → `taskDecompose` function gate via `mb3-critic` → child dispatch.
 
 ## Active Roadmap
 
-- **RM-001 Statemachine Standalone Evolution** — Phase 1 (P01 bootstrap-extraction) CLOSED. Phase 2 (P02 zig-wasm-port) NOT auto-started; explicit operator decision required to enter Phase 2.
+- **RM-001 Statemachine Standalone Evolution** — Phase 1 (P01 bootstrap-extraction) CLOSED. Phase 2 (P02 zig-wasm-port) ACTIVE via TASK-009 VAN entry.
 
 ## Known carry-forwards from Phase 1
 

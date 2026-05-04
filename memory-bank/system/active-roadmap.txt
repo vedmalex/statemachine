@@ -1,1 +1,1 @@
-RM-001 (Phase 1 P01 closed; Phase 2 P02 zig-wasm-port not auto-started)
+RM-001 (Phase 1 P01 closed; Phase 2 P02 zig-wasm-port — TASK-009 active VAN)
