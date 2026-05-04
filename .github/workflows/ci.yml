@@ -36,7 +36,6 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "${{ matrix.node-version }}" }
       - run: npm install
-        working-directory: .
       - run: npm run build
       - run: npm test
       - if: matrix.node-version == 20
@@ -60,7 +59,6 @@ jobs:
       - uses: denoland/setup-deno@v1
         with: { deno-version: vx.x.x }
       - run: npm install
-        working-directory: .
       - run: npm run build
       - run: npm run test:deno-smoke
 
@@ -72,7 +70,6 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - run: npm install
-        working-directory: .
       - run: npm run build
       - run: npx playwright install chromium --with-deps
       - run: npm run test:browser
