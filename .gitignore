@@ -6,3 +6,4 @@ types/
 .DS_Store
 coverage/
 temp/
+docs/api-html/

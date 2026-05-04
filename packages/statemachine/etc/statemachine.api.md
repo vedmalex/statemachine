@@ -228,6 +228,46 @@ export class FallbackStateRecoveryStrategy implements ErrorRecoveryStrategy {
     recover(error: EnhancedStateMachineError, context: any): Promise<boolean>;
 }
 
+// @public
+export interface IErrorHandler {
+    // (undocumented)
+    addRecoveryStrategy(strategy: ErrorRecoveryStrategy): void;
+    // (undocumented)
+    disable(): void;
+    // (undocumented)
+    enable(): void;
+    // (undocumented)
+    getAnalytics(): ErrorAnalytics;
+    // (undocumented)
+    isEnabled(): boolean;
+    // (undocumented)
+    removeRecoveryStrategy(strategyName: string): void;
+}
+
+// @public (undocumented)
+export interface ILogger {
+    // (undocumented)
+    debug(message: string, context?: any): void;
+    // (undocumented)
+    error(message: string, context?: any, error?: Error): void;
+    // (undocumented)
+    info(message: string, context?: any): void;
+    // (undocumented)
+    warn(message: string, context?: any, error?: Error): void;
+}
+
+// @public
+export interface IMonitor {
+    // (undocumented)
+    getMetrics?(): MonitorMetricsSnapshot;
+    // (undocumented)
+    recordError(error: Error, context?: ErrorContext): void;
+    // (undocumented)
+    recordEvent?(eventName: string, duration: number): void;
+    // (undocumented)
+    recordTransition(duration: number, success: boolean, context?: TransitionContext): void;
+}
+
 // @public (undocumented)
 export function isAdapter<T extends object>(inp: unknown): inp is Adapter<T>;
 
@@ -237,13 +277,21 @@ export function isRecoverableError(error: Error): boolean;
 // @public (undocumented)
 export function isValidConfig<T extends object>(config: StateMachineConfig<T>): boolean;
 
+// @public
+export interface ITimerScheduler {
+    // (undocumented)
+    cancel(token: object): void;
+    // (undocumented)
+    isActive(): boolean;
+    // (undocumented)
+    schedule(delay: number, callback: () => void): object;
+}
+
 // @public (undocumented)
 export type KeysOf<T, R> = {
     [K in keyof T]: T[K] extends R ? K : never;
 }[keyof T];
 
-// Warning: (ae-forgotten-export) The symbol "StatePersistenceAdapter" needs to be exported by the entry point index.d.ts
-//
 // @public (undocumented)
 export class LocalStorageAdapter<T extends object> implements Adapter<T>, StatePersistenceAdapter {
     constructor(data: T, storageKey?: string);
@@ -286,6 +334,18 @@ export class MemoryAdapter<T extends object> implements Adapter<T>, StatePersist
 export type MethodsOf<T> = {
     [K in keyof T as T[K] extends (...args: any[]) => any ? K : never]: T[K];
 };
+
+// @public
+export interface MonitorMetricsSnapshot {
+    // (undocumented)
+    averageDuration: number;
+    // (undocumented)
+    errorCount: number;
+    // (undocumented)
+    successCount: number;
+    // (undocumented)
+    totalTransitions: number;
+}
 
 // @public (undocumented)
 export type NestedStateName<S> = {
@@ -476,22 +536,14 @@ export class StateMachineError extends Error {
 // @public (undocumented)
 export interface StateMachineOptions {
     abortOnExitError?: boolean;
-    // Warning: (ae-forgotten-export) The symbol "IErrorHandler" needs to be exported by the entry point index.d.ts
-    //
     // (undocumented)
     errorHandler?: IErrorHandler;
     errorState?: string;
-    // Warning: (ae-forgotten-export) The symbol "ILogger" needs to be exported by the entry point index.d.ts
-    //
     // (undocumented)
     logger?: ILogger;
     maxQueueDepth?: number;
-    // Warning: (ae-forgotten-export) The symbol "IMonitor" needs to be exported by the entry point index.d.ts
-    //
     // (undocumented)
     monitor?: IMonitor;
-    // Warning: (ae-forgotten-export) The symbol "ITimerScheduler" needs to be exported by the entry point index.d.ts
-    //
     // (undocumented)
     scheduler?: ITimerScheduler;
     transitionTimeout?: number;
@@ -502,6 +554,22 @@ export type StateName = string;
 
 // @public (undocumented)
 export type StatePaths<S> = SimpleStateName<S> | RegionStateName<S> | NestedStateName<S> | DeepNestedStateName<S>;
+
+// @public (undocumented)
+export interface StatePersistenceAdapter {
+    // (undocumented)
+    restore(): Promise<{
+        currentState: string;
+        history: any;
+        stateEntryTimes: any;
+    }>;
+    // (undocumented)
+    save(state?: {
+        currentState: string;
+        history: any;
+        stateEntryTimes: any;
+    }): Promise<void>;
+}
 
 // @public (undocumented)
 export type States<T extends object> = Record<StateName, Omit<State<T>, 'name'>>;
@@ -515,6 +583,16 @@ export type Transition<T extends object, S extends States<T>> = {
     onTransition?: ActionOrString<T>;
     onError?: ErrorHandlerOrString<T>;
 };
+
+// @public
+export interface TransitionContext {
+    // (undocumented)
+    eventName?: string;
+    // (undocumented)
+    fromState: string;
+    // (undocumented)
+    toState: string;
+}
 
 // Warning: (ae-forgotten-export) The symbol "ValidationConfig" needs to be exported by the entry point index.d.ts
 //

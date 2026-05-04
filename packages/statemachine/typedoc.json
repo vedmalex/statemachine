@@ -1,0 +1,16 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/index.ts"],
+  "tsconfig": "tsconfig.json",
+  "out": "docs/api-html",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "excludeProtected": true,
+  "categorizeByGroup": true,
+  "categoryOrder": ["Stable", "Unstable", "*"],
+  "readme": "none",
+  "navigationLinks": {
+    "GitHub": "https://github.com/vedmalex/statemachine",
+    "npm": "https://www.npmjs.com/package/@vedmalex/statemachine"
+  }
+}

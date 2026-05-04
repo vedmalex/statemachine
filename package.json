@@ -2,7 +2,7 @@
   "name": "@vedmalex/statemachine-monorepo",
   "private": true,
   "version": "0.0.0",
-  "workspaces": ["packages/*"],
+  "workspaces": ["packages/*", "examples/integration/*"],
   "author": "vedmalex (Vedanta-krit das)",
   "license": "MIT",
   "description": "Monorepo root for @vedmalex/statemachine and future integration packages."

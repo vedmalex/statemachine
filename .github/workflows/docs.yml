@@ -1,0 +1,33 @@
+name: Docs
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/statemachine/src/**'
+      - 'packages/statemachine/typedoc.json'
+      - 'packages/statemachine/docs/**'
+      - 'packages/statemachine/README.md'
+      - '.github/workflows/docs.yml'
+permissions:
+  contents: write
+defaults:
+  run:
+    working-directory: packages/statemachine
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v1
+      - run: bun install
+        working-directory: .
+      - run: bun run build
+      - run: bunx typedoc
+      - name: Verify docs output non-empty
+        run: test -f docs/api-html/index.html && [ "$(ls -A docs/api-html)" ]
+      - uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: packages/statemachine/docs/api-html
+          publish_branch: gh-pages

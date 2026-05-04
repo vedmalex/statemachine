@@ -31,6 +31,13 @@
 
 TASK-007 of the standalone-evolution roadmap (RM-001) handles the inaugural publish. See `memory-bank/tasks/2026-05-03_TASK-007_*` for the operator playbook.
 
+### GitHub Pages first deploy
+
+Before triggering `.github/workflows/docs.yml`:
+1. Verify Repo Settings → Pages → Source: "Deploy from a branch" with `gh-pages` selected.
+2. If the `gh-pages` branch doesn't exist yet, the first run of docs.yml creates it; Pages settings auto-detect.
+3. Subsequent docs.yml runs deploy to the same gh-pages branch.
+
 ## Troubleshooting
 
 - `npm publish` 403: NPM_TOKEN missing or scoped incorrectly.

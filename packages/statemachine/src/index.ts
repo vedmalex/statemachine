@@ -11,22 +11,44 @@
 
 // === Stable public surface (5 firm symbols) ===
 
-/** @stable — primary factory; the canonical consumer entry point. */
+/**
+ * @stable — primary factory; the canonical consumer entry point.
+ * @category Stable
+ */
 export { createMachine } from './lite'
 
-/** @stable — class form for advanced consumers needing direct instance access. */
+/**
+ * @stable — class form for advanced consumers needing direct instance access.
+ * @category Stable
+ */
 export { StateMachine } from './state_machine'
 
-// === Stable and unstable type re-exports ===
+// === Stable type re-exports ===
 
+/**
+ * @stable — top-level machine configuration interface.
+ * @category Stable
+ */
+export type { StateMachineConfig } from './types'
+
+/**
+ * @stable — transition descriptor used in events.
+ * @category Stable
+ */
+export type { Transition } from './types'
+
+/**
+ * @stable — state node shape; consumed by States<T> map.
+ * @category Stable
+ */
+export type { State } from './types'
+
+// === @unstable type re-exports (inherit package-level @unstable default) ===
+
+/**
+ * @category Unstable
+ */
 export type {
-  /** @stable — top-level machine configuration interface. */
-  StateMachineConfig,
-  /** @stable — transition descriptor used in events. */
-  Transition,
-  /** @stable — state node shape; consumed by States<T> map. */
-  State,
-  // === @unstable type re-exports (inherit package-level @unstable default) ===
   States,
   Events,
   Event,
@@ -94,3 +116,47 @@ export {
   type ValidationError,
   type ValidationWarning,
 } from './config_validator'
+
+// === Extension-point interfaces (per TASK-006 EP catalog) — @unstable ===
+
+/**
+ * @category Unstable
+ * @unstable — observability injection contract; implement to collect per-machine metrics.
+ */
+export type { IMonitor } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — timer scheduling injection contract; implement for WASM/host portability.
+ */
+export type { ITimerScheduler } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — error-handler injection contract; implement to replace built-in recovery.
+ */
+export type { IErrorHandler } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — logging injection contract; implement to route logs to host logging stack.
+ */
+export type { ILogger } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — persistence adapter contract; implement to save/restore machine state.
+ */
+export type { StatePersistenceAdapter } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — transition observability context passed to IMonitor.recordTransition.
+ */
+export type { TransitionContext } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — aggregate observability snapshot returned by IMonitor.getMetrics.
+ */
+export type { MonitorMetricsSnapshot } from './types'

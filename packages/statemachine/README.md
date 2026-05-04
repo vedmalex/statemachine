@@ -28,6 +28,18 @@ const sm = createMachine({
 })
 ```
 
+## Documentation
+
+Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)
+
+## Extension Points
+
+This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+
+## Stability policy
+
+5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
+
 ## Status & module format
 
 `1.0.0-beta.x`. Stability: experimental. The full API surface is currently `@unstable` per the package's STABILITY policy; per-symbol stability tagging arrives before `1.0.0` stable.
