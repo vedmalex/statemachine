@@ -6,6 +6,12 @@ export default defineConfig({
     include: ['src/tests/**/*.test.ts'],
     exclude: ['test/**', 'node_modules/**'],
     hookTimeout: 30000,
+    testTimeout: 30000,
+    fakeTimers: {
+      // Only fake these; do NOT fake setImmediate/process.nextTick/queueMicrotask
+      // to avoid vi.useRealTimers() hanging on restore in slow CI environments (Node 18)
+      toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'],
+    },
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
