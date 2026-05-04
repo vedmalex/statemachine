@@ -5,6 +5,5 @@
     "emitDeclarationOnly": false,
     "declarationDir": "types",
     "outDir": "dist"
-  },
-  "exclude": ["node_modules", "dist", "types", "**/*.test.ts", "src/tests/**"]
+  }
 }

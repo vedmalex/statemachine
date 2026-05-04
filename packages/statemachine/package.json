@@ -17,15 +17,23 @@
   },
   "files": ["dist", "src", "types", "README.md", "LICENSE"],
   "scripts": {
-    "clean": "rm -rf dist types tsconfig.tsbuildinfo",
+    "clean": "rm -rf dist types tsconfig.tsbuildinfo coverage",
     "build": "bun run clean && tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "knip": "knip --no-progress",
     "prepublishOnly": "bun run build && test -f dist/index.js && test -f types/index.d.ts"
   },
   "dependencies": {},
   "peerDependencies": {},
   "devDependencies": {
     "@types/bun": "^1.2.16",
-    "typescript": "^5.6.0"
+    "@vitest/coverage-istanbul": "^4.1.5",
+    "@vitest/coverage-v8": "^4.1.5",
+    "knip": "^6.11.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.5"
   },
   "publishConfig": {
     "access": "public"

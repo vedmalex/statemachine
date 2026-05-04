@@ -1,4 +1,10 @@
 /**
+ * @deprecated Will be removed in a follow-up task. Security policy enforcement should
+ * happen at the host-application layer; this module is a source-tree marker.
+ *
+ * Post TD-T3-4 pruning, symbols from this module are not reachable from `dist/index.js` —
+ * the deprecation has no public deprecation cycle, only source-tree intent.
+ *
  * Security module for safe function serialization and validation
  * Replaces unsafe `new Function()` usage with secure alternatives
  */
@@ -13,6 +19,9 @@ import type {
 } from './types'
 
 // Configuration for function security
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export interface FunctionSecurityConfig {
   allowedFunctionNames: Set<string>
   maxFunctionLength: number
@@ -20,8 +29,14 @@ export interface FunctionSecurityConfig {
   customPatterns?: DangerousPattern[]
 }
 
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export type FunctionRiskLevel = 'low' | 'medium' | 'high' | 'critical'
 
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export interface DangerousPattern {
   pattern: RegExp
   risk: FunctionRiskLevel
@@ -29,6 +44,9 @@ export interface DangerousPattern {
   category?: string
 }
 
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export interface FunctionValidationResult {
   isValid: boolean
   errors: string[]
@@ -183,7 +201,9 @@ const BUILTIN_PATTERNS: DangerousPattern[] = [
   },
 ]
 
-// Default security configuration
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export const DEFAULT_SECURITY_CONFIG: FunctionSecurityConfig = {
   allowedFunctionNames: new Set([
     // Common safe function patterns
@@ -221,7 +241,9 @@ export const DEFAULT_SECURITY_CONFIG: FunctionSecurityConfig = {
   customPatterns: [],
 }
 
-// Type definition for safe serialized action
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export type SafeSerializedAction =
   | {
       type: 'string'
@@ -238,7 +260,9 @@ export type SafeSerializedAction =
       }
     }
 
-// Security validator for function content
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export class FunctionValidator {
   private config: FunctionSecurityConfig
   private allPatterns: DangerousPattern[]
@@ -367,7 +391,9 @@ export class FunctionValidator {
   }
 }
 
-// Safe serializer for functions
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export class SafeFunctionSerializer {
   public validator: FunctionValidator
 
@@ -393,7 +419,7 @@ export class SafeFunctionSerializer {
       const metadata = {
         length: body.length,
         createdAt: Date.now(),
-        functionName,
+        ...(functionName !== undefined ? { functionName } : {}),
       }
 
       const hash = await this.validator.createSecurityHash(body, metadata)
@@ -425,7 +451,7 @@ export class SafeFunctionSerializer {
       const metadata = {
         length: body.length,
         createdAt: Date.now(),
-        functionName,
+        ...(functionName !== undefined ? { functionName } : {}),
       }
 
       // Sync version uses the weak fallback hash logic implicitly or needs a sync version of createHash
@@ -650,13 +676,22 @@ export class SafeFunctionSerializer {
   }
 }
 
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 // Global instance for convenience
 export const safeFunctionSerializer = new SafeFunctionSerializer()
 
-// Legacy compatibility functions
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export const serializeAction = safeFunctionSerializer.serializeAction.bind(
   safeFunctionSerializer,
 )
+
+/**
+ * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
+ */
 export const deserializeAction = safeFunctionSerializer.deserializeAction.bind(
   safeFunctionSerializer,
 )

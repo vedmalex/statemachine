@@ -189,8 +189,8 @@ export class Logger {
       timestamp: Date.now(),
       level,
       message,
-      context,
-      error,
+      ...(context !== undefined ? { context } : {}),
+      ...(error !== undefined ? { error } : {}),
       source: this.source,
     }
 
@@ -226,7 +226,7 @@ export class Logger {
   }
 
   // Create child logger with additional context
-  child(childSource: string, additionalContext?: Record<string, any>): Logger {
+  child(childSource: string, _additionalContext?: Record<string, any>): Logger {
     const childLogger = new Logger(`${this.source}.${childSource}`, this.config)
     childLogger.appenders = this.appenders
     return childLogger

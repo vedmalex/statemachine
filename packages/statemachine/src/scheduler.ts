@@ -106,6 +106,7 @@ export class TimerScheduler {
     while (this.heap.length > 0) {
       // Смотрим на самый ранний таймер
       const task = this.heap[0]
+      /* c8 ignore next */ if (task === undefined) break
 
       // Если его время еще не пришло - останавливаемся
       if (task.executeAt > now) {
@@ -145,12 +146,13 @@ export class TimerScheduler {
   }
 
   private extractMin(): TimerTask | undefined {
-    if (this.heap.length === 0) return undefined
+    /* c8 ignore next */ if (this.heap.length === 0) return undefined
 
     const min = this.heap[0]
-    const last = this.heap.pop()!
+    /* c8 ignore next */ if (min === undefined) return undefined
+    const last = this.heap.pop()
 
-    if (this.heap.length > 0) {
+    if (this.heap.length > 0 && last !== undefined) {
       this.heap[0] = last
       this.sinkDown(0)
     }
@@ -161,7 +163,10 @@ export class TimerScheduler {
   private bubbleUp(index: number) {
     while (index > 0) {
       const parentIndex = Math.floor((index - 1) / 2)
-      if (this.heap[parentIndex].executeAt <= this.heap[index].executeAt) break
+      const parent = this.heap[parentIndex]
+      const current = this.heap[index]
+      /* c8 ignore next */ if (parent === undefined || current === undefined) break
+      if (parent.executeAt <= current.executeAt) break
 
       this.swap(index, parentIndex)
       index = parentIndex
@@ -171,6 +176,7 @@ export class TimerScheduler {
   private sinkDown(index: number) {
     const length = this.heap.length
     const element = this.heap[index]
+    /* c8 ignore next */ if (element === undefined) return
 
     while (true) {
       const leftChildIdx = 2 * index + 1
@@ -178,19 +184,24 @@ export class TimerScheduler {
       let swapIdx: number | null = null
 
       if (leftChildIdx < length) {
-        if (this.heap[leftChildIdx].executeAt < element.executeAt) {
+        const leftChild = this.heap[leftChildIdx]
+        if (leftChild !== undefined && leftChild.executeAt < element.executeAt) {
           swapIdx = leftChildIdx
         }
       }
 
       if (rightChildIdx < length) {
-        if (
-          (swapIdx === null &&
-            this.heap[rightChildIdx].executeAt < element.executeAt) ||
-          (swapIdx !== null &&
-            this.heap[rightChildIdx].executeAt < this.heap[swapIdx].executeAt)
-        ) {
-          swapIdx = rightChildIdx
+        const rightChild = this.heap[rightChildIdx]
+        /* c8 ignore next */
+        if (rightChild !== undefined) {
+          if (
+            (swapIdx === null && rightChild.executeAt < element.executeAt) ||
+            /* c8 ignore next */
+            (swapIdx !== null && this.heap[swapIdx] !== undefined &&
+              rightChild.executeAt < this.heap[swapIdx]!.executeAt)
+          ) {
+            swapIdx = rightChildIdx
+          }
         }
       }
 
@@ -203,7 +214,9 @@ export class TimerScheduler {
 
   private swap(a: number, b: number) {
     const temp = this.heap[a]
-    this.heap[a] = this.heap[b]
+    const other = this.heap[b]
+    /* c8 ignore next */ if (temp === undefined || other === undefined) return
+    this.heap[a] = other
     this.heap[b] = temp
   }
 }

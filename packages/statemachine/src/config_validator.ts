@@ -117,9 +117,10 @@ export class ConfigValidator {
       // ✅ Запуск кастомных правил
       this.runCustomRules(smConfig)
     } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error)
       this.addError(
         'VALIDATION_FAILED',
-        `Validation process failed: ${error.message}`,
+        `Validation process failed: ${msg}`,
         'validation',
       )
     }
@@ -506,6 +507,7 @@ export class ConfigValidator {
 
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i]
+      if (part === undefined) return false
 
       if (i === 0) {
         // Root state
@@ -522,8 +524,10 @@ export class ConfigValidator {
         // Continue with regions
       } else if (i === 1) {
         // Region name
-        const rootState = currentStates[parts[0]]
-        if (!rootState.regions || !rootState.regions[part]) {
+        const rootStatePart = parts[0]
+        if (rootStatePart === undefined) return false
+        const rootState = currentStates[rootStatePart]
+        if (!rootState || !rootState.regions || !rootState.regions[part]) {
           return false
         }
         currentStates = rootState.regions[part]
@@ -708,8 +712,8 @@ export class ConfigValidator {
       message,
       severity: 'error',
       path,
-      details,
-      suggestion,
+      ...(details !== undefined ? { details } : {}),
+      ...(suggestion !== undefined ? { suggestion } : {}),
     })
   }
 
@@ -725,8 +729,8 @@ export class ConfigValidator {
       message,
       severity: 'warning',
       path,
-      details,
-      suggestion,
+      ...(details !== undefined ? { details } : {}),
+      ...(suggestion !== undefined ? { suggestion } : {}),
     })
   }
 }

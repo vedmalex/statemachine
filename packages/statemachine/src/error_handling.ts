@@ -16,10 +16,10 @@ export interface ExtendedErrorContext extends ErrorContext {
     to: string
     event: string
   }
-  stackTrace?: string
-  userAgent?: string
-  sessionId?: string
-  additionalData?: Record<string, any>
+  stackTrace?: string | undefined
+  userAgent?: string | undefined
+  sessionId?: string | undefined
+  additionalData?: Record<string, any> | undefined
 }
 
 // Error severity levels
@@ -198,6 +198,7 @@ export class FallbackStateRecoveryStrategy implements ErrorRecoveryStrategy {
           errorCode: error.errorCode,
           fallbackState: this.fallbackState,
         },
+        /* c8 ignore next */
         recoveryError instanceof Error
           ? recoveryError
           : new Error(String(recoveryError)),
@@ -393,6 +394,7 @@ export class ErrorHandler {
               errorCode: enhancedError.errorCode,
               strategy: strategy.name,
             },
+            /* c8 ignore next */
             recoveryError instanceof Error
               ? recoveryError
               : new Error(String(recoveryError)),
