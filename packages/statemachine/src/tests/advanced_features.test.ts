@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { TimerScheduler } from '../scheduler'
 import { StateMachine } from '../state_machine'
 import { MemoryAdapter } from '../types'
 
 describe('Advanced Features: Wildcards & Timers', () => {
-  // Ensure scheduler is off before these tests to use native setTimeout
-  TimerScheduler.getInstance().stop()
-  TimerScheduler.getInstance().clear()
+  // TASK-004: TimerScheduler.getInstance() removed; each StateMachine gets its own scheduler.
+  // These tests use native setTimeout (default scheduler is not started), so no explicit cleanup needed.
 
   // --- Тест таймеров ---
   it('should automatically transition using "invoke" (Time-based)', async () => {

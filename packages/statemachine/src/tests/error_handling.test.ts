@@ -12,7 +12,7 @@ import {
   FallbackStateRecoveryStrategy,
   RetryRecoveryStrategy,
   createEnhancedError,
-  globalErrorHandler,
+  createDefaultErrorHandler,
   isRecoverableError,
 } from '../error_handling'
 import { StateMachine } from '../state_machine'
@@ -378,10 +378,11 @@ describe('Enhanced Error Handling', () => {
     })
   })
 
-  describe('Global error handler', () => {
-    it('should be available as singleton', () => {
-      expect(globalErrorHandler).toBeInstanceOf(ErrorHandler)
-      expect(globalErrorHandler.isEnabled()).toBe(true)
+  describe('Default error handler factory (TASK-004: singleton replaced)', () => {
+    it('should create a new ErrorHandler instance via createDefaultErrorHandler()', () => {
+      const handler = createDefaultErrorHandler()
+      expect(handler).toBeInstanceOf(ErrorHandler)
+      expect(handler.isEnabled()).toBe(true)
     })
   })
 })

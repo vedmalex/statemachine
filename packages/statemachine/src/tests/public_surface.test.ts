@@ -14,7 +14,7 @@ import * as pkg from '../index'
  */
 
 const BANNED_SYMBOLS = [
-  // TASK-004 singletons (must NOT leak to public surface; TASK-004 will eliminate them entirely)
+  // TASK-004 singletons (eliminated in TASK-004 per ISS-007/ISS-008)
   'globalStateMachineMonitor',
   'globalErrorHandler',
   'TimerScheduler',
@@ -24,6 +24,10 @@ const BANNED_SYMBOLS = [
   'MetricsCollector',
   'PerformanceMonitor',
   'StateMachineMonitor',
+  // TASK-004 internal factories (@internal; not for public consumption)
+  'createDefaultScheduler',
+  'createDefaultMonitor',
+  'createDefaultErrorHandler',
   // Internal logger plumbing
   'Logger',
   'LoggerFactory',
@@ -37,6 +41,14 @@ const BANNED_SYMBOLS = [
   'Configuree',
   // Note: `Config` is intentionally allowed to remain absent — was removed in TASK-003 CODE_REVIEW.
 ] as const
+
+// === @unstable type re-export inventory (per TD-T4-7 TASK-004) ===
+// The following types are intentionally part of the @unstable surface
+// (not in STABLE_SYMBOLS, not in BANNED_SYMBOLS — type-only, runtime-invisible):
+//   - IMonitor (existing TASK-002 surface; expanded additively in TASK-004 per TD-T4-2)
+//   - ITimerScheduler (NEW in TASK-004 per TD-T4-2a)
+//   - IErrorHandler (NEW in TASK-004 per TD-T4-2b)
+// Per package-level @unstable JSDoc default in src/index.ts; verified by tsc reachability.
 
 const STABLE_SYMBOLS = [
   'createMachine',

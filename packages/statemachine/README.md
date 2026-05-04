@@ -38,11 +38,13 @@ const sm = createMachine({
 
 ## Known internal debt (Phase 1)
 
-The Phase 1 bootstrap copied several modules as-is from the legacy `@grainjs/statemachine` source. They are functionally correct for `1.0.0-beta.x` consumers but carry singleton patterns that block WASM/Zig portability and cross-runtime hosting. Each item is bound to its planned owner task in the standalone-evolution roadmap (RM-001):
+The Phase 1 bootstrap copied several modules as-is from the legacy `@grainjs/statemachine` source. They are functionally correct for `1.0.0-beta.x` consumers but carried singleton patterns that blocked WASM/Zig portability and cross-runtime hosting. Each item has been resolved in TASK-004:
 
-- **`TimerScheduler.getInstance()`** in `src/scheduler.ts` — module-level singleton — owner: TASK-004 (singleton elimination).
-- **`globalStateMachineMonitor`** in `src/monitoring.ts` and the `IMonitor` interface signature mismatch — tracked as `ISS-007` (signature alignment) and `ISS-008` (singleton removal) — owner: TASK-004.
-- **`globalErrorHandler`** in `src/error_handling.ts` — owner: TASK-004 (re-export was removed from `src/index.ts` in TASK-003 CODE_REVIEW per Q7; only the internal symbol remains pending TASK-004 removal).
+- **`TimerScheduler.getInstance()`** — removed in TASK-004 (singleton elimination); use `createDefaultScheduler()` or inject via `StateMachineOptions.scheduler`.
+- **`globalStateMachineMonitor`** — removed in TASK-004 (ISS-007 + ISS-008); use `createDefaultMonitor()` or inject via `StateMachineOptions.monitor`.
+- **`globalErrorHandler`** — removed in TASK-004; use `createDefaultErrorHandler()` or inject via `StateMachineOptions.errorHandler`.
+
+- **WASM/Zig port architectural commitments** — see `docs/zig-port-considerations.md` for the patterns this package commits to (no module-level mutable state, injection contracts, factory defaults).
 
 ## Build-time constraints
 

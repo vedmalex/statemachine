@@ -1,3 +1,5 @@
+import type { ITimerScheduler } from './types'
+
 /**
  * Тип для идентификатора таймера
  */
@@ -21,18 +23,10 @@ export class TimerScheduler {
   // Это позволяет удалять задачи за O(1) без поиска в куче O(n)
   private activeTokens: WeakSet<TimerToken> = new WeakSet()
 
-  private static instance: TimerScheduler
   private intervalId: any = null
   private pollingInterval = 100 // ms
 
-  private constructor() {}
-
-  public static getInstance(): TimerScheduler {
-    if (!TimerScheduler.instance) {
-      TimerScheduler.instance = new TimerScheduler()
-    }
-    return TimerScheduler.instance
-  }
+  constructor() {}
 
   /**
    * Настройка режима опроса
@@ -219,4 +213,13 @@ export class TimerScheduler {
     this.heap[a] = other
     this.heap[b] = temp
   }
+}
+
+/**
+ * @internal — default factory for StateMachine.scheduler injection slot.
+ * Returns a new TimerScheduler instance (NOT a singleton).
+ * Same-module placement required: TimerScheduler constructor is public within module.
+ */
+export function createDefaultScheduler(): ITimerScheduler {
+  return new TimerScheduler()
 }

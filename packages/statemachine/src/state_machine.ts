@@ -1,5 +1,7 @@
-import { TimerScheduler } from './scheduler'
+import { createDefaultScheduler } from './scheduler'
 import { type SafeSerializedAction, safeFunctionSerializer } from './security'
+import { createDefaultMonitor } from './monitoring'
+import { createDefaultErrorHandler } from './error_handling'
 import {
   type ActionOrString,
   type Adapter,
@@ -9,8 +11,10 @@ import {
   type Event,
   type EventAction,
   type Events,
+  type IErrorHandler,
   type ILogger,
   type IMonitor,
+  type ITimerScheduler,
   isAdapter,
   type KeysOf,
   MemoryAdapter,
@@ -36,11 +40,6 @@ const ConsoleLogger: ILogger = {
   info: () => { },
   warn: (msg, ctx) => console.warn(msg, ctx),
   error: (msg, ctx, err) => console.error(msg, ctx, err),
-}
-
-const NoOpMonitor: IMonitor = {
-  recordTransition: () => { },
-  recordError: () => { },
 }
 
 interface StateInfo {
@@ -77,6 +76,8 @@ export class StateMachine<
   // Приватные поля для зависимостей
   private logger: ILogger
   private monitor: IMonitor
+  private scheduler: ITimerScheduler
+  private errorHandler: IErrorHandler
 
   // Свойства
   private states: Map<keyof SMConfig['states'], State<TOwner>>
@@ -146,8 +147,10 @@ export class StateMachine<
 
     // ✅ Внедрение зависимостей (Dependency Injection)
     // Если передали - используем, если нет - fallback на легковесные версии
-    this.logger = options?.logger || ConsoleLogger
-    this.monitor = options?.monitor || NoOpMonitor
+    this.logger = options?.logger ?? ConsoleLogger
+    this.monitor = options?.monitor ?? createDefaultMonitor()
+    this.scheduler = options?.scheduler ?? createDefaultScheduler()
+    this.errorHandler = options?.errorHandler ?? createDefaultErrorHandler()
 
     if (adaptee) {
       if (!isAdapter<TOwner>(adaptee)) {
@@ -403,6 +406,12 @@ export class StateMachine<
         /* c8 ignore next */
         error instanceof Error ? error : new Error(String(error)),
       )
+      if (this.errorHandler.isEnabled()) {
+        this.monitor.recordError(
+          error instanceof Error ? error : new Error(String(error)),
+          { state: currentState, event: eventName },
+        )
+      }
       throw error // Propagate error to caller (e.g. fireEvent rejection)
     })
 
@@ -1799,7 +1808,7 @@ export class StateMachine<
   private setTimer(callback: () => void, delay: number): any {
     // If scheduler is running (lazy mode enabled), use it.
     // Otherwise fallback to native setTimeout for standard behavior.
-    const scheduler = TimerScheduler.getInstance()
+    const scheduler = this.scheduler
     if (scheduler.isActive()) {
       return scheduler.schedule(delay, callback)
     }
@@ -1810,7 +1819,7 @@ export class StateMachine<
    * Helper to clear timer
    */
   private clearTimer(timerId: any): void {
-    const scheduler = TimerScheduler.getInstance()
+    const scheduler = this.scheduler
     // We can try to cancel in scheduler even if inactive (it handles untracked tokens gracefully)
     // But to be safe and correct with types:
     // Note: TimerToken is object, setTimeout returns Timeout (Node) or number (Browser).

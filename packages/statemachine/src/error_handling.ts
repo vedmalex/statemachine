@@ -467,8 +467,14 @@ export class ErrorHandler {
   }
 }
 
-// Global error handler instance
-export const globalErrorHandler = new ErrorHandler()
+/**
+ * @internal — default factory for StateMachine.errorHandler injection slot.
+ * Returns a new ErrorHandler instance (NOT a singleton).
+ * Constructor at line 343 is public (verified).
+ */
+export function createDefaultErrorHandler(): import('./types').IErrorHandler {
+  return new ErrorHandler()
+}
 
 // Utility functions
 export function createEnhancedError(

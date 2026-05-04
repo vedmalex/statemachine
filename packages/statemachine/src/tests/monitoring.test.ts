@@ -8,7 +8,7 @@ import {
   MonitoringUtils,
   PerformanceMonitor,
   StateMachineMonitor,
-  globalStateMachineMonitor,
+  createDefaultMonitor,
 } from '../monitoring'
 
 describe('StateMachine Monitoring System', () => {
@@ -424,16 +424,18 @@ describe('StateMachine Monitoring System', () => {
     })
   })
 
-  describe('Global Monitor', () => {
-    it('should provide global monitoring instance', () => {
-      expect(globalStateMachineMonitor).toBeDefined()
-      expect(globalStateMachineMonitor).toBeInstanceOf(StateMachineMonitor)
+  describe('Default Monitor Factory (TASK-004: singleton replaced)', () => {
+    it('should provide a new monitor instance via createDefaultMonitor()', () => {
+      const monitor = createDefaultMonitor()
+      expect(monitor).toBeDefined()
+      expect(monitor).toBeInstanceOf(StateMachineMonitor)
     })
 
     it('should be usable for recording metrics', () => {
-      globalStateMachineMonitor.recordTransition(25)
+      const monitor = createDefaultMonitor() as StateMachineMonitor
+      monitor.recordTransition(25)
 
-      const report = globalStateMachineMonitor.getMonitoringReport()
+      const report = monitor.getMonitoringReport()
       expect(report.metrics.totalTransitions).toBeGreaterThanOrEqual(1)
     })
   })

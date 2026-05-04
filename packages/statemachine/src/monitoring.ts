@@ -2,6 +2,7 @@
 // Provides essential monitoring for state machine transitions and errors
 
 import { stateMachineLogger } from './logger'
+import type { ErrorContext, IMonitor, MonitorMetricsSnapshot, TransitionContext } from './types'
 
 /**
  * Performance metrics interface
@@ -479,17 +480,39 @@ export class StateMachineMonitor {
   }
 
   /**
-   * Record a transition for monitoring
+   * Record a transition for monitoring (F-T4-TS-5 widening: added success + context params)
    */
-  recordTransition(transitionTime: number): void {
+  recordTransition(transitionTime: number, success: boolean = true, _context?: TransitionContext): void {
     this.metricsCollector.recordTransition(transitionTime)
+    if (!success) this.metricsCollector.recordError()
+    // _context kept for future enrichment
   }
 
   /**
-   * Record an error for monitoring
+   * Record an error for monitoring (F-T4-TS-5 widening: added error + context params)
    */
-  recordError(): void {
+  recordError(_error?: Error, _context?: ErrorContext): void {
     this.metricsCollector.recordError()
+  }
+
+  /**
+   * Record an event for monitoring (optional IMonitor extension)
+   */
+  recordEvent(_eventName: string, _duration: number): void {
+    // optional implementation; metrics enrichment deferred to follow-up
+  }
+
+  /**
+   * Get aggregate metrics snapshot (optional IMonitor extension)
+   */
+  getMetrics(): MonitorMetricsSnapshot {
+    const summary = this.metricsCollector.getMetricsSummary()
+    return {
+      totalTransitions: summary.totalTransitions,
+      successCount: summary.totalTransitions - summary.totalErrors,
+      errorCount: summary.totalErrors,
+      averageDuration: summary.averageTransitionTime,
+    }
   }
 
   /**
@@ -599,9 +622,12 @@ export class StateMachineMonitor {
 }
 
 /**
- * Global monitoring instance
+ * @internal — default factory for StateMachine.monitor injection slot.
+ * Returns a new StateMachineMonitor instance (NOT a singleton).
  */
-export const globalStateMachineMonitor = new StateMachineMonitor()
+export function createDefaultMonitor(): IMonitor {
+  return new StateMachineMonitor()
+}
 
 /**
  * Utility functions for monitoring integration

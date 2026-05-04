@@ -60,16 +60,59 @@ export interface ILogger {
   error(message: string, context?: any, error?: Error): void
 }
 
-// ✅ НОВОЕ: Абстракция мониторинга
+// === WASM-friendly injection contracts (per TD-T4-2a, TD-T4-2, TD-T4-2b) ===
+
+/** @unstable — timer scheduling injection contract; consumed by StateMachine. */
+export interface ITimerScheduler {
+  isActive(): boolean
+  schedule(delay: number, callback: () => void): object
+  cancel(token: object): void
+}
+
+/** @unstable — transition observability context (additive on IMonitor). */
+export interface TransitionContext {
+  fromState: string
+  toState: string
+  eventName?: string
+}
+
+/** @unstable — minimal aggregate observability snapshot for tests. */
+export interface MonitorMetricsSnapshot {
+  totalTransitions: number
+  successCount: number
+  errorCount: number
+  averageDuration: number
+}
+
+/**
+ * @unstable — observability injection contract.
+ * EXPANDED additively in TASK-004 per TD-T4-2: third param of `recordTransition`
+ * is parameter-optional; `recordEvent?` and `getMetrics?` are interface-optional.
+ * Existing 2-arg call site at state_machine.ts:1665 remains valid.
+ */
 export interface IMonitor {
-  recordTransition(duration: number, success: boolean): void
-  recordError(error: Error, context?: any): void
+  recordTransition(duration: number, success: boolean, context?: TransitionContext): void
+  recordError(error: Error, context?: ErrorContext): void
+  recordEvent?(eventName: string, duration: number): void
+  getMetrics?(): MonitorMetricsSnapshot
+}
+
+/** @unstable — error-handler injection contract; surfaces methods consumed by host integrations. */
+export interface IErrorHandler {
+  isEnabled(): boolean
+  enable(): void
+  disable(): void
+  addRecoveryStrategy(strategy: import('./error_handling').ErrorRecoveryStrategy): void
+  removeRecoveryStrategy(strategyName: string): void
+  getAnalytics(): import('./error_handling').ErrorAnalytics
 }
 
 // ✅ НОВОЕ: Опции инъекции для StateMachine
 export interface StateMachineOptions {
   logger?: ILogger
-  monitor?: IMonitor
+  monitor?: IMonitor        // EXISTING; element type evolves additively per TD-T4-2
+  scheduler?: ITimerScheduler   // NEW per TD-T4-2a
+  errorHandler?: IErrorHandler  // NEW per TD-T4-2b
   /**
    * Maximum time (ms) to wait for async entry/exit actions.
    * If exceeded, the transition aborts with an error.

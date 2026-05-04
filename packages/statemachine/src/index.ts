@@ -82,10 +82,7 @@ export {
   RetryRecoveryStrategy,
 } from './error_handling'
 
-// `globalErrorHandler` is intentionally NOT re-exported — it is an internal
-// singleton scheduled for removal in TASK-004 (singleton elimination).
-// Consumers needing error-handler instances must construct them via
-// `EnhancedStateMachineError` and `createEnhancedError` directly.
+// globalErrorHandler removed in TASK-004 (singleton elimination per ISS-007/ISS-008).
 
 // === Public config validator entry points ===
 

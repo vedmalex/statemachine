@@ -8,19 +8,24 @@ import {
 } from 'vitest'
 import { TimerScheduler } from '../scheduler'
 
+// TASK-004: use direct instantiation instead of TimerScheduler.getInstance()
+// Each test gets its own scheduler instance to avoid cross-test interference.
+
 describe('TimerScheduler', () => {
+  let scheduler: TimerScheduler
+
   beforeEach(() => {
     vi.useFakeTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
+    scheduler = new TimerScheduler()
   })
 
   afterEach(() => {
+    scheduler.stop()
+    scheduler.clear()
     vi.useRealTimers()
   })
 
   it('should execute task after delay', () => {
-    const scheduler = TimerScheduler.getInstance()
     const callback = vi.fn()
 
     scheduler.schedule(100, callback)
@@ -38,7 +43,6 @@ describe('TimerScheduler', () => {
   })
 
   it('should handle multiple tasks in order', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: string[] = []
 
     scheduler.schedule(200, () => calls.push('second'))
@@ -59,7 +63,6 @@ describe('TimerScheduler', () => {
   })
 
   it('should cancel tasks', () => {
-    const scheduler = TimerScheduler.getInstance()
     const callback = vi.fn()
 
     const token = scheduler.schedule(100, callback)
@@ -72,7 +75,6 @@ describe('TimerScheduler', () => {
   })
 
   it('should work with auto-polling', () => {
-    const scheduler = TimerScheduler.getInstance()
     const callback = vi.fn()
 
     // Enable polling every 50ms

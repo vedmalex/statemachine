@@ -30,7 +30,6 @@ import {
   MonitoringUtils,
   PerformanceMonitor,
   StateMachineMonitor,
-  globalStateMachineMonitor,
 } from '../monitoring'
 import { TimerScheduler } from '../scheduler'
 import { StateMachine } from '../state_machine'
@@ -244,8 +243,9 @@ describe('Logger (logger.ts)', () => {
 // ===== scheduler.ts - additional coverage =====
 
 describe('TimerScheduler additional coverage', () => {
-  it('is accessible via singleton', () => {
-    const scheduler = TimerScheduler.getInstance()
+  it('is directly instantiable (TASK-004: singleton removed)', () => {
+    // TASK-004: TimerScheduler.getInstance() removed; use direct instantiation
+    const scheduler = new TimerScheduler()
     expect(scheduler).toBeDefined()
     expect(typeof scheduler.schedule).toBe('function')
     scheduler.clear()
@@ -370,20 +370,21 @@ describe('StateMachine additional branch coverage', () => {
 // ===== scheduler.ts - additional branch coverage =====
 
 describe('TimerScheduler branch coverage', () => {
+  // TASK-004: use per-test instances instead of TimerScheduler.getInstance()
+  let scheduler: TimerScheduler
+
   beforeEach(() => {
     vi.useFakeTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
+    scheduler = new TimerScheduler()
   })
 
   afterEach(() => {
+    scheduler.clear()
+    scheduler.stop()
     vi.useRealTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
   })
 
   it('handles callback errors gracefully', () => {
-    const scheduler = TimerScheduler.getInstance()
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     scheduler.schedule(100, () => { throw new Error('test error') })
@@ -395,7 +396,6 @@ describe('TimerScheduler branch coverage', () => {
   })
 
   it('stop clears the interval when running', () => {
-    const scheduler = TimerScheduler.getInstance()
     scheduler.setPollingInterval(100)
     expect(scheduler.isActive()).toBe(true)
     scheduler.stop()
@@ -403,7 +403,6 @@ describe('TimerScheduler branch coverage', () => {
   })
 
   it('handles sinkDown with right child being smaller than left', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     // Schedule 3 tasks such that sinkDown must prefer right child
     scheduler.schedule(300, () => calls.push(3))
@@ -514,38 +513,43 @@ describe('ConfigValidator additional coverage', () => {
 // ===== error_handling.ts additional branch coverage =====
 
 describe('ErrorHandler additional branch coverage', () => {
+  // TASK-004: use createDefaultErrorHandler() instead of globalErrorHandler singleton
   it('handles action error categories correctly', async () => {
-    const { globalErrorHandler } = await import('../error_handling')
-    globalErrorHandler.enable()
+    const { createDefaultErrorHandler: factory } = await import('../error_handling')
+    const errorHandler = factory()
+    errorHandler.enable()
     const actionError = new Error('action failed')
-    const recovered = await globalErrorHandler.handleError(actionError)
+    const recovered = await (errorHandler as any).handleError(actionError)
     expect(typeof recovered).toBe('boolean')
   })
 
   it('handles security error categories correctly', async () => {
-    const { globalErrorHandler } = await import('../error_handling')
-    globalErrorHandler.enable()
+    const { createDefaultErrorHandler: factory } = await import('../error_handling')
+    const errorHandler = factory()
+    errorHandler.enable()
     const secError = new Error('security injection detected')
-    const recovered = await globalErrorHandler.handleError(secError)
+    const recovered = await (errorHandler as any).handleError(secError)
     expect(typeof recovered).toBe('boolean')
   })
 
   it('handles validation error categories', async () => {
-    const { globalErrorHandler } = await import('../error_handling')
-    globalErrorHandler.enable()
+    const { createDefaultErrorHandler: factory } = await import('../error_handling')
+    const errorHandler = factory()
+    errorHandler.enable()
     const validationError = new Error('validation failed')
-    const recovered = await globalErrorHandler.handleError(validationError)
+    const recovered = await (errorHandler as any).handleError(validationError)
     expect(typeof recovered).toBe('boolean')
   })
 
   it('disable/enable toggles error handling', async () => {
-    const { globalErrorHandler } = await import('../error_handling')
-    globalErrorHandler.disable()
-    expect(globalErrorHandler.isEnabled()).toBe(false)
-    const recovered = await globalErrorHandler.handleError(new Error('test'))
+    const { createDefaultErrorHandler: factory } = await import('../error_handling')
+    const errorHandler = factory()
+    errorHandler.disable()
+    expect(errorHandler.isEnabled()).toBe(false)
+    const recovered = await (errorHandler as any).handleError(new Error('test'))
     expect(recovered).toBe(false)
-    globalErrorHandler.enable()
-    expect(globalErrorHandler.isEnabled()).toBe(true)
+    errorHandler.enable()
+    expect(errorHandler.isEnabled()).toBe(true)
   })
 
   it('ErrorAnalytics tracks errors and provides stats', async () => {
@@ -588,10 +592,12 @@ describe('ErrorHandler additional branch coverage', () => {
   })
 
   it('convertToEnhancedError uses UNKNOWN category for unrecognized errors', async () => {
-    const { globalErrorHandler } = await import('../error_handling')
-    globalErrorHandler.enable()
+    // TASK-004: use createDefaultErrorHandler() instead of globalErrorHandler singleton
+    const { createDefaultErrorHandler: factory } = await import('../error_handling')
+    const errorHandler = factory()
+    errorHandler.enable()
     // Error with no recognized keyword
-    const result = await globalErrorHandler.handleError(new Error('some random failure xyz'))
+    const result = await (errorHandler as any).handleError(new Error('some random failure xyz'))
     expect(typeof result).toBe('boolean')
   })
 })
@@ -1745,20 +1751,21 @@ describe('ConfigValidator additional branch coverage', () => {
 // ===== scheduler.ts additional branch coverage =====
 
 describe('TimerScheduler full branch coverage', () => {
+  // TASK-004: use per-test instances instead of TimerScheduler.getInstance()
+  let scheduler: TimerScheduler
+
   beforeEach(() => {
     vi.useFakeTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
+    scheduler = new TimerScheduler()
   })
 
   afterEach(() => {
+    scheduler.clear()
+    scheduler.stop()
     vi.useRealTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
   })
 
   it('setPollingInterval with null disables polling', () => {
-    const scheduler = TimerScheduler.getInstance()
     scheduler.setPollingInterval(100) // start
     expect(scheduler.isActive()).toBe(true)
     scheduler.setPollingInterval(null) // stop
@@ -1766,7 +1773,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('setPollingInterval with positive number re-starts polling', () => {
-    const scheduler = TimerScheduler.getInstance()
     scheduler.setPollingInterval(50)
     expect(scheduler.isActive()).toBe(true)
     scheduler.setPollingInterval(100) // restart with new interval
@@ -1775,7 +1781,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('start is idempotent when already running', () => {
-    const scheduler = TimerScheduler.getInstance()
     scheduler.start()
     scheduler.start() // second start is no-op
     expect(scheduler.isActive()).toBe(true)
@@ -1783,7 +1788,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('cancel prevents task from running', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     const token = scheduler.schedule(50, () => calls.push(1))
     scheduler.cancel(token)
@@ -1793,14 +1797,12 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('process with empty heap does nothing', () => {
-    const scheduler = TimerScheduler.getInstance()
     scheduler.clear()
     // Should not throw
     expect(() => scheduler.process(Date.now())).not.toThrow()
   })
 
   it('multiple tasks with different delays execute in order', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     scheduler.schedule(300, () => calls.push(3))
     scheduler.schedule(100, () => calls.push(1))
@@ -1812,7 +1814,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('sinkDown with right child smaller than both element and left child', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     // Insert in order that forces right child comparison
     scheduler.schedule(200, () => calls.push(2))
@@ -1825,7 +1826,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('sinkDown with 4+ elements exercises right child comparison', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     // 4 tasks: after extracting the first, heap has 3 elements
     // sinkDown at root with 3 elements triggers right child check
@@ -1839,7 +1839,6 @@ describe('TimerScheduler full branch coverage', () => {
   })
 
   it('sinkDown with right child winning over left child (swapIdx != null path)', () => {
-    const scheduler = TimerScheduler.getInstance()
     const calls: number[] = []
     // Insert 6 elements in specific order to force right-child-wins scenario
     // After bubbleUp: [100, 300, 200, 600, 400, 500]
@@ -2304,9 +2303,8 @@ describe('StateMachine resumeTimers with invoke', () => {
   })
 
   afterEach(() => {
+    // TASK-004: no global singleton to clean up; each SM has its own scheduler
     vi.useRealTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
   })
 
   it('fromJSON with stateEntryTimes resumes invoke timers', () => {
@@ -2365,15 +2363,19 @@ describe('StateMachine resumeTimers with invoke', () => {
 // ===== setTimer/clearTimer with active scheduler =====
 
 describe('StateMachine setTimer with active TimerScheduler', () => {
+  // TASK-004: inject a shared scheduler via StateMachineOptions to test scheduler integration
+  let sharedScheduler: TimerScheduler
+
   beforeEach(() => {
     vi.useFakeTimers()
-    TimerScheduler.getInstance().setPollingInterval(50) // activate scheduler
+    sharedScheduler = new TimerScheduler()
+    sharedScheduler.setPollingInterval(50) // activate scheduler
   })
 
   afterEach(() => {
+    sharedScheduler.clear()
+    sharedScheduler.stop()
     vi.useRealTimers()
-    TimerScheduler.getInstance().clear()
-    TimerScheduler.getInstance().stop()
   })
 
   it('uses TimerScheduler when active for invoke delays', () => {
@@ -2390,11 +2392,11 @@ describe('StateMachine setTimer with active TimerScheduler', () => {
       events: { go: { transitions: [{ from: 'a', to: 'b' }] } },
     }
     const adapter = new MemoryAdapter({ state: '' })
-    const sm = new StateMachine(config, adapter)
+    const sm = new StateMachine(config, adapter, { scheduler: sharedScheduler })
     expect(sm.getCurrentState()).toBe('a')
     // Advance fake timers to trigger the scheduler
     vi.advanceTimersByTime(200)
-    TimerScheduler.getInstance().process(Date.now())
+    sharedScheduler.process(Date.now())
     // State machine timer fired via scheduler — branch for setTimer is covered
     expect(sm.getCurrentState()).toBeDefined()
   })
@@ -2413,7 +2415,7 @@ describe('StateMachine setTimer with active TimerScheduler', () => {
       events: { go: { transitions: [{ from: 'a', to: 'b' }] } },
     }
     const adapter = new MemoryAdapter({ state: '' })
-    const sm = new StateMachine(config, adapter)
+    const sm = new StateMachine(config, adapter, { scheduler: sharedScheduler })
     // Reset to clear the timer (should use scheduler cancel)
     await sm.reset()
     expect(sm.getCurrentState()).toBe('a')
