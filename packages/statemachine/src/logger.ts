@@ -16,7 +16,7 @@ export const LogLevel = {
 export type LogLevel = (typeof LogLevel)[keyof typeof LogLevel]
 
 // Log level names for display
-export const LogLevelNames: Record<LogLevel, string> = {
+const LogLevelNames: Record<LogLevel, string> = {
   [LogLevel.DEBUG]: 'DEBUG',
   [LogLevel.INFO]: 'INFO',
   [LogLevel.WARN]: 'WARN',
@@ -26,7 +26,7 @@ export const LogLevelNames: Record<LogLevel, string> = {
 }
 
 // Log entry structure
-export interface LogEntry {
+interface LogEntry {
   timestamp: number
   level: LogLevel
   message: string
@@ -36,7 +36,7 @@ export interface LogEntry {
 }
 
 // Logger configuration
-export interface LoggerConfig {
+interface LoggerConfig {
   level: LogLevel
   enableConsole: boolean
   enableStructuredLogging: boolean
@@ -54,7 +54,7 @@ export const DEFAULT_LOGGER_CONFIG: LoggerConfig = {
 }
 
 // Log appender interface for extensibility
-export interface LogAppender {
+interface LogAppender {
   append(entry: LogEntry): void
 }
 
@@ -267,4 +267,3 @@ export const setDefaultLogLevel = (level: LogLevel) => {
 // Pre-configured loggers for common use cases
 export const stateMachineLogger = getLogger('StateMachine')
 export const securityLogger = getLogger('Security')
-export const serializationLogger = getLogger('Serialization')

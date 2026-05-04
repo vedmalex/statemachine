@@ -1,7 +1,7 @@
 /**
  * Тип для идентификатора таймера
  */
-export type TimerToken = object
+type TimerToken = object
 
 interface TimerTask {
   token: TimerToken

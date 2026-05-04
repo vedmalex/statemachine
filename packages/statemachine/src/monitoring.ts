@@ -6,7 +6,7 @@ import { stateMachineLogger } from './logger'
 /**
  * Performance metrics interface
  */
-export interface PerformanceMetrics {
+interface PerformanceMetrics {
   transitionTime: number
   stateChangeCount: number
   errorCount: number
@@ -28,7 +28,7 @@ export type HealthStatus = (typeof HealthStatus)[keyof typeof HealthStatus]
 /**
  * Health check result
  */
-export interface HealthCheckResult {
+interface HealthCheckResult {
   status: HealthStatus
   message: string
   timestamp: number

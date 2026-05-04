@@ -30,7 +30,7 @@ export interface ValidationWarning extends ValidationError {
 }
 
 // ✅ НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ КАСТОМНЫХ ПРАВИЛ
-export interface ValidationContext {
+interface ValidationContext {
   addError(
     code: string,
     message: string,
@@ -45,7 +45,7 @@ export interface ValidationContext {
   ): void
 }
 
-export type CustomRule<T extends object = any> = {
+type CustomRule<T extends object = any> = {
   id: string
   validate: (config: StateMachineConfig<T>, context: ValidationContext) => void
 }

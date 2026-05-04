@@ -51,9 +51,6 @@ export type {
   KeysOf,
   ExtractAdaptee,
   ErrorContext,
-  ILogger,
-  IMonitor,
-  StatePersistenceAdapter,
 } from './types'
 
 // === Public adapter classes (live in types.ts) ===
@@ -92,60 +89,7 @@ export {
   validateConfig,
   validateConfigStrict,
   isValidConfig,
-  ConfigValidator,
   type ValidationResult,
   type ValidationError,
   type ValidationWarning,
-  type ValidationContext,
-  type CustomRule,
-  type ValidationConfig,
 } from './config_validator'
-
-// === BroadcastChannelAdapter (from adapters.ts) ===
-
-export { BroadcastChannelAdapter, type ISyncableStateMachine } from './adapters'
-
-// === Logger public API ===
-
-export {
-  Logger,
-  LoggerFactory,
-  ConsoleAppender,
-  MemoryAppender,
-  LogLevel,
-  DEFAULT_LOGGER_CONFIG,
-  setDefaultLogLevel,
-  type LogEntry,
-  type LoggerConfig,
-  type LogAppender,
-  LogLevelNames,
-  serializationLogger,
-} from './logger'
-
-// === Monitoring public API ===
-
-export {
-  StateMachineMonitor,
-  HealthChecker,
-  MetricsCollector,
-  PerformanceMonitor,
-  HealthStatus,
-  MonitoringUtils,
-  globalStateMachineMonitor,
-  DEFAULT_MONITORING_CONFIG,
-  type PerformanceMetrics,
-  type HealthCheckResult,
-  type MonitoringConfig,
-} from './monitoring'
-
-// === Scheduler public API ===
-
-export { TimerScheduler, type TimerToken } from './scheduler'
-
-// === State machine additional types ===
-
-export type { StateInfo, QueuedEvent, QueuedEventInfo } from './state_machine'
-
-// === Additional utility types from types.ts ===
-
-export type { Adaptee, Configuree, Config } from './types'

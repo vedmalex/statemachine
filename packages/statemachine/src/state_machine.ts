@@ -43,7 +43,7 @@ const NoOpMonitor: IMonitor = {
   recordError: () => { },
 }
 
-export interface StateInfo {
+interface StateInfo {
   name: string
   display?: string
   isComposite: boolean
@@ -52,7 +52,7 @@ export interface StateInfo {
   children?: string[]
 }
 
-export interface QueuedEvent<TOwner extends object = object> {
+interface QueuedEvent<TOwner extends object = object> {
   id: string
   eventName: string
   obj: Adapter<PropertiesOf<TOwner>>
@@ -63,7 +63,7 @@ export interface QueuedEvent<TOwner extends object = object> {
   type: 'internal' | 'external'
 }
 
-export interface QueuedEventInfo {
+interface QueuedEventInfo {
   id: string
   event: string
   age: number

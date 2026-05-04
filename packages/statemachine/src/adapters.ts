@@ -3,7 +3,7 @@ import type { Adapter, StatePersistenceAdapter } from './types'
 /**
  * Interface for a minimal state machine that can be updated from the adapter
  */
-export interface ISyncableStateMachine {
+interface ISyncableStateMachine {
   restoreState(): Promise<void>
 }
 

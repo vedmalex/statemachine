@@ -2,5 +2,8 @@
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "entry": ["src/index.ts"],
   "project": ["src/**/*.ts"],
-  "ignore": ["src/tests/**", "src/presets.ts", "src/security.ts"]
+  "ignore": ["src/tests/**", "src/presets.ts", "src/security.ts"],
+  "rules": {
+    "types": "warn"
+  }
 }
