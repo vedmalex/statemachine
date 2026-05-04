@@ -27,9 +27,46 @@
 4. Trigger publish: GitHub UI → Actions → Release workflow → Run workflow on `main`.
 5. Verify on npm: `npm view @vedmalex/statemachine` shows the new version.
 
-## First publish (1.0.0-beta.0)
+## First publish (1.0.0-beta.0) — TASK-007 playbook
 
 TASK-007 of the standalone-evolution roadmap (RM-001) handles the inaugural publish. See `memory-bank/tasks/2026-05-03_TASK-007_*` for the operator playbook.
+
+### Pre-publish (agent steps)
+
+1. Verify scope: `npm view @vedmalex/statemachine versions` returns 404 (or list without 1.0.0-beta.0).
+2. Verify pre-mode: `.changeset/pre.json` has mode=pre, tag=beta. If absent: `bunx changeset pre enter beta`.
+3. Author changeset at `.changeset/phase-1-baseline.md` with `"@vedmalex/statemachine": patch` bump.
+4. Run `bunx changeset version` from the monorepo root.
+5. Commit + push: `chore(TASK-007): version bump for 1.0.0-beta.x publish`.
+6. Wait for CI green on remote.
+
+### Operator-action steps
+
+1. Confirm `NPM_TOKEN` repo secret is configured in GitHub.
+2. Trigger Actions → Release → Run workflow on main.
+3. Wait for completion (~3-5 min).
+4. Verify: `npm view @vedmalex/statemachine@1.0.0-beta.1` returns metadata.
+5. Smoke install in clean dir:
+   ```bash
+   mkdir /tmp/sm-smoke && cd /tmp/sm-smoke
+   npm init -y && npm install @vedmalex/statemachine@1.0.0-beta.1
+   node scripts/post-publish-smoke.cjs
+   node scripts/post-publish-smoke.mjs
+   ```
+6. Notify agent of result.
+
+### Post-publish (agent steps)
+
+1. Re-run `npm view` to confirm metadata.
+2. Tag: `git tag task-007-published-stable && git push origin task-007-published-stable`.
+3. Verify Q12: no `@grainjs` references in published tarball.
+4. Verify Q13: published `package.json` dependencies empty.
+
+### Failure-path branches
+
+- Step 4 fail (`npm view` no metadata): release.yml partial. Inspect logs; do NOT push tag; transition to QA-failure.
+- Step 5 fail (smoke install errors): version published but broken. Author follow-up changeset for `1.0.0-beta.2` fix.
+- NPM_TOKEN expiry: regenerate + retry workflow.
 
 ### GitHub Pages first deploy
 

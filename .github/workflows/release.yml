@@ -22,6 +22,5 @@ jobs:
       - run: npm run knip
         working-directory: packages/statemachine
       - run: npx changeset publish
-        working-directory: packages/statemachine
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

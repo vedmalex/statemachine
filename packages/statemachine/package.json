@@ -1,8 +1,14 @@
 {
   "name": "@vedmalex/statemachine",
-  "version": "1.0.0-beta.0",
+  "version": "1.0.0-beta.1",
   "description": "Hierarchical state machine for TypeScript with monitoring, validation, and persistence (lite-only DI-free surface).",
-  "keywords": ["state-machine", "statemachine", "hierarchical", "lite", "wasm-friendly"],
+  "keywords": [
+    "state-machine",
+    "statemachine",
+    "hierarchical",
+    "lite",
+    "wasm-friendly"
+  ],
   "author": "vedmalex (Vedanta-krit das)",
   "license": "MIT",
   "homepage": "https://github.com/vedmalex/statemachine#readme",
@@ -26,7 +32,12 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist", "types", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=18"
   },
