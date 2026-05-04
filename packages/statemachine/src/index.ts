@@ -78,10 +78,14 @@ export {
   type ErrorSeverity as ErrorSeverityType,
   type ExtendedErrorContext,
   FallbackStateRecoveryStrategy,
-  globalErrorHandler,
   isRecoverableError,
   RetryRecoveryStrategy,
 } from './error_handling'
+
+// `globalErrorHandler` is intentionally NOT re-exported — it is an internal
+// singleton scheduled for removal in TASK-004 (singleton elimination).
+// Consumers needing error-handler instances must construct them via
+// `EnhancedStateMachineError` and `createEnhancedError` directly.
 
 // === Public config validator entry points ===
 
