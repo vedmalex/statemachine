@@ -9,18 +9,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: 'https://registry.npmjs.org'
-      - run: npm install
+      - uses: oven-sh/setup-bun@v2
+      # `bun install` supports workspace:* protocol natively (npm install does not — see https://github.com/oven-sh/bun/blob/main/docs/pm/workspaces.mdx).
+      # Examples in examples/integration/* depend on the package via workspace:*; that resolves only under bun's package manager.
+      - run: bun install
         working-directory: .
-      - run: npm run build
+      - run: bun run build
         working-directory: packages/statemachine
       - run: node test/verify-dist.cjs
         working-directory: packages/statemachine
-      - run: npm run knip
+      - run: bun run knip
         working-directory: packages/statemachine
-      - run: npx changeset publish
+      # bun publish automatically strips catalog and workspace protocols from package.json before publishing
+      # (https://github.com/oven-sh/bun/blob/main/docs/pm/cli/publish.mdx).
+      # workspace:* → resolved to actual version at publish time.
+      - run: bun publish --access public
+        working-directory: packages/statemachine
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
