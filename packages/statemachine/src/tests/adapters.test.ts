@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn } from 'bun:test'
+import { describe, expect, it, vi } from 'vitest'
 import { BroadcastChannelAdapter } from '../adapters'
 import { StateMachine } from '../state_machine'
 import { LocalStorageAdapter, MemoryAdapter } from '../types'
@@ -56,7 +56,7 @@ describe('BroadcastChannelAdapter', () => {
     adapter1.bindStateMachine(sm1)
     adapter2.bindStateMachine(sm2)
 
-    const restoreSpy = spyOn(sm2, 'restoreState')
+    const restoreSpy = vi.spyOn(sm2, 'restoreState')
 
     // Transition sm1 to busy and save
     await sm1.fireEvent('work')

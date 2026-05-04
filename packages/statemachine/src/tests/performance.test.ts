@@ -3,7 +3,7 @@
  * Tests large state machines, frequent transitions, and memory usage
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { LogLevel, MemoryAppender, getLogger } from '../logger'
 import { StateMachine } from '../state_machine'
 import { MemoryAdapter } from '../types'

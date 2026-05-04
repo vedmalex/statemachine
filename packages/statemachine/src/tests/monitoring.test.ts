@@ -1,5 +1,5 @@
 // Tests for StateMachine monitoring system
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   DEFAULT_MONITORING_CONFIG,
   HealthChecker,

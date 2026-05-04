@@ -1,3 +1,4 @@
+import { describe, expect, it, vi } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Events,
@@ -8,8 +9,8 @@ import {
 
 describe('StateMachine Context', () => {
   it('should use context for actions if context is set', async () => {
-    const actionFromContext = jest.fn()
-    const actionFromAdaptee = jest.fn()
+    const actionFromContext = vi.fn()
+    const actionFromAdaptee = vi.fn()
 
     const states = {
       state1: {},
@@ -49,7 +50,7 @@ describe('StateMachine Context', () => {
   })
 
   it('should serialize and deserialize state machine with context actions', async () => {
-    const actionFromContext = jest.fn()
+    const actionFromContext = vi.fn()
 
     const contextActionsSMConfig = {
       name: 'ContextActionsSM',
@@ -83,7 +84,7 @@ describe('StateMachine Context', () => {
 
 describe('StateMachine Context Error Handling', () => {
   it('should use context for error handlers if context is set', async () => {
-    const errorHandlerFromContext = jest.fn()
+    const errorHandlerFromContext = vi.fn()
 
     const states = {
       state1: {},

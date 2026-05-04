@@ -1,3 +1,4 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Events,
@@ -131,8 +132,8 @@ describe('StateMachine attache to object', () => {
   })
 
   it('works', async () => {
-    const action = jest.fn()
-    const action1 = jest.fn()
+    const action = vi.fn()
+    const action1 = vi.fn()
     person.set('event', action)
     await expect(sm1.fireEvent('born', action1)).resolves.toBe(true)
     await sm1.fireEvent('health')
@@ -164,7 +165,7 @@ describe('state machine as singleton', () => {
   let personEvent = () => undefined
 
   beforeEach(() => {
-    personEvent = jest.fn()
+    personEvent = vi.fn()
     person = new MemoryAdapter<Person>({
       name: 'Someone',
       state: '',
@@ -175,7 +176,7 @@ describe('state machine as singleton', () => {
   const sm2 = new StateMachine<Person, typeof SMC>(SMC)
 
   it('works', async () => {
-    const action = jest.fn()
+    const action = vi.fn()
     expect(person.get('state')).toBe('')
     await expect(sm2.fireEvent('born', person, action)).resolves.toBe(true)
     expect(person.get('state')).toBe('born')

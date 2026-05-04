@@ -1,3 +1,4 @@
+import { describe, expect, it, vi } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Events,

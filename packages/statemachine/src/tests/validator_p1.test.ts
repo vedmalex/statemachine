@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { ConfigValidator } from '../config_validator'
 
 describe('ConfigValidator P1', () => {

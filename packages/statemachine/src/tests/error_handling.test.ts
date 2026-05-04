@@ -2,7 +2,7 @@
  * Tests for enhanced error handling module
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test'
+import { beforeEach, describe, expect, it } from 'vitest'
 import {
   EnhancedStateMachineError,
   ErrorAnalytics,

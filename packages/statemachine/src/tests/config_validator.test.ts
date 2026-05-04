@@ -2,7 +2,7 @@
  * Tests for configuration validation module
  */
 
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import {
   ConfigValidator,
   DEFAULT_VALIDATION_CONFIG,

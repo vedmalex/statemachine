@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { StateMachine } from '../state_machine'
 import { type Adapter, MemoryAdapter, type StateMachineConfig } from '../types'
 

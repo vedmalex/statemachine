@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it } from 'vitest'
 import { TimerScheduler } from '../scheduler'
 import { StateMachine } from '../state_machine'
 import { MemoryAdapter } from '../types'

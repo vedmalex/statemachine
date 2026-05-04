@@ -1,3 +1,4 @@
+import { describe, expect, it, vi } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Events,
@@ -116,7 +117,7 @@ describe('StateMachine attachToObject', () => {
     const eventMap = {
       switchon: 'switchOn',
     }
-    const mockFireEvent = jest.spyOn(sm, 'fireEvent')
+    const mockFireEvent = vi.spyOn(sm, 'fireEvent')
     sm.attachToObject(emitter, eventMap)
 
     emitter.dispatchEvent('switchon', 'arg1', 123)

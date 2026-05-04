@@ -4,25 +4,24 @@ import {
   describe,
   expect,
   it,
-  jest,
-  spyOn,
-} from 'bun:test'
+  vi,
+} from 'vitest'
 import { TimerScheduler } from '../scheduler'
 
 describe('TimerScheduler', () => {
   beforeEach(() => {
-    jest.useFakeTimers()
+    vi.useFakeTimers()
     TimerScheduler.getInstance().clear()
     TimerScheduler.getInstance().stop()
   })
 
   afterEach(() => {
-    jest.useRealTimers()
+    vi.useRealTimers()
   })
 
   it('should execute task after delay', () => {
     const scheduler = TimerScheduler.getInstance()
-    const callback = jest.fn()
+    const callback = vi.fn()
 
     scheduler.schedule(100, callback)
 
@@ -31,7 +30,7 @@ describe('TimerScheduler', () => {
     expect(callback).not.toHaveBeenCalled()
 
     // Advance time
-    jest.advanceTimersByTime(100)
+    vi.advanceTimersByTime(100)
 
     // Process manually
     scheduler.process(Date.now())
@@ -46,27 +45,27 @@ describe('TimerScheduler', () => {
     scheduler.schedule(100, () => calls.push('first'))
     scheduler.schedule(300, () => calls.push('third'))
 
-    jest.advanceTimersByTime(150)
+    vi.advanceTimersByTime(150)
     scheduler.process(Date.now())
     expect(calls).toEqual(['first'])
 
-    jest.advanceTimersByTime(100) // Total 250
+    vi.advanceTimersByTime(100) // Total 250
     scheduler.process(Date.now())
     expect(calls).toEqual(['first', 'second'])
 
-    jest.advanceTimersByTime(100) // Total 350
+    vi.advanceTimersByTime(100) // Total 350
     scheduler.process(Date.now())
     expect(calls).toEqual(['first', 'second', 'third'])
   })
 
   it('should cancel tasks', () => {
     const scheduler = TimerScheduler.getInstance()
-    const callback = jest.fn()
+    const callback = vi.fn()
 
     const token = scheduler.schedule(100, callback)
     scheduler.cancel(token)
 
-    jest.advanceTimersByTime(200)
+    vi.advanceTimersByTime(200)
     scheduler.process(Date.now())
 
     expect(callback).not.toHaveBeenCalled()
@@ -74,14 +73,14 @@ describe('TimerScheduler', () => {
 
   it('should work with auto-polling', () => {
     const scheduler = TimerScheduler.getInstance()
-    const callback = jest.fn()
+    const callback = vi.fn()
 
     // Enable polling every 50ms
     scheduler.setPollingInterval(50)
     scheduler.schedule(100, callback)
 
     // Advance time enough for polling to trigger and task to be due
-    jest.advanceTimersByTime(150)
+    vi.advanceTimersByTime(150)
 
     expect(callback).toHaveBeenCalled()
   })

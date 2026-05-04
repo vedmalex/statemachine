@@ -1,3 +1,4 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Events,
@@ -135,8 +136,8 @@ describe('StateMachine persistence', () => {
     })
     const sm = new StateMachine(personConfig, person)
 
-    const action = jest.fn()
-    const action1 = jest.fn()
+    const action = vi.fn()
+    const action1 = vi.fn()
     person.set('event', action)
 
     await sm.fireEvent('born', action1)
@@ -159,8 +160,8 @@ describe('StateMachine persistence', () => {
     )
     const sm = new StateMachine(personConfig, person)
 
-    const action = jest.fn()
-    const action1 = jest.fn()
+    const action = vi.fn()
+    const action1 = vi.fn()
     person.set('event', action)
 
     await sm.fireEvent('born', action1)
@@ -191,8 +192,8 @@ describe('StateMachine persistence', () => {
       'test_person',
     )
     const sm = new StateMachine(personConfig, person)
-    const action = jest.fn()
-    const action1 = jest.fn()
+    const action = vi.fn()
+    const action1 = vi.fn()
     person.set('event', action)
 
     await sm.fireEvent('born', action1)
@@ -221,8 +222,8 @@ describe('StateMachine persistence', () => {
     })
     const sm = new StateMachine(personConfig, person)
 
-    const action = jest.fn()
-    const action1 = jest.fn()
+    const action = vi.fn()
+    const action1 = vi.fn()
     person.set('event', action)
 
     await sm.fireEvent('born', action1)

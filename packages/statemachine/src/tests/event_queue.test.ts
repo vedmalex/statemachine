@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, test } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
   type Adapter,
@@ -106,7 +106,7 @@ describe('Event Queue', () => {
     const sm = new StateMachine<Counter, typeof config>(config, adapter)
 
     const events = sm.getQueuedEvents()
-    expect(events).toBeArray()
+    expect(Array.isArray(events)).toBe(true)
     expect(events.length).toBe(0)
   })
 

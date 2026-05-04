@@ -3,7 +3,7 @@
  * TDD-based tests for timeout, state visibility, and zombie prevention
  */
 
-import { describe, expect, it, beforeEach } from 'bun:test'
+import { describe, expect, it, beforeEach } from 'vitest'
 import { StateMachine } from '../state_machine'
 import { type Adapter, MemoryAdapter, type StateMachineConfig, StateMachineError } from '../types'
 
