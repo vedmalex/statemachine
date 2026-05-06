@@ -121,10 +121,11 @@ describe('StateMachine Debug Reproduction', () => {
     expect(transitionActionMock).toHaveBeenCalled() // Ожидаем провал здесь
   })
 
-  // 3. Тест на передачу контекста в Action
-  it('should pass correct context as first argument to actions', async () => {
-    let capturedContext: any = undefined
+  // 3. Тест на передачу owner в Action
+  it('should pass raw owner as first argument to actions', async () => {
+    let capturedOwner: any = undefined
     const adaptee = createMockAdaptee('idle')
+    ;(adaptee as any).role = 'tester'
 
     const config = {
       name: 'ContextMachine',
@@ -141,7 +142,7 @@ describe('StateMachine Debug Reproduction', () => {
       context: {
         role: 'tester',
         checkContext: (ctx: any) => {
-          capturedContext = ctx
+          capturedOwner = ctx
         }
       }
     }
@@ -153,10 +154,11 @@ describe('StateMachine Debug Reproduction', () => {
     // Вызываем событие, чтобы триггернуть action
     await machine.fireEvent('START')
 
-    console.log('Captured Context:', capturedContext)
+    console.log('Captured Owner:', capturedOwner)
 
-    expect(capturedContext).toBeDefined()
-    expect(capturedContext.role).toBe('tester')
+    expect(capturedOwner).toBeDefined()
+    expect(capturedOwner).toBe(adaptee)
+    expect(capturedOwner.role).toBe('tester')
   })
 
 })

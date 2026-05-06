@@ -194,6 +194,48 @@ describe('state machine as singleton', () => {
 })
 
 describe('StateMachine boolean fireEvent + history helpers', () => {
+  it('passes the raw owner object to config callbacks', async () => {
+    type Owner = {
+      state: string
+      count: number
+    }
+
+    let seenOwner: Owner | undefined
+
+    const config = {
+      name: 'CallbackOwner',
+      initialState: 'idle',
+      stateAttribute: 'state',
+      states: {
+        idle: {},
+        done: {
+          onEnter: (owner: Owner) => {
+            seenOwner = owner
+            owner.count++
+          },
+        },
+      },
+      events: {
+        go: {
+          transitions: [{ from: 'idle', to: 'done' }],
+        },
+      },
+    } satisfies StateMachineConfig<Owner>
+
+    const adapter = new MemoryAdapter<Owner>({
+      state: '',
+      count: 0,
+    })
+    const sm = new StateMachine<Owner, typeof config>(config, adapter)
+
+    await sm.fireEvent('go')
+
+    expect(seenOwner).toBeDefined()
+    expect(seenOwner).toBe(adapter.adaptee)
+    expect((seenOwner as any).adaptee).toBeUndefined()
+    expect(adapter.adaptee.count).toBe(1)
+  })
+
   it('returns false when all transitions are blocked by guards', async () => {
     type Owner = { state: string }
 

@@ -82,6 +82,12 @@ See `examples/integration/custom-adapter/`.
 The `adaptee` getter exposes the underlying host object the adapter binds to
 (used internally by the StateMachine for spreads and transitive access).
 
+State-machine callbacks resolved from config or `setContext()` (`onEnter`,
+`onExit`, `guard`, `onTransition`, `onError`, `invoke.action`, `invoke.cond`)
+receive the underlying owner object directly. The adapter wrapper stays
+internal to the machine boundary so host code does not need to unwrap it in
+each callback.
+
 ## EP-5 — ILogger (logging)
 
 **Contract** (from `src/types.ts`):

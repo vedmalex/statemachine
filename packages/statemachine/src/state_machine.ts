@@ -209,6 +209,12 @@ export class StateMachine<
     this.context = context
   }
 
+  private resolveCallbackOwner(value: Adapter<any> | TOwner): TOwner {
+    return isAdapter<TOwner>(value)
+      ? (value.adaptee as TOwner)
+      : (value as TOwner)
+  }
+
   private enqueueEvent(
     eventName: string,
     obj: Adapter<PropertiesOf<TOwner>>,
@@ -1402,7 +1408,7 @@ export class StateMachine<
     return (...args: any[]) => {
       const targetAdaptee = args.length >= 2 ? args[0] : adaptee
       const error = args.length >= 2 ? args[1] : args[0]
-      return handler(targetAdaptee, error)
+      return handler(this.resolveCallbackOwner(targetAdaptee), error)
     }
   }
 
@@ -1411,6 +1417,7 @@ export class StateMachine<
     actionName: ActionOrString<TOwner, CallResult>,
     ...args: any[]
   ): Promise<CallResult | void> {
+    const targetOwner = this.resolveCallbackOwner(obj)
     const _callActionState = this.getCurrentState(
       obj as unknown as Adapter<PropertiesOf<TOwner>>,
     )
@@ -1431,14 +1438,14 @@ export class StateMachine<
           >
           /* c8 ignore next */
           if (typeof action === 'function') {
-            const result = action(this.context as any, ...args)
+            const result = action(targetOwner, ...args)
             return result instanceof Promise ? await result : result
           }
         }
 
         // 2. Check if it's an inline function (Compatibility mode)
         else if (typeof actionName === 'function') {
-          const result = actionName(obj, ...args)
+          const result = actionName(targetOwner, ...args)
           return result instanceof Promise ? await result : result
         }
 
@@ -1447,7 +1454,7 @@ export class StateMachine<
           const action = obj.get(actionName as any)
           /* c8 ignore next */
           if (typeof action === 'function') {
-            const result = action(obj, ...args)
+            const result = action(targetOwner, ...args)
             /* c8 ignore next */
             return result instanceof Promise ? await result : result
           }
@@ -1660,7 +1667,7 @@ export class StateMachine<
             event.onError,
             this.onError,
           )
-          errorHandler(obj as any, error)
+          errorHandler(this.resolveCallbackOwner(obj), error)
         }
       }
 

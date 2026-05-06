@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { StateMachine } from '../state_machine'
-import { type Adapter, MemoryAdapter, type StateMachineConfig } from '../types'
+import { MemoryAdapter, type StateMachineConfig } from '../types'
 
 interface TrafficLight {
   state: string
@@ -13,21 +13,21 @@ const config: StateMachineConfig<TrafficLight> = {
   initialState: 'green',
   states: {
     green: {
-      onEnter: async (adapter: Adapter<TrafficLight>) => {
+      onEnter: async (owner: TrafficLight) => {
         await new Promise((resolve) => setTimeout(resolve, 10))
-        adapter.adaptee.count++
+        owner.count++
       },
     },
     yellow: {
-      onEnter: async (adapter: Adapter<TrafficLight>) => {
+      onEnter: async (owner: TrafficLight) => {
         await new Promise((resolve) => setTimeout(resolve, 10))
-        adapter.adaptee.count++
+        owner.count++
       },
     },
     red: {
-      onEnter: async (adapter: Adapter<TrafficLight>) => {
+      onEnter: async (owner: TrafficLight) => {
         await new Promise((resolve) => setTimeout(resolve, 10))
-        adapter.adaptee.count++
+        owner.count++
       },
     },
   },
@@ -88,8 +88,8 @@ describe('Concurrency Tests', () => {
       states: {
         ...config.states,
         green: {
-          onEnter: async (adapter: Adapter<TrafficLight>) => {
-            adapter.adaptee.count += 10
+          onEnter: async (owner: TrafficLight) => {
+            owner.count += 10
           },
         },
       },

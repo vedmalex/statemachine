@@ -190,9 +190,11 @@ export type StatePaths<S> =
   | NestedStateName<S>
   | DeepNestedStateName<S>
 
+// Config callbacks and setContext-resolved string callbacks run against the
+// underlying owner object, not the adapter wrapper.
 export type ActionOrString<T extends object, R = void> =
   | KeysOf<T, EventAction<T, R>>
-  | EventAction<Adapter<T>, R>
+  | EventAction<T, R>
 export type ErrorHandlerOrString<T extends object> =
   | KeysOf<T, ErrorHandler<T>>
   | ErrorHandler<T>
@@ -290,7 +292,7 @@ export interface StateMachineConfig<T extends object = object> {
   >
   states: States<T> // Корневые состояния машины
   // states: Record<StateName, Omit<State<T>, 'name'>>
-  onError?: KeysOf<T, ErrorHandler<T>>
+  onError?: ErrorHandlerOrString<T>
 }
 
 // `Adaptee<T>`, `Configuree<T>`, and `Config<T>` type-utilities were removed in TASK-003 CODE_REVIEW.

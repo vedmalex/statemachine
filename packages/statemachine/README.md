@@ -34,7 +34,7 @@ Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedma
 
 ## Extension Points
 
-This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
 
 ## Stability policy
 

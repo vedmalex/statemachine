@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import { StateMachine } from '../state_machine'
 import {
-  type Adapter,
   MemoryAdapter,
   type StateMachineConfig,
   StateMachineError,
@@ -23,17 +22,17 @@ describe('Event Queue', () => {
       initialState: 'idle',
       states: {
         idle: {
-          onEnter: (adapter: Adapter<Counter>) => {
+          onEnter: () => {
             log.push('enter:idle')
           },
         },
         processing: {
-          onEnter: (adapter: Adapter<Counter>) => {
+          onEnter: () => {
             log.push('enter:processing')
           },
         },
         done: {
-          onEnter: (adapter: Adapter<Counter>) => {
+          onEnter: () => {
             log.push('enter:done')
           },
         },

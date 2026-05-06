@@ -46,6 +46,7 @@ describe('StateMachine Context', () => {
     await sm.fireEvent('event1')
 
     expect(actionFromContext).toHaveBeenCalledTimes(1)
+    expect(actionFromContext).toHaveBeenCalledWith(adaptee.adaptee)
     expect(actionFromAdaptee).not.toHaveBeenCalled()
   })
 

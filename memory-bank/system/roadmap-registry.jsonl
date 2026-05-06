@@ -5,3 +5,5 @@
 {"event":"roadmap_phase_created","id":"RM-001-P04","roadmap_id":"RM-001","name":"grainjs-prod-migration","order":4,"status":"pending","tasks":[],"ts":"2026-05-02T22:42:39Z"}
 {"event":"roadmap_phase_closed","id":"RM-001-P01","ts":"2026-05-04T13:30:00Z","closure_summary":"All 6 child tasks ARCHIVED; @vedmalex/statemachine@1.0.0-beta.1 live on npm; tag task-007-published-stable at b0492df"}
 {"event":"roadmap_phase_activated","id":"RM-001-P02","ts":"2026-05-04T13:45:00Z","activation_summary":"Phase 2 zig-wasm-port entered via TASK-009 VAN","entry_task":"TASK-009"}
+{"event":"roadmap_task_linked","task_id":"TASK-011","roadmap_id":"RM-001","phase_id":"RM-001-P02","ts":"2026-05-06T07:16:01Z","__mb3_idempotency":"roadmap_add_task:RM-001:RM-001-P02:TASK-011"}
+{"event":"roadmap_phase_completed","id":"RM-001-P02","roadmap_id":"RM-001","status":"completed","ts":"2026-05-06T07:31:38Z"}
