@@ -1,0 +1,35 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.14/schema.json",
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": false,
+      "correctness": {
+        "noUnusedVariables": "error",
+        "noUnusedImports": "error"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": false
+  },
+  "assist": {
+    "enabled": false
+  },
+  "files": {
+    "includes": [
+      "**/*.{ts,js,mjs,json}",
+      "!dist/**",
+      "!types/**",
+      "!docs/**",
+      "!coverage/**",
+      "!temp/**",
+      "!node_modules/**",
+      "!**/node_modules/**",
+      "!src/tests/**",
+      "!test/**",
+      "!package-lock.json",
+      "!**/package-lock.json"
+    ]
+  }
+}

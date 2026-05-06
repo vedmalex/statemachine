@@ -45,6 +45,9 @@
     "clean": "rm -rf dist types coverage tsconfig.tsbuildinfo",
     "build": "npm run clean && tsup && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "lint": "biome check .",
+    "typecheck": "tsc --noEmit",
+    "check": "biome check . && tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
@@ -53,11 +56,12 @@
     "test:browser": "playwright test",
     "knip": "knip --no-progress",
     "api:check": "api-extractor run --local --verbose",
-    "prepublishOnly": "npm run build && node test/verify-dist.cjs"
+    "prepublishOnly": "npm run check && npm run build && node test/verify-dist.cjs"
   },
   "dependencies": {},
   "peerDependencies": {},
   "devDependencies": {
+    "@biomejs/biome": "2.4.14",
     "@changesets/cli": "^2.31.0",
     "@microsoft/api-extractor": "^7.58.7",
     "@playwright/test": "^1.59.1",
