@@ -1,9 +1,10 @@
 {
   "projectName": "@vedmalex/statemachine",
   "projectRoot": "/Users/vedmalex/work/statemachine",
-  "mbPlacement": "root",
+  "mbPlacement": "embedded",
   "sourceRoots": [
     "packages/statemachine/src/",
+    "packages/statemachine-zig/src/",
     "examples/integration/"
   ],
   "excludePatterns": [
@@ -14,7 +15,21 @@
     "docs/api-html",
     ".git",
     "*.lock",
-    "bun.lock"
+    "bun.lock",
+    "zig-cache",
+    "zig-out"
   ],
-  "primaryPackage": "packages/statemachine"
+  "primaryPackage": "packages/statemachine",
+  "methodology": "tiger-style",
+  "methodologyRefs": {
+    "tigerStyle": "/Users/vedmalex/work/agent-skills/docs/methodology/tiger-style-methodology.md",
+    "ztbLens": "/Users/vedmalex/work/agent-skills/docs/methodology/ztb-lens.md"
+  },
+  "lang": ["typescript", "zig"],
+  "ztbLens": {
+    "active": true,
+    "scope": ["general", "zig"],
+    "activatedBy": "UR-013",
+    "activatedAt": "2026-05-26"
+  }
 }

@@ -31,17 +31,22 @@ Core types:
 
 ### `std.heap` — Allocators
 
-Confirmed shipped in 0.16:
+Confirmed shipped in 0.16 (release-notes-derived + upstream `std/heap.zig` inspection):
 - **`ArenaAllocator`** — **lock-free, thread-safe** (new in 0.16; ~7-thread speedup).
 - **`FixedBufferAllocator`** — fixed pre-allocated region.
 - **`GeneralPurposeAllocator`** — full-featured GPA.
-- **`page_allocator`** — OS page-level.
+- **`page_allocator`** — OS page-level allocator (used on non-wasm targets).
 - **`c_allocator`** — libc malloc wrapper.
+- **`wasm_allocator`** — page-level allocator specific to `wasm32-*` targets; backs the WASM linear-memory growth via `@wasmMemoryGrow`. Documented at https://ziglang.org/documentation/0.16.0/std/#std.heap.wasm_allocator. Shipped in pre-0.16 releases too; release notes do not enumerate it as a 0.16-specific change.
 
 **Removed in 0.16:**
 - `heap.ThreadSafeAllocator` (anti-pattern; individual allocators should be lock-free).
 
-**Phase 2 choice (TD-T9-13)**: per-StateMachine `ArenaAllocator` carved from `FixedBufferAllocator` over WASM linear memory. Reset on `dispose()` for batch free.
+**Phase 2 choice (TD-T9-13, reformulated 2026-05-26)**:
+- Consumer A (WASM, through `@vedmalex/statemachine-zig`): `std.heap.ArenaAllocator(std.heap.wasm_allocator)` — wasm_allocator as the page-level backing inside the per-Instance linear memory; ArenaAllocator on top for transient allocations. Bulk-reset on `dispose()`.
+- Consumer B (Zig direct): `std.heap.ArenaAllocator(caller_allocator)` — caller-supplied outer allocator; ArenaAllocator owns StateMachine-lifetime allocations only. Bulk-reset on `dispose()`.
+- `FixedBufferAllocator` standalone is NOT used (no free, even bulk; rejected by TD-T9-13 due to inability to dispose intermediate scratch).
+- `GeneralPurposeAllocator` is NOT used (heavier per-alloc overhead; incompatible with simple WASM linear-memory model).
 
 ### `std.wasm` (existing in pre-0.16; status in 0.16 unchanged per release notes)
 - WASM-format helpers, opcodes, sections.
@@ -126,7 +131,7 @@ For VAN/CREATIVE/PLAN of TASK-009, the release-notes-derived module summary abov
 | Area | Change | Phase 2 implication |
 |---|---|---|
 | `std.Io` | New interface for fs/net/time/process | Mirror our IMonitor/ITimerScheduler pattern in Zig core |
-| `std.heap.ArenaAllocator` | Lock-free, thread-safe | TD-T9-13: per-StateMachine arena |
+| `std.heap.ArenaAllocator` | Lock-free, thread-safe | TD-T9-13: per-StateMachine arena. Consumer A backs onto `std.heap.wasm_allocator`; consumer B backs onto caller-supplied allocator. |
 | `std.heap.ThreadSafeAllocator` | REMOVED | Don't try to wrap allocators with mutexes |
 | `std.posix` / `std.os.windows` | Most medium-level fns removed | Use `std.Io` (Phase 2) or `std.posix.system` (low-level) |
 | `std.debug` | Reworked, safe unwinding | TD-T9-6: emit `.debug.wasm` with DWARF |

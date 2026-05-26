@@ -1,6 +1,50 @@
 # Coding Rules — @vedmalex/statemachine
 
-Updated: 2026-05-04
+Updated: 2026-05-26
+
+## Methodology — TigerStyle + ZTB lens (UR-013, adopted 2026-05-26)
+
+This project commits to the **TigerStyle methodology** for all library packages: TS core (`packages/statemachine/`), Zig core (`packages/statemachine-zig/`, created in TASK-010), and any future integration packages.
+
+- **Reference:** `/Users/vedmalex/work/agent-skills/docs/methodology/tiger-style-methodology.md`
+- **DA cross-lens:** `/Users/vedmalex/work/agent-skills/docs/methodology/ztb-lens.md`
+
+### Priority order (non-negotiable)
+
+```
+Safety   >   Performance   >   Developer Experience
+```
+
+Conflicts resolve top-down. Trade-offs that sacrifice safety for the lower priorities must be explicit and justified in the affected artefact.
+
+### ZTB lens activation
+
+- **Auto-active** for any phase where `.zig` files appear in diff OR `packages/statemachine-zig/build.zig` exists in the working tree.
+- **Active by methodology declaration** (this section) for TS-only diffs from the moment of adoption.
+- Applies the full **ZTB-General** check set (G1–G13) plus **ZTB-Zig** (Z1–Z10) when Zig files are touched.
+- `mb3-critic` envelope `lens` field includes `+ ZTB` suffix on IMPLEMENT / QA / CODE_REVIEW gates.
+
+### Operative TigerStyle baselines for this project
+
+- **Function cap:** 70 lines (TS + Zig). Helpers extract control flow upward; data-plane helpers stay branch-free.
+- **Assertion density:** ≥2 ассерта в среднем на новую/изменённую функцию. Парные ассерты у писателя+читателя для критических инвариантов.
+- **Operating vs programmer errors:** разделены типами возврата. TS — `Result<T, E>`-подобные union types или `throw` для programmer errors; Zig — `error{...}!T` для operating, `assert`/`unreachable` для programmer.
+- **Hot path memory:** zero dynamic allocation. Pre-allocate capacity at `init`; pools instead of per-event `new`.
+- **Static-width integers:** Zig — `u32`/`u64`/`i64`, не `usize` в бизнес-логике. TS — branded numeric types где off-by-one критичен.
+- **Limits as first-class:** all loops/queues/buffers/timeouts have named upper-bound constants + fail-fast assert on breach.
+- **Push ifs up, push fors down:** branches at the caller, loops near data.
+- **Control plane / data plane separation:** validation/auth done once per batch; data plane is branch-free.
+- **Naming:** существительные (не причастия), единицы в конце имени (`latency_ms_max`, не `max_latency_ms`), без сокращений (`source`/`target`, не `src`/`dst`).
+- **`zig fmt` mandatory** before commit for any `.zig` file. Prettier mandatory for TS.
+- **Comptime invariants:** wire-format structs MUST carry `comptime assert(@sizeOf(T) == N)`.
+- **`errdefer`:** каждая `try gpa.alloc()` сопровождается `errdefer gpa.free(...)` сразу же.
+
+### Conflict with existing rules
+
+Where this section overlaps with sections below (e.g., coverage threshold, strict TypeScript), the stricter rule wins. TigerStyle never relaxes an existing baseline — it only tightens or adds.
+
+---
+
 
 ## Public API discipline
 

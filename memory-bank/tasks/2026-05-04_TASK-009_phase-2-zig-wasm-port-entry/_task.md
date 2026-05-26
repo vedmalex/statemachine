@@ -31,15 +31,18 @@
 
 ## UR Coverage
 
-- [ ] UR-001 — partial
-- [ ] UR-002 — missing
-- [ ] UR-003 — missing
-- [ ] UR-004 — missing
-- [ ] UR-005 — missing
-- [ ] UR-006 — missing
-- [ ] UR-007 — missing
-- [ ] UR-008 — missing
-- [ ] UR-009 — missing
-- [ ] UR-010 — missing
-- [ ] UR-011 — partial
-- [ ] UR-012 — partial
+> CREATIVE-time status. Authoritative coverage matrix lives in `artifacts/creative-decisions.md` §"UR Coverage Matrix". Final ARCHIVE-time satisfaction tracked when TASK-009 closes.
+
+- [x] UR-001 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
+- [x] UR-002 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
+- [x] UR-003 — COVERED by TD-T9-1 (`packages/statemachine-zig/` separate package)
+- [x] UR-004 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
+- [x] UR-005 — COVERED by TD-T9-9 (separate `createMachineZig()` factory; `createMachine()` signature unchanged) + TD-T9-11 (ABI versioning)
+- [x] UR-006 — COVERED by TD-T9-2, TD-T9-3, TD-T9-7, TD-T9-8
+- [x] UR-007 — COVERED by TD-T9-6, TD-T9-10, TD-T9-11, TD-T9-12 (behavioral parity via TASK-014 + Zig-side `std.testing` MUST)
+- [x] UR-008 — COVERED by TD-T9-2 + R-T9-8 closure
+- [x] UR-009 — COVERED (PRIMARY DRIVER for all TD-T9-*)
+- [x] UR-010 — COVERED by TD-T9-1, TD-T9-5 (EP catalog preserved)
+- [ ] UR-011 — PARTIAL (TASK-017 owns final verification; TD-T9-1 carries `PENDING UR-011` marker on Zig package name)
+- [x] UR-012 — COVERED (Phase 2 entry decomposition complete)
+- [x] UR-013 — COVERED by TigerStyle methodology adoption + ZTB lens registration in `CODING_RULES.md` + `project-config.json`

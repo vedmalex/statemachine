@@ -1,0 +1,34 @@
+{
+  "schema": "mb3-critic.review/v2",
+  "verdict": "PROCEED",
+  "lens": "Design Integrity + UR-Goal Traceability + ZTB",
+  "task_id": "TASK-009",
+  "phase": "CREATIVE",
+  "iteration": "r04",
+  "reviewedAt": "2026-05-26",
+  "hookPersistencePathFailed": true,
+  "hookPersistenceFailureReason": "task_not_found_in_any_known_project despite (a) project registered in mb3_project list, (b) activeTask=TASK-009 confirmed via mb3_project info, (c) envelope.task_id=TASK-009 correctly extracted by hook. This is a fourth class of hook routing bug — recorded in agent-skills/TASK-284 as continuation evidence.",
+  "rationale": "r04 closes the single r03 finding F-CRE-C3-1 cleanly: zig-016-phase2-impact.md reconciliation note line 5 now enumerates Q-T9-9 and R-T9-5 among the updated rows; Q-T9-9 row at line 37 and R-T9-5 row at line 53 explicitly mark TD-T9-9 reformulated 2026-05-26 (createMachine signature unchanged; Zig opt-in via separate package @vedmalex/statemachine-zig createMachineZig factory). Fresh-eyes grep across the full task tree confirms no live useZigCore residue and no other pre-reformulation drift. Cumulative state: all 12 r01 findings closed (verified r03), all 6 r02 findings closed (verified r03), the 1 r03 finding closed (verified r04). UR Traceability: 13/13 URs mapped — 12 COVERED, UR-011 PARTIAL by design (TASK-017 owns final npm/Zig-registry name verification per UR-011 gate). UR-005 honoured strictly: createMachine signature at packages/statemachine/etc/statemachine.api.md:29 unchanged from 1.0.0-beta.1; IMonitor interface at packages/statemachine/etc/statemachine.api.md:260-269 unchanged (4 members, no flush — flush lives on IZigMonitor in @vedmalex/statemachine-zig per TD-T9-14). UR-013 (TigerStyle + ZTB methodology) registered in CODING_RULES.md §Methodology and project-config.json.ztbLens; ZTB scope at CREATIVE locked (General advisory; ZTB-Zig dormant until TASK-010 first .zig file). CREATIVE is ready to transition to PLAN. PLAN will plan in detail the 8 named children: TASK-010 (Zig toolchain + WASM build, T3), TASK-011 (Core types port, T3), TASK-012 (StateMachine core port, T4 baseline with T5 escalation triggers documented), TASK-013 (EP shims + IMonitor batching ring buffer, T3), TASK-014 (three-layer parity tests all MUST, T3), TASK-015 (Multi-runtime smoke, T2), TASK-016 (Bundle + perf, T2, hard 250 KB budget), TASK-017 (Zig + npm package publishing, T3, UR-011 verification gate).",
+  "findings": [],
+  "ur_traceability": [
+    { "ur_id": "UR-001", "status": "COVERED", "user_goal": "Bootstrap standalone statemachine monorepo (TypeScript extraction)", "evidence": "_task.md:36 SATISFIED by Phase 1 ARCHIVED carry-forward" },
+    { "ur_id": "UR-002", "status": "COVERED", "user_goal": "Standalone framework-agnostic library, zero @grainjs runtime deps", "evidence": "SATISFIED by Phase 1; Phase 2 must not regress (orchestration-packet.md L30)" },
+    { "ur_id": "UR-003", "status": "COVERED", "user_goal": "Separate dedicated monorepo with packages-as-packages discipline", "evidence": "TD-T9-1 places Zig core in separate package @vedmalex/statemachine-zig (creative-decisions.md L42-58)" },
+    { "ur_id": "UR-004", "status": "COVERED", "user_goal": "Drop DI from statemachine core", "evidence": "SATISFIED by Phase 1 ARCHIVED (_task.md L39)" },
+    { "ur_id": "UR-005", "status": "COVERED", "user_goal": "Stabilize current public API; ship 1.0.0-beta.x; no API redesign", "evidence": "createMachine signature unchanged (statemachine.api.md:29); IMonitor unchanged (statemachine.api.md:260-269); TD-T9-9 places Zig opt-in in separate package; TD-T9-14 scopes flush() to IZigMonitor in Zig-only package" },
+    { "ur_id": "UR-006", "status": "COVERED", "user_goal": "Bun/Node 20+/Browser/Deno/Edge support; ESM+CJS; portable core", "evidence": "TD-T9-2, TD-T9-3, TD-T9-7, TD-T9-8" },
+    { "ur_id": "UR-007", "status": "COVERED", "user_goal": "Strict TS, ≥90% coverage, TypeDoc, cookbook", "evidence": "TD-T9-6, TD-T9-10 (three-layer test parity all MUST including Zig-side std.testing), TD-T9-11, TD-T9-12, TD-T9-14 (comptime invariants)" },
+    { "ur_id": "UR-008", "status": "COVERED", "user_goal": "CI/CD via GitHub Actions under vedmalex personal account", "evidence": "TD-T9-2 + R-T9-8 closure" },
+    { "ur_id": "UR-009", "status": "COVERED", "user_goal": "Plan for Zig/WASM rewrite; TS design WASM-friendly", "evidence": "PRIMARY DRIVER for all 14 TD-T9-* + 8-task child DAG" },
+    { "ur_id": "UR-010", "status": "COVERED", "user_goal": "Documented extension points for integration packages", "evidence": "TD-T9-1, TD-T9-5, TD-T9-14 (IZigMonitor extends IMonitor)" },
+    { "ur_id": "UR-011", "status": "PARTIAL", "user_goal": "npm package names available, verified via npm view, operator-confirmed before publish", "evidence": "PARTIAL by design — TD-T9-1 carries PENDING UR-011 markers on both @vedmalex/statemachine-zig (npm) and Zig package slug; ownership locked to TASK-017 publish gate (orchestration-packet.md L18). Operator-confirmed deferral; PARTIAL is correct (not MISSING) — verification named, owned, gated." },
+    { "ur_id": "UR-012", "status": "COVERED", "user_goal": "Phase 2 entry — decompose RM-001-P02 into child tasks; lock DAG; resolve Q-T9-1..13", "evidence": "13 Q-T9 → 14 TD-T9-*; 8-task DAG locked; AC#1-7 met" },
+    { "ur_id": "UR-013", "status": "COVERED", "user_goal": "Adopt TigerStyle + ZTB lens", "evidence": "Registered in CODING_RULES.md §Methodology + project-config.json.ztbLens (active=true, scope=[general,zig], activatedBy=UR-013, activatedAt=2026-05-26); ZTB scope at CREATIVE locked in creative-decisions.md L10" }
+  ],
+  "iterationsHistory": [
+    { "iteration": "r01", "verdict": "REVISE", "findings_count": 12, "all_closed": true },
+    { "iteration": "r02", "verdict": "REVISE", "findings_count": 6, "all_closed": true },
+    { "iteration": "r03", "verdict": "REVISE", "findings_count": 1, "all_closed": true },
+    { "iteration": "r04", "verdict": "PROCEED", "findings_count": 0, "all_closed": true }
+  ]
+}

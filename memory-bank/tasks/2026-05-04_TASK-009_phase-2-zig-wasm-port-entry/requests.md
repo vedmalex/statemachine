@@ -61,3 +61,10 @@
 - Timestamp: 2026-05-04 14:43
 - Source: user
 - Text (verbatim): "Phase 2 entry — zig-wasm-port. Decompose RM-001-P02 into actionable child tasks (TASK-010+) per UR-009, lock the child-task DAG, and resolve open questions Q-T9-1..Q-T9-13 before subagent dispatch."
+
+## UR-013
+- Timestamp: 2026-05-26
+- Source: user
+- Text (verbatim): "mb3 давай будем использовать tiger style ZTB для разработки этой библиотеки"
+- Scope (operator-clarified): Apply TigerStyle methodology (`/Users/vedmalex/work/agent-skills/docs/methodology/tiger-style-methodology.md`) + ZTB lens (`/Users/vedmalex/work/agent-skills/docs/methodology/ztb-lens.md`) to ALL library packages — TS core (`packages/statemachine/`), Zig core (`packages/statemachine-zig/`, to be created in TASK-010), and any integration packages.
+- Cross-cutting impact: re-frames TD-T9-1..TD-T9-13 through Safety > Performance > DX priority order; makes ZTB lens authoritative for IMPLEMENT / QA / CODE_REVIEW DA gates from this point forward.

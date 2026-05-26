@@ -7,17 +7,19 @@ This packet drives Phase 2 entry decomposition. It is the canonical input for `m
 - **Program**: Statemachine Standalone Evolution (RM-001)
 - **Phase scope of this packet**: Phase 2 only — `RM-001-P02 zig-wasm-port`. Phase 3 (mb3-dsl-adoption) and Phase 4 (grainjs-prod-migration) are out of scope.
 - **Parent task**: TASK-009 (Phase 2 entry; T5:epic candidate)
-- **Children** (CREATIVE-locked; PLAN finalizes tiers and per-task ACs):
-  - TASK-010 Zig toolchain + WASM build pipeline (T3) — **dual outputs**: native Zig lib + `wasm32-unknown-none` artefact
-  - TASK-011 Core types port (T3) — public Zig API + WASM extern surface; exports `abi_version`
-  - TASK-012 StateMachine class core port (**T4 candidate, T5 likely** — DA F-VAN-C2-1; PLAN re-evaluates and decomposes if T5)
-  - TASK-013 EP shims (T3) — JS host implements IMonitor/ITimerScheduler/IErrorHandler; consumer A only
-  - TASK-014 ABI parity tests (T3) — TASK-014a WASM extern + TASK-014b Zig native bindings (consumer B parity)
+- **Children** (CREATIVE-locked; PLAN finalizes per-task ACs):
+  - TASK-010 Zig toolchain + WASM build pipeline (T3) — **single `wasm32-unknown-none` target** (TD-T9-3) + native targets for consumer B
+  - TASK-011 Core types port (T3) — public Zig API + WASM extern surface; exports `abi_version`; `comptime assert(@sizeOf(...))` on all wire-format structs (TigerStyle ZTB-Zig Z4)
+  - TASK-012 StateMachine class core port — **T4:large baseline; escalates to T5:epic on ANY of (a) Zig port > 700 lines, (b) ≥2 distinct concurrency patterns in one file, (c) PLAN cannot fit in single document ≤ ~400 lines**. On escalation: TASK-012a (flat core + transitions), TASK-012b (nested/parallel regions), TASK-012c (adapter integration). PLAN owns the trigger evaluation.
+  - TASK-013 EP shims (T3) — JS host implements IMonitor/ITimerScheduler/IErrorHandler; **IMonitor batching ring buffer (TD-T9-14)**; consumer A path
+  - TASK-014 ABI + behavioural parity tests (T3) — three layers all MUST: (a) 7 structural ABI tests against WASM; (b) full TS test suite rerun via `createMachineZig` symbol-swap; (c) Zig-side `std.testing` unit tests for comptime invariants + internals
   - TASK-015 Multi-runtime smoke (T2) — Bun, Node 20+, Browser (Safari iOS), Deno/Edge
-  - TASK-016 Bundle size + perf benchmark (T2) — `etc/wasm-size.txt` ratchet at +50% over baseline
-  - TASK-017 Zig package publishing (T3) — `build.zig.zon` registry / git tag; semver-align with npm `@vedmalex/statemachine`; UR-011 name verification
+  - TASK-016 Bundle size + perf benchmark (T2) — **hard budget 250 KB total** (200 KB raw `.wasm` + 50 KB JS shim) + 150% baseline ratchet
+  - TASK-017 Zig + npm package publishing (T3) — publish `@vedmalex/statemachine-zig` to npm + Zig package to registry/git tag; **UR-011 name verification BEFORE first publish** (both names PENDING)
 
-**Dual-consumer model (TD-T9-1)**: Single Zig source produces TWO artefacts — npm tarball with `.wasm` (consumer A: TS host via WASM) + Zig package (consumer B: other Zig projects via Zig package manager). Both consumers exercise the same 7 ABI tests for parity.
+**Dual-consumer model (TD-T9-1 + TD-T9-9, reformulated 2026-05-26)**: Single Zig source produces TWO artefacts. Consumer A (TS host via WASM) is reached via **separate npm package `@vedmalex/statemachine-zig` exporting `createMachineZig()`** — the canonical `@vedmalex/statemachine.createMachine()` signature is unchanged from 1.0.0-beta.1 (UR-005 honoured strictly). Consumer B (Zig direct) uses Zig package manager. Both consumers exercise the structural ABI tests + Zig-side unit tests; behavioural parity owned by TASK-014b symbol-swap.
+
+**Methodology (UR-013, adopted 2026-05-26)**: TigerStyle + ZTB lens active across all children. `mb3-critic` envelopes carry `+ ZTB` suffix on IMPLEMENT / QA / CODE_REVIEW gates. See `memory-bank/system/CODING_RULES.md` §Methodology.
 - **Vocabulary alignment**: lifecycle phases (VAN..ARCHIVE) per MB3 topology. Authoritative DA actor remains `mb3-critic`.
 
 ## Scope + Binding
@@ -25,7 +27,7 @@ This packet drives Phase 2 entry decomposition. It is the canonical input for `m
 - **Roadmap binding**: RM-001 Phase 2 (RM-001-P02 `zig-wasm-port`).
 - **Project binding**: `/Users/vedmalex/work/statemachine/` — the standalone monorepo (post-Phase-1 closure).
 - **MB3 work tree**: `/Users/vedmalex/work/statemachine/memory-bank/` (NOT the legacy grainjs-prod tree; D15 bifurcation is closed post-TASK-008).
-- **UR coverage** (TASK-009 inherits): UR-001 (umbrella), UR-009 (WASM/Zig portability). Other URs (002/005/007/008/010/011) inherited via Phase 1 closure as constraints — Phase 2 must NOT regress them.
+- **UR coverage** (TASK-009 inherits): UR-001 (umbrella), UR-009 (WASM/Zig portability), UR-013 (TigerStyle + ZTB methodology, adopted 2026-05-26). Other URs (002/005/007/008/010/011) inherited via Phase 1 closure as constraints — Phase 2 must NOT regress them. UR-005 (API stability) is honoured by TD-T9-9 reformulation: Zig opt-in via separate package `@vedmalex/statemachine-zig`, not via `createMachine()` flag.
 - **Out of scope** (per Phase 2 stop scope):
   - Phase 3 MB3 DSL adoption
   - Phase 4 grainjs-prod consumer migration
@@ -56,7 +58,7 @@ Critical path: A → B → C → E → F → G → H. Parallel cluster after B: 
 
 > **Note (DA finding F-VAN-C2-2 fix)**: D was previously drawn as a child of C; corrected to show D as a sibling of C, both depending on B. Cluster C dispatch instructions in §`Execution timeline` (TASK-012 + TASK-013 parallel after B.ARCHIVE) match this corrected DAG.
 
-> **Note (DA finding F-VAN-C2-1)**: TASK-012 is currently sized as T4:standard but PLAN must re-evaluate as a likely T5:epic candidate. If escalated, TASK-012 should be decomposed into sub-tasks (TASK-012a flat-state core, TASK-012b nested/parallel state regions, TASK-012c adapter integration) before subagent dispatch.
+> **Note (DA finding F-VAN-C2-1, resolved 2026-05-26)**: TASK-012 baseline tier is **T4:large** with explicit escalation trigger to **T5:epic** on ANY of: (a) Zig port exceeds 700 lines (~10× TigerStyle 70-line cap × ~10 functions), (b) ≥2 distinct concurrency patterns required in a single file (flat + nested + parallel + adapter), (c) PLAN cannot author the full plan in ≤ ~400 lines of `plan.md`. PLAN owns trigger evaluation; on escalation, decompose into TASK-012a (flat core + transition machinery), TASK-012b (nested/parallel state regions), TASK-012c (adapter integration) before subagent dispatch.
 
 > **Note (TASK-017 added — operator decision 2026-05-04)**: 7th child for Zig package publishing (consumer B path). Sequential after TASK-016 — size+perf measured before public release; semver alignment with npm `@vedmalex/statemachine`; UR-011 name verification.
 

@@ -44,6 +44,7 @@ TASK-009 itself (the decomposition task) is DONE when all of the following hold:
 4. **`taskDecompose` function gate** cleared by `mb3-critic` with verdict PROCEED.
 5. **Orchestration packet updated** with the final child set, DAG, and stop conditions.
 6. **All 12 UR (UR-001..UR-012)** explicitly mapped to either "satisfied by Phase 1" or "covered by a planned child task".
+   - **Amendment 2026-05-26**: AC#6 scope extended to include **UR-013** (TigerStyle + ZTB methodology adoption) — `artifacts/creative-decisions.md` UR Coverage Matrix authoritatively tracks all 13 URs at CREATIVE exit.
 7. **TASK-009 ARCHIVE event** emitted only after operator approves the orchestration packet for child dispatch.
 
 ## Assumptions
