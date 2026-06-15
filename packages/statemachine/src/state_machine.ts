@@ -1722,6 +1722,39 @@ export class StateMachine<
     this._isTransitioning = true
     this._targetState = targetState as string
 
+    // D7: compute the immutable new configuration together with its SCXML
+    // ancestor-first enter / descendant-first exit sets ONCE, BEFORE any exit
+    // or enter action runs, so Phase 6 enters know the expanded leaves and
+    // Phase 8 reuses the same `newState` (no recompute). `updateState` calls
+    // `validateCompositeState`, which can throw on a contradictory target; we
+    // wrap the early compute so such a throw aborts cleanly with NO half-run
+    // exit/enter set rather than after Phase 3 has already exited states.
+    let newState: string
+    let enterStates: string[]
+    let exitStates: string[]
+    try {
+      newState = this.updateState(currentState, targetState as string)
+      const sets = this.computeEnterExitSets(currentState, newState)
+      enterStates = sets.enterStates
+      exitStates = sets.exitStates
+    } catch (error) {
+      this.logger.warn('Transition aborted: invalid target configuration', {
+        state: currentState,
+        target: String(targetState),
+        error,
+      })
+      this._isTransitioning = false
+      this._targetState = undefined
+      return undefined
+    }
+    // Fallbacks: a flat (non-composite) transition has no registered ancestor
+    // chain delta, so drive a single onExit/onEnter for the literal
+    // from/to names, preserving prior behaviour for flat states.
+    const exitFireOrder =
+      exitStates.length > 0 ? exitStates : [transition.from as string]
+    const enterFireOrder =
+      enterStates.length > 0 ? enterStates : [transition.to as string]
+
     try {
       // Phase 1: Guard validation
       if (transition.guard) {
@@ -1752,9 +1785,13 @@ export class StateMachine<
         )
       }
 
-      // Phase 3: Exit actions
+      // Phase 3: Exit actions — descendant-first (leaf-to-root) over the
+      // computed exit set (D2). Each exited leaf clears its own per-leaf
+      // invoke timers inside executeExitActions, so no timer leaks.
       try {
-        await this.executeExitActions(obj, transition.from, args, context)
+        for (const exitStateName of exitFireOrder) {
+          await this.executeExitActions(obj, exitStateName, args, context)
+        }
       } catch (error) {
         if (this.abortOnExitError) {
           this.logger.warn('Transition aborted due to onExit error', { state: currentState, error })
@@ -1778,15 +1815,20 @@ export class StateMachine<
         )
       }
 
-      // Phase 6: Enter actions
+      // Phase 6: Enter actions — ancestor-first (root-to-leaf) over the
+      // computed enter set (D2), so a composite parent's onEnter fires before
+      // each of its region children and each region leaf arms its own invoke
+      // timers.
       try {
-        await this.executeEnterActions(obj, transition.to, args, context)
+        for (const enterStateName of enterFireOrder) {
+          await this.executeEnterActions(obj, enterStateName, args, context)
+        }
       } catch (error) {
         // ZOMBIE STATE PREVENTION
         if (this.errorState) {
           this.logger.error(`Failed to enter state '${targetState}'. Fallback to error state '${this.errorState}'`, { error })
-          const newState = this.updateState(currentState, this.errorState)
-          this.setCurrentState(newState, obj as any)
+          const errorNewState = this.updateState(currentState, this.errorState)
+          this.setCurrentState(errorNewState, obj as any)
           return this.states.get(this.errorState)
         }
         throw error
@@ -1807,27 +1849,20 @@ export class StateMachine<
         }
       }
 
-      // Phase 8: State update
+      // Phase 8: State update — reuse the immutable `newState` computed once
+      // before Phase 3 (D7); never recompute. updateState is side-effect-free,
+      // so only the setCurrentState write stays late.
       const transitionStartTime = Date.now()
-      // Compute the immutable new configuration together with its SCXML
-      // ancestor-first enter / descendant-first exit sets in a single pass.
-      // T2 wires only the shared helpers and reuses `transitionPlan.newState`
-      // here, preserving existing behaviour; T3 lifts this compute to the
-      // pre-Phase-3 position (~D7) and drives the Phase 3/6 loops from
-      // transitionPlan.enterStates / transitionPlan.exitStates.
-      const newState = this.updateState(currentState, targetState)
-      const transitionPlan = {
-        newState,
-        ...this.computeEnterExitSets(currentState, newState),
-        // T7 wires the `isStateFinal` marker behaviour-neutrally: record which
-        // newly-active atomic leaves are UML/SCXML `<final>` states. Nothing
-        // consumes this yet; T8 replaces it with the real `checkCompletion`
-        // all-regions-final scan + `done.state.<id>` emission (D10/D11).
-        finalLeaves: newState
-          .split('|')
-          .filter((leaf) => leaf && this.isStateFinal(leaf)),
-      }
-      this.setCurrentState(transitionPlan.newState, obj as any)
+      this.setCurrentState(newState, obj as any)
+
+      // T7 placeholder, kept behaviour-neutral: record which newly-active atomic
+      // leaves are UML/SCXML `<final>` states. Nothing consumes this yet; T8
+      // replaces it with the real `checkCompletion` all-regions-final scan +
+      // `done.state.<id>` emission (D10/D11).
+      const finalLeaves = newState
+        .split('|')
+        .filter((leaf) => leaf && this.isStateFinal(leaf))
+      void finalLeaves
 
       // Record successful transition
       const transitionTime = Date.now() - transitionStartTime
