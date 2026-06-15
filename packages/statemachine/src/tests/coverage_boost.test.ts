@@ -1108,14 +1108,20 @@ describe('StateMachine composite state info', () => {
       events: {},
     }
     const sm = createMachine(config, { state: '' })
-    const state = sm.currentState
-    // If it entered properly
-    if (state.includes('|')) {
-      const info = sm.getCurrentStateInfo()
-      expect(info?.isComposite).toBe(true)
-    } else {
-      expect(sm.currentState).toBeDefined()
-    }
+    // Bare-root composite always expands its regions on entry (SCXML/UML D1),
+    // so the deterministic expanded shape is asserted directly (no defensive guard).
+    expect(sm.currentState.split('|').sort()).toEqual(
+      ['parent.r1.on', 'parent.r2.x'].sort(),
+    )
+    const info = sm.getCurrentStateInfo()
+    expect(info?.isComposite).toBe(true)
+    // regions report the dotted region keys; children the active leaves
+    expect(info?.regions?.slice().sort()).toEqual(
+      ['parent.r1', 'parent.r2'].sort(),
+    )
+    expect(info?.children?.slice().sort()).toEqual(
+      ['parent.r1.on', 'parent.r2.x'].sort(),
+    )
   })
 
   it('getCurrentStateInfo returns undefined when no current state', () => {
@@ -1915,16 +1921,15 @@ describe('StateMachine getCurrentStateInfo detail branches', () => {
       events: { exit: { transitions: [{ from: 'parent.r1.child', to: 'other' }] } },
     }
     const sm = createMachine(config, { state: '' })
-    // The current state should be parent.r1.child (initial nested state)
-    const currentState = sm.currentState
-    if (currentState.includes('.')) {
-      const info = sm.getCurrentStateInfo()
-      expect(info).toBeDefined()
-      // nested state should have parent
-      expect(info?.['parent']).toBeDefined()
-    } else {
-      expect(currentState).toBeDefined()
-    }
+    // The single-region composite deterministically expands to its leaf
+    // parent.r1.child on entry (D1); assert the concrete nested shape.
+    expect(sm.currentState).toBe('parent.r1.child')
+    const info = sm.getCurrentStateInfo()
+    expect(info).toBeDefined()
+    expect(info?.name).toBe('parent.r1.child')
+    expect(info?.isComposite).toBe(false)
+    // a nested leaf reports its immediate region container as parent
+    expect(info?.['parent']).toBe('parent.r1')
   })
 
   it('getCurrentStateInfo returns regions for composite state', () => {
@@ -1943,18 +1948,25 @@ describe('StateMachine getCurrentStateInfo detail branches', () => {
       },
       events: { go: { transitions: [{ from: '*', to: 'other' }] } },
     }
-    const sm = createMachine(config, { state: '' })
-    // multi state has regions
-    // check if we can get to a state where getCurrentStateInfo shows regions
-    // Force the current state to 'multi' by checking the info
+    createMachine(config, { state: '' })
+    // Assigning a bare-root composite via the public currentState setter expands
+    // its regions (D1, same path as a transition), so getCurrentStateInfo reports
+    // the deterministic expanded composite shape (dotted region keys + active leaves).
     const adapter = new MemoryAdapter({ state: 'multi' })
     const sm2 = new StateMachine(config, adapter)
     sm2.currentState = 'multi'
+    expect(sm2.getCurrentState()?.split('|').sort()).toEqual(
+      ['multi.r1.on', 'multi.r2.x'].sort(),
+    )
     const info = sm2.getCurrentStateInfo()
     expect(info).toBeDefined()
-    if (info && !info.isComposite) {
-      expect(info.name).toBe('multi')
-    }
+    expect(info?.isComposite).toBe(true)
+    expect(info?.regions?.slice().sort()).toEqual(
+      ['multi.r1', 'multi.r2'].sort(),
+    )
+    expect(info?.children?.slice().sort()).toEqual(
+      ['multi.r1.on', 'multi.r2.x'].sort(),
+    )
   })
 })
 
@@ -2182,18 +2194,15 @@ describe('StateMachine history states', () => {
       },
     }
     const sm = createMachine(config, { state: '' })
-    // State machine enters top initially
-    const initial = sm.currentState
-    expect(initial).toBeDefined()
+    // Bare-root composite expands deterministically to its region leaf (D1),
+    // so the deep-history round-trip is asserted directly (no defensive guard).
+    expect(sm.currentState).toBe('top.r1.s1')
     // Leave top region
-    if (initial.includes('top.r1.s1')) {
-      await sm.fireEvent('leave')
-      expect(sm.currentState).toBe('other')
-      // Return to top — should restore history
-      await sm.fireEvent('enter')
-      const restored = sm.currentState
-      expect(restored).toBeDefined()
-    }
+    await sm.fireEvent('leave')
+    expect(sm.currentState).toBe('other')
+    // Return to top — deep history restores the full expanded state path
+    await sm.fireEvent('enter')
+    expect(sm.currentState).toBe('top.r1.s1')
   })
 
   it('shallow history state records shallow state', async () => {

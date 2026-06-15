@@ -199,6 +199,91 @@ describe('StateMachine with hierarchical states using regions', () => {
   })
 
   /*
+    R1: SCXML/UML ancestor-first entry, descendant-first exit on a parallel-exit.
+    Leaving a composite parent fires every region-child onExit BEFORE the parent
+    composite onExit (descendant-first), and entering it fires the parent onEnter
+    BEFORE its region children (ancestor-first). These hooks are newly driven by
+    R1 (the engine was previously silent on the parent + sibling regions).
+  */
+  it('fires descendant-first sibling+parent onExit and ancestor-first onEnter on parallel-exit', async () => {
+    const log: string[] = []
+    const adaptee = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+
+    const states = {
+      wrap: {
+        display: 'Composite',
+        initial: 'r1.a|r2.x',
+        onEnter: () => log.push('enter:wrap'),
+        onExit: () => log.push('exit:wrap'),
+        regions: {
+          r1: {
+            a: {
+              onEnter: () => log.push('enter:r1.a'),
+              onExit: () => log.push('exit:r1.a'),
+            },
+          },
+          r2: {
+            x: {
+              onEnter: () => log.push('enter:r2.x'),
+              onExit: () => log.push('exit:r2.x'),
+            },
+          },
+        },
+      },
+      done: { display: 'Done', onEnter: () => log.push('enter:done') },
+    } satisfies States<typeof adaptee>
+
+    const events = {
+      finish: {
+        display: 'Finish',
+        // bare composite-parent `from` is eligible while any region is active
+        // (ANY-leaf parallel-exit / LCCA, D3)
+        transitions: [{ from: 'wrap', to: 'done' }],
+      },
+    } satisfies Events<typeof adaptee, typeof states>
+
+    const SMC = {
+      name: 'ParallelExitOrder',
+      initialState: 'wrap',
+      stateAttribute: 'state',
+      states,
+      events,
+    } satisfies StateMachineConfig<ExtractAdaptee<typeof adaptee>>
+
+    const sm = new StateMachine(SMC, adaptee)
+
+    // Initial entry is ancestor-first: parent onEnter precedes its region children.
+    expect(sm.isInState('wrap')).toBe(true)
+    expect(sm.getCurrentState()?.split('|').sort()).toEqual(
+      ['wrap.r1.a', 'wrap.r2.x'].sort(),
+    )
+    expect(log[0]).toBe('enter:wrap')
+    expect(log.slice(1).sort()).toEqual(['enter:r1.a', 'enter:r2.x'].sort())
+
+    log.length = 0
+    await sm.fireEvent('finish')
+    expect(sm.getCurrentState()).toBe('done')
+
+    // Descendant-first exit: BOTH region children onExit fire before the parent
+    // composite onExit, which fires before the target onEnter. Same-depth sibling
+    // order is map-insertion dependent, so assert order-insensitively per layer.
+    const exitWrapIdx = log.indexOf('exit:wrap')
+    const enterDoneIdx = log.indexOf('enter:done')
+    expect(log.indexOf('exit:r1.a')).toBeLessThan(exitWrapIdx)
+    expect(log.indexOf('exit:r2.x')).toBeLessThan(exitWrapIdx)
+    expect(exitWrapIdx).toBeLessThan(enterDoneIdx)
+    expect(log.slice(0, 2).sort()).toEqual(['exit:r1.a', 'exit:r2.x'].sort())
+    expect(log).toEqual([
+      ...log.slice(0, 2),
+      'exit:wrap',
+      'enter:done',
+    ])
+  })
+
+  /*
     2. Иерархические состояния: процесс покупки онлайн
     Процесс покупки в интернет-магазине с вложенными состояниями.
     Описание

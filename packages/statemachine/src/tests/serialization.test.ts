@@ -190,7 +190,10 @@ describe('StateMachine Serialization/Deserialization', () => {
       toParentChild1: {
         display: 'Перейти в Parent.Child1',
         transitions: [
-          { from: 'state1', to: 'parentState' }, // Переход на parentState восстановит начальные состояния регионов
+          // A transition into the bare-root composite 'parentState' expands its
+          // regions to their initial leaves (SCXML/UML D1). NOTE: this transition
+          // is declared for config shape only — it is not fired in this test body.
+          { from: 'state1', to: 'parentState' },
         ],
       },
     } satisfies Events<Person, PersonStates>
