@@ -3,7 +3,17 @@
 [![CI](https://github.com/vedmalex/statemachine/actions/workflows/ci.yml/badge.svg)](https://github.com/vedmalex/statemachine/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@vedmalex/statemachine?label=npm)](https://www.npmjs.com/package/@vedmalex/statemachine)
 
-Hierarchical state machine for TypeScript with monitoring, validation, and persistence.
+Hierarchical state machine for TypeScript with orthogonal (parallel) regions, SCXML/UML entry-exit semantics, monitoring, validation, and persistence.
+
+**Features:**
+
+- Hierarchical (nested) states addressed by dotted paths
+- Orthogonal **parallel regions** with SCXML ancestor-first entry / descendant-first exit
+- **UML all-regions-final join** via `final` states, the engine-raised `done.state.<id>` event, and the `isDone()` guard
+- Parallel-exit (LCCA) — a transition from a composite parent preempts and exits all active regions
+- Guards, before/enter/after + exit/transition actions, and timed `invoke` transitions
+- Pluggable monitoring, validation, persistence, and timer scheduling (7 extension points)
+- ESM + CJS dual bundle; DI-free lite surface
 
 The package ships only the DI-free lite surface. The legacy DI-aware factory from `@grainjs/statemachine` is intentionally not carried over.
 
@@ -61,7 +71,20 @@ const sm = createMachine({
 - **Parallel-exit** — a plain transition `from: 'proc'` on a user event preempts and exits all active regions immediately (LCCA).
 - **Join** — when all regions are `final`, the engine raises `done.state.proc`; `sm.isDone('proc')` reflects the all-final configuration. (`done.state.*` is never matched by a `from: '*'` wildcard.)
 
-See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, and validation.
+Author the join either as the `done.state.<id>` transition above, **or** as a guard on any event:
+
+```ts
+events: {
+  tryFinish: {
+    // fires only once every region of `proc` has reached a `final` state
+    transitions: [{ from: 'proc', to: 'complete', guard: () => sm.isDone('proc') }],
+  },
+}
+```
+
+Composites nest: a parent's `done.state` is raised only after every region — **including any nested composite** — is final, innermost-first. `done.state.<id>` is edge-triggered (raised once on entering the done configuration, not re-raised while the composite merely stays all-final).
+
+See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, nesting, and validation.
 
 ## Documentation
 
@@ -73,11 +96,11 @@ This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorH
 
 ## Stability policy
 
-5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
+5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. The all-regions-final join API lives on these stable symbols — `State.final?: boolean`, `StateMachine.isDone(compositeId)`, and the engine-raised `done.state.<id>` event (all reflected in `etc/statemachine.api.md`). Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
 
 ## Status & module format
 
-`1.0.0-beta.x`. Stability: experimental. The full API surface is currently `@unstable` per the package's STABILITY policy; per-symbol stability tagging arrives before `1.0.0` stable.
+`1.0.0-beta.x` (current published version: see the npm badge above; both the `latest` and `beta` dist-tags track the newest release). Stability: experimental. SCXML/UML parallel regions, ancestor-first / descendant-first ordering, and the all-regions-final join landed in **`1.0.0-beta.2`**. The full API surface is `@unstable` per the package's STABILITY policy except the 5 firm `@stable` symbols; per-symbol stability tagging completes before `1.0.0` stable.
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 
