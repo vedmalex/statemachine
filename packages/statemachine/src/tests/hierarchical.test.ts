@@ -1283,4 +1283,200 @@ describe('SCXML/UML regions: ancestor-first entry + final join (T0 repros, red)'
     // user-event abort did NOT spuriously fire.
     expect(smJoin.getCurrentState()).toBe('complete')
   })
+
+  // ── DA remediation (F-1, F-2, F-3) ────────────────────────────────────────
+
+  it('all-final with a from:* wildcard event declared (no done.state.C) does not fire spuriously and does not crash (F-1)', async () => {
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      proc: {
+        initial: 'a.run|b.run',
+        regions: {
+          a: { run: {}, done: { final: true } },
+          b: { run: {}, done: { final: true } },
+        },
+      },
+      elsewhere: {},
+    } satisfies States<any>
+    const events = {
+      finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
+      finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
+      // A wildcard event is declared but NO done.state.proc — reaching all-final
+      // must NOT enqueue an engine done.state event into the '*' fallback, and
+      // must not throw an Invalid-event rejection.
+      anything: { transitions: [{ from: '*', to: 'elsewhere' }] },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'WildcardNoDone',
+        initialState: 'proc',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    await sm.fireEvent('finishA')
+    await sm.fireEvent('finishB')
+    // All-final reached. Drain any internally-scheduled processing.
+    await new Promise((r) => setTimeout(r, 0))
+    // The wildcard event did NOT fire on a synthetic done.state.proc; the
+    // machine is still in the all-final proc config, not 'elsewhere'.
+    expect(sameComposite(sm.getCurrentState(), 'proc.a.done|proc.b.done')).toBe(
+      true,
+    )
+    expect((sm as any).isDone('proc')).toBe(true)
+    // The wildcard still works when fired explicitly by the user.
+    await sm.fireEvent('anything')
+    expect(sm.getCurrentState()).toBe('elsewhere')
+  })
+
+  it('nested all-final cascade: inner done.state is raised before outer in the same configuration (F-2)', async () => {
+    // We observe each done.state dispatch via its (false) guard — guards run on
+    // every dispatch, so they faithfully record emission order without mutating
+    // state. q is final from the start, so outer C becomes done on the SAME
+    // transition that completes inner D — exercising the innermost-first cascade.
+    const order: string[] = []
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      C: {
+        initial: 'p.D|q.q1',
+        regions: {
+          p: {
+            D: {
+              initial: 's.s1|t.t1',
+              regions: {
+                s: { s1: {}, s2: { final: true } },
+                t: { t1: {}, t2: { final: true } },
+              },
+            },
+          },
+          q: { q1: { final: true } },
+        },
+      },
+      outerDone: {},
+    } satisfies States<any>
+    const events = {
+      finishS: { transitions: [{ from: 'C.p.D.s.s1', to: 'C.p.D.s.s2' }] },
+      finishT: { transitions: [{ from: 'C.p.D.t.t1', to: 'C.p.D.t.t2' }] },
+      'done.state.C.p.D': {
+        transitions: [
+          {
+            from: 'C.p.D',
+            to: 'C.p.D',
+            guard: () => {
+              order.push('inner')
+              return false
+            },
+          },
+        ],
+      },
+      'done.state.C': {
+        transitions: [
+          {
+            from: 'C',
+            to: 'outerDone',
+            guard: () => {
+              order.push('outer')
+              return false
+            },
+          },
+        ],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'NestedDone',
+        initialState: 'C',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    await sm.fireEvent('finishS')
+    // Only s is final; neither D nor C is done yet.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(order).toEqual([])
+    expect((sm as any).isDone('C.p.D')).toBe(false)
+    // finishT makes D all-final; q is already final, so C becomes all-final on
+    // the SAME transition. Inner done.state must be raised before outer.
+    await sm.fireEvent('finishT')
+    await new Promise((r) => setTimeout(r, 0))
+    expect((sm as any).isDone('C.p.D')).toBe(true)
+    expect((sm as any).isDone('C')).toBe(true)
+    expect(order).toEqual(['inner', 'outer'])
+  })
+
+  it('done.state.C is edge-triggered: not re-raised while C merely stays all-final (F-3)', async () => {
+    // Observe each done.state.outer.main.C dispatch via its (false) guard.
+    // C is nested under `outer` alongside an independent sibling region `sib`
+    // that keeps toggling AFTER C is all-final — the classic re-emission trap:
+    // each sib transition re-lists C's (unchanged) final leaves in newState.
+    let cDone = 0
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      outer: {
+        initial: 'main.C.a.adone|main.C.b.bdone|sib.s1',
+        regions: {
+          main: {
+            C: {
+              initial: 'a.adone|b.bdone',
+              regions: {
+                a: { adone: { final: true } },
+                b: { bdone: { final: true } },
+              },
+            },
+          },
+          sib: { s1: {}, s2: {} },
+        },
+      },
+    } satisfies States<any>
+    const events = {
+      // sib keeps moving while C stays all-final (a/b final from the start).
+      sibMove: { transitions: [{ from: 'outer.sib.s1', to: 'outer.sib.s2' }] },
+      sibBack: { transitions: [{ from: 'outer.sib.s2', to: 'outer.sib.s1' }] },
+      'done.state.outer.main.C': {
+        transitions: [
+          {
+            from: 'outer.main.C',
+            to: 'outer.main.C',
+            guard: () => {
+              cDone += 1
+              return false
+            },
+          },
+        ],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'EdgeTriggered',
+        initialState: 'outer',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    // C is all-final from the initial config → exactly one done.state on ENTER.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(cDone).toBe(1)
+    // sib toggles while C STAYS all-final: must NOT re-raise done.state.
+    await sm.fireEvent('sibMove')
+    await new Promise((r) => setTimeout(r, 0))
+    await sm.fireEvent('sibBack')
+    await new Promise((r) => setTimeout(r, 0))
+    expect(cDone).toBe(1)
+    expect((sm as any).isDone('outer.main.C')).toBe(true)
+  })
 })

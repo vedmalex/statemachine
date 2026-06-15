@@ -1280,6 +1280,7 @@ export class StateMachine<
     // returns, never on a half-constructed instance.
     this.checkCompletion(
       targetAdaptee as Adapter<PropertiesOf<TOwner>>,
+      '',
       initialStates,
     )
   }
@@ -1371,34 +1372,47 @@ export class StateMachine<
       )
       if (!activeLeaf) return false
 
-      // The region is "final" when its active leaf is itself a `final` state,
-      // OR the leaf is inside a nested composite under this region that is in
-      // turn done (inner-before-outer recursion over the static tree).
-      if (this.isStateFinal(activeLeaf)) continue
-
-      const nestedComposite = this.deepestComposite(activeLeaf)
-      if (
-        nestedComposite &&
-        nestedComposite.startsWith(regionPrefix) &&
-        this.isCompositeDone(nestedComposite, atomicLeaves)
-      ) {
-        continue
+      // Determine whether the region's active sub-configuration is complete.
+      // If the region holds a NESTED COMPOSITE (e.g. region p -> composite D),
+      // the region is final iff that composite is all-regions-final — checking
+      // a single parallel branch leaf's `final` flag is NOT sufficient (one
+      // branch being final does not finalize the whole nested composite). We
+      // therefore defer to isCompositeDone on the region's OUTERMOST nested
+      // composite first, and only fall back to a direct atomic `final` check
+      // when the region holds a simple state.
+      const nestedComposite = this.regionComposite(activeLeaf, regionPrefix)
+      if (nestedComposite) {
+        if (this.isCompositeDone(nestedComposite, atomicLeaves)) continue
+        return false
       }
+      if (this.isStateFinal(activeLeaf)) continue
       return false
     }
     return true
   }
 
   /**
-   * The deepest registered composite (regions-bearing) ancestor of `leaf`,
-   * or `undefined` if `leaf` has no composite ancestor. Used by
-   * {@link isCompositeDone} to detect a nested all-final inner composite.
+   * The OUTERMOST registered composite (regions-bearing) ancestor of `leaf`
+   * that lives strictly under `regionPrefix`, or `undefined` if the region
+   * holds a simple atomic state directly. Used by {@link isCompositeDone} to
+   * delegate a region's completeness to its nested composite (recursing over
+   * every parallel branch), independent of whether any single branch leaf
+   * happens to carry the `final` flag.
+   *
+   * ancestorChain is root-to-leaf, so the FIRST matching ancestor is the
+   * region's direct composite child (e.g. `C.p.D` for leaf `C.p.D.s.s2` under
+   * region prefix `C.p.`); isCompositeDone then recurses into its regions.
    */
-  private deepestComposite(leaf: string): string | undefined {
-    const chain = this.ancestorChain(leaf)
-    for (let i = chain.length - 1; i >= 0; i--) {
-      const ancestor = chain[i] as string
-      if (ancestor !== leaf && this.states.get(ancestor)?.regions) {
+  private regionComposite(
+    leaf: string,
+    regionPrefix: string,
+  ): string | undefined {
+    for (const ancestor of this.ancestorChain(leaf)) {
+      if (
+        ancestor !== leaf &&
+        ancestor.startsWith(regionPrefix) &&
+        this.states.get(ancestor)?.regions
+      ) {
         return ancestor
       }
     }
@@ -1442,32 +1456,48 @@ export class StateMachine<
    */
   private checkCompletion(
     obj: Adapter<PropertiesOf<TOwner>>,
+    oldState: string,
     newState: string,
   ): void {
     const atomicLeaves = newState.split('|').filter(Boolean)
     if (atomicLeaves.length === 0) return
 
-    // Collect the composite ancestors of the newly-active leaves, deepest-first
-    // so a nested inner composite's done.state is enqueued before its parent's.
-    const candidates: string[] = []
+    // EDGE-TRIGGERED (SCXML): done.state.<C> is generated once, when the done
+    // configuration is ENTERED — not on every macrostep that leaves C all-final.
+    // We therefore emit only for composites that became done ON THIS transition:
+    // done in `newState` AND NOT already done in `oldState`. A composite that
+    // stays all-final across an unrelated (e.g. sibling-region) transition is
+    // not re-signalled; a composite that leaves and later re-enters its done
+    // configuration is correctly re-signalled. `oldState === ''` (initial/reset)
+    // makes every all-final composite newly-done, so a degenerate all-final
+    // initial config still raises done.state once.
+    const oldLeaves = oldState.split('|').filter(Boolean)
+
+    // Collect the composite ancestors of the newly-active leaves, then sort
+    // DEEPEST-first so a nested inner composite's done.state is enqueued before
+    // its parent's (SCXML inner-before-outer). Sorting by depth is required:
+    // relying on leaf iteration order is unsound because the `|`-leaf order is
+    // map-insertion dependent, so an outer-only leaf (e.g. a sibling region of
+    // the inner composite) can otherwise surface the parent before the child.
     const seen = new Set<string>()
     for (const leaf of atomicLeaves) {
-      const chain = this.ancestorChain(leaf)
-      // ancestorChain is root-to-leaf; walk leaf-to-root for innermost-first.
-      for (let i = chain.length - 1; i >= 0; i--) {
-        const ancestor = chain[i] as string
+      for (const ancestor of this.ancestorChain(leaf)) {
         if (ancestor === leaf) continue
         if (seen.has(ancestor)) continue
         if (!this.states.get(ancestor)?.regions) continue
         seen.add(ancestor)
-        candidates.push(ancestor)
       }
     }
+    const candidates = Array.from(seen).sort(
+      (a, b) => b.split('.').length - a.split('.').length,
+    )
 
     const emitted = new Set<string>()
     for (const compositeId of candidates) {
       if (emitted.has(compositeId)) continue
       if (!this.isCompositeDone(compositeId, atomicLeaves)) continue
+      // Edge gate: skip if C was ALREADY all-final before this transition.
+      if (this.isCompositeDone(compositeId, oldLeaves)) continue
       emitted.add(compositeId)
       const doneEvent = `done.state.${compositeId}`
       if (!this.events.has(doneEvent as keyof SMConfig['events'])) continue
@@ -2012,8 +2042,10 @@ export class StateMachine<
       // D10/D11: after the new configuration is written, raise `done.state.<C>`
       // for every composite that just became all-regions-final (innermost-first,
       // only when a matching event is declared). Consumes the immutable R1
-      // `newState`; gated internally so an undeclared join cannot crash.
-      this.checkCompletion(obj as any, newState)
+      // `newState`; edge-triggered against `currentState` so a composite that
+      // merely STAYS all-final is not re-signalled. Gated internally so an
+      // undeclared join cannot crash.
+      this.checkCompletion(obj as any, currentState, newState)
 
       // Record successful transition
       const transitionTime = Date.now() - transitionStartTime
