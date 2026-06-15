@@ -356,7 +356,12 @@ export class StateMachine<
       )
       : []
 
-    if (!transitions.length) {
+    // D11: engine-generated `done.state.<id>` completion events must NEVER fall
+    // through to a user `from: '*'` wildcard transition — that would fire a
+    // spurious transition on a machine that uses `*` as a catch-all. They only
+    // ever match an explicitly-declared `done.state.<id>` event (handled above).
+    const isEngineDoneEvent = String(eventName).startsWith('done.state.')
+    if (!transitions.length && !isEngineDoneEvent) {
       const wildcardEvent = this.events.get('*' as keyof SMConfig['events'])
       if (wildcardEvent) {
         const wildcardTransitions = wildcardEvent.transitions.filter((t) =>
@@ -1267,6 +1272,16 @@ export class StateMachine<
         )
       })
     }
+
+    // D12: a degenerate all-final initial configuration should raise
+    // done.state.<C> just like a transition that reaches it. setInitialState
+    // runs in the constructor; checkCompletion only ever uses raiseEvent +
+    // scheduleProcessing (queueMicrotask), so the join fires AFTER construction
+    // returns, never on a half-constructed instance.
+    this.checkCompletion(
+      targetAdaptee as Adapter<PropertiesOf<TOwner>>,
+      initialStates,
+    )
   }
 
   private getInitialCompositeState(initialState: string): string {
@@ -1327,6 +1342,138 @@ export class StateMachine<
    */
   private isStateFinal(leaf: string): boolean {
     return Boolean(this.states.get(leaf)?.final)
+  }
+
+  /**
+   * Whether composite `compositeId` has reached its UML/SCXML "done"
+   * configuration: every one of its regions has its active atomic leaf in a
+   * `final` state (recursively, for nested composites).
+   *
+   * D10 (mustFix): doneness is derived by scanning the active atomic `|`-leaves
+   * against the STATIC regions tree (`this.states.get(C)?.regions`), NEVER via a
+   * region-key Map lookup (`configMap.get`) — that map keys leaves by their
+   * deepest region container and so cannot answer "which leaf is active in
+   * region X of composite C". For each region we locate the active leaf via the
+   * `C.region.` dotted prefix; the region is final iff that leaf is `final`, or
+   * the leaf lives under a nested composite that is itself `isCompositeDone`.
+   *
+   * Returns `false` for a non-composite id, for a composite with no active leaf
+   * in some region, or when no substate under it is ever `final` (cheap miss).
+   */
+  private isCompositeDone(compositeId: string, atomicLeaves: string[]): boolean {
+    const regions = this.states.get(compositeId)?.regions
+    if (!regions) return false
+
+    for (const regionName of Object.keys(regions)) {
+      const regionPrefix = `${compositeId}.${regionName}.`
+      const activeLeaf = atomicLeaves.find((leaf) =>
+        leaf.startsWith(regionPrefix),
+      )
+      if (!activeLeaf) return false
+
+      // The region is "final" when its active leaf is itself a `final` state,
+      // OR the leaf is inside a nested composite under this region that is in
+      // turn done (inner-before-outer recursion over the static tree).
+      if (this.isStateFinal(activeLeaf)) continue
+
+      const nestedComposite = this.deepestComposite(activeLeaf)
+      if (
+        nestedComposite &&
+        nestedComposite.startsWith(regionPrefix) &&
+        this.isCompositeDone(nestedComposite, atomicLeaves)
+      ) {
+        continue
+      }
+      return false
+    }
+    return true
+  }
+
+  /**
+   * The deepest registered composite (regions-bearing) ancestor of `leaf`,
+   * or `undefined` if `leaf` has no composite ancestor. Used by
+   * {@link isCompositeDone} to detect a nested all-final inner composite.
+   */
+  private deepestComposite(leaf: string): string | undefined {
+    const chain = this.ancestorChain(leaf)
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const ancestor = chain[i] as string
+      if (ancestor !== leaf && this.states.get(ancestor)?.regions) {
+        return ancestor
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Whether composite `compositeId` has reached its all-regions-final ("done")
+   * configuration in the CURRENT active state. Public guard surface (`@stable`)
+   * for authoring a join as `guard: () => sm.isDone('C')` instead of (or
+   * alongside) listening on the engine `done.state.<C>` event.
+   *
+   * @param compositeId - The dotted id of the composite/parallel state.
+   * @returns `true` iff every region's active atomic leaf is `final`.
+   */
+  public isDone(
+    compositeId: string,
+    adaptee?: Adapter<PropertiesOf<TOwner>>,
+  ): boolean {
+    const currentState = this.getCurrentState(adaptee)
+    if (!currentState) return false
+    const atomicLeaves = currentState.split('|').filter(Boolean)
+    return this.isCompositeDone(compositeId, atomicLeaves)
+  }
+
+  /**
+   * SCXML completion hook (D10/D11/D12): after a new configuration is written,
+   * raise `done.state.<C>` for each composite that became all-regions-final.
+   *
+   * - Scans only composites that GAINED an active leaf (the ancestor chain of
+   *   each `|`-leaf of `newState`), so unaffected composites are not re-checked.
+   * - Emits INNERMOST-first (a deeper composite's `done.state` precedes its
+   *   parent's), matching SCXML's inner-before-outer completion ordering, via a
+   *   per-config emitted-id Set so each id is raised at most once per call.
+   * - Gates each emission on `this.events.has('done.state.'+C)` (D11 mustFix):
+   *   raising an undeclared event would hit the `Invalid event` throw
+   *   (executeQueuedTransition) as an unhandled microtask rejection. No declared
+   *   `done.state.<C>` event => no emission, no crash, no observable effect.
+   * - Uses the internal queue (`raiseEvent`) + `scheduleProcessing` so the
+   *   completion event is processed before subsequent external events.
+   */
+  private checkCompletion(
+    obj: Adapter<PropertiesOf<TOwner>>,
+    newState: string,
+  ): void {
+    const atomicLeaves = newState.split('|').filter(Boolean)
+    if (atomicLeaves.length === 0) return
+
+    // Collect the composite ancestors of the newly-active leaves, deepest-first
+    // so a nested inner composite's done.state is enqueued before its parent's.
+    const candidates: string[] = []
+    const seen = new Set<string>()
+    for (const leaf of atomicLeaves) {
+      const chain = this.ancestorChain(leaf)
+      // ancestorChain is root-to-leaf; walk leaf-to-root for innermost-first.
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const ancestor = chain[i] as string
+        if (ancestor === leaf) continue
+        if (seen.has(ancestor)) continue
+        if (!this.states.get(ancestor)?.regions) continue
+        seen.add(ancestor)
+        candidates.push(ancestor)
+      }
+    }
+
+    const emitted = new Set<string>()
+    for (const compositeId of candidates) {
+      if (emitted.has(compositeId)) continue
+      if (!this.isCompositeDone(compositeId, atomicLeaves)) continue
+      emitted.add(compositeId)
+      const doneEvent = `done.state.${compositeId}`
+      if (!this.events.has(doneEvent as keyof SMConfig['events'])) continue
+      this.raiseEvent(doneEvent, obj)
+      this.scheduleProcessing()
+    }
   }
 
   /**
@@ -1862,14 +2009,11 @@ export class StateMachine<
       const transitionStartTime = Date.now()
       this.setCurrentState(newState, obj as any)
 
-      // T7 placeholder, kept behaviour-neutral: record which newly-active atomic
-      // leaves are UML/SCXML `<final>` states. Nothing consumes this yet; T8
-      // replaces it with the real `checkCompletion` all-regions-final scan +
-      // `done.state.<id>` emission (D10/D11).
-      const finalLeaves = newState
-        .split('|')
-        .filter((leaf) => leaf && this.isStateFinal(leaf))
-      void finalLeaves
+      // D10/D11: after the new configuration is written, raise `done.state.<C>`
+      // for every composite that just became all-regions-final (innermost-first,
+      // only when a matching event is declared). Consumes the immutable R1
+      // `newState`; gated internally so an undeclared join cannot crash.
+      this.checkCompletion(obj as any, newState)
 
       // Record successful transition
       const transitionTime = Date.now() - transitionStartTime

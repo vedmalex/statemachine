@@ -723,10 +723,19 @@ describe('SCXML/UML regions: ancestor-first entry + final join (T0 repros, red)'
       true,
     )
     await sm.fireEvent('finishB')
-    // Allow the internally-raised done.state.proc to be processed.
-    await new Promise((r) => setTimeout(r, 0))
+    // Both regions are now final: the all-final configuration is reached, so
+    // isDone('proc') is true at THIS point (before the internally-raised
+    // done.state.proc join drains and moves the machine out of proc).
     expect((sm as any).isDone?.('proc')).toBe(true)
+    expect(sameComposite(sm.getCurrentState(), 'proc.a.done|proc.b.done')).toBe(
+      true,
+    )
+    // Allow the internally-raised done.state.proc to be processed; the join
+    // fires exactly once and exits proc into complete (SCXML done.state).
+    await new Promise((r) => setTimeout(r, 0))
     expect(sm.getCurrentState()).toBe('complete')
+    // Having left proc entirely, the machine is no longer "in" proc's done set.
+    expect((sm as any).isDone?.('proc')).toBe(false)
   })
 
   it('all-final join (negative): one region final does not raise done.state.<C> and the join does not fire', async () => {
