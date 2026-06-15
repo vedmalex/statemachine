@@ -630,6 +630,14 @@ export class StateMachine<
     const currentParts = currentState.split('|').sort()
     const expectedParts = expectedState.split('|').sort()
 
+    // D5: ancestor-aware matching — true when every expected '|'-part equals OR
+    // is an ancestor (isParentState) of some active leaf. Keeps isInState('C')
+    // and isInState('C.region') true after a composite root expands to leaves.
+    const ancestorMatch = expectedParts.every((expectedPart) =>
+      currentParts.some((leaf) => this.isParentState(expectedPart, leaf)),
+    )
+    if (ancestorMatch) return true
+
     if (currentParts.length !== expectedParts.length) return false
 
     return currentParts.every((part, index) => part === expectedParts[index])
