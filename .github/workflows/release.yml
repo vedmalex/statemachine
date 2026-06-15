@@ -40,3 +40,20 @@ jobs:
         working-directory: packages/statemachine
         env:
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Auto-advance `latest` to the version just published, so `npm install`
+      # (no tag) always resolves to the newest release. npm CLI authenticates
+      # from ~/.npmrc `_authToken` (NOT NPM_CONFIG_TOKEN); requires NPM_TOKEN to
+      # be an npm *automation* token to clear the 2FA gate on dist-tag writes.
+      # NOTE: this moves `latest` on EVERY release — appropriate for a linear
+      # release line; revisit if you ever backport to an older line.
+      - name: Point latest at the just-published version
+        working-directory: packages/statemachine
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          printf '//registry.npmjs.org/:_authToken=%s\nregistry=https://registry.npmjs.org/\n' "${NPM_TOKEN}" > ~/.npmrc
+          echo "Moving latest -> @vedmalex/statemachine@${VERSION}"
+          npm dist-tag add "@vedmalex/statemachine@${VERSION}" latest
+          npm view "@vedmalex/statemachine" dist-tags
