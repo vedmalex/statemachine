@@ -20,6 +20,7 @@ jobs:
         working-directory: .
 
       - run: bun run check
+        working-directory: packages/statemachine
       - run: bun run build
         working-directory: packages/statemachine
       - run: node test/verify-dist.cjs
