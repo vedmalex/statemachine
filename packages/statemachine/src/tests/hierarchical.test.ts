@@ -883,4 +883,404 @@ describe('SCXML/UML regions: ancestor-first entry + final join (T0 repros, red)'
       true,
     )
   })
+
+  // ===== T12: new coverage — R1 ordering + invoke timers + R2 coexistence =====
+
+  it('nested entry is strictly outer-to-inner and nested exit inner-to-outer; region containers are never an onEnter/onExit site', async () => {
+    // SCXML/UML (D2): for a leaf nested under TWO composite ancestors, entry fires
+    // root-to-leaf (a, then a.r1.c1, then a.r1.c1.r3.x) and exit fires the reverse.
+    // Region containers (a.r1, a.r1.c1.r3) are unregistered states, so they are
+    // NEVER an onEnter/onExit firing site — only composite parents + atomic leaves.
+    const log: string[] = []
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      idle: { display: 'Idle' },
+      a: {
+        display: 'A',
+        initial: 'r1.c1',
+        onEnter: () => log.push('enter:a'),
+        onExit: () => log.push('exit:a'),
+        regions: {
+          r1: {
+            c1: {
+              display: 'c1',
+              initial: 'r3.x',
+              onEnter: () => log.push('enter:a.r1.c1'),
+              onExit: () => log.push('exit:a.r1.c1'),
+              regions: {
+                r3: {
+                  x: {
+                    display: 'x',
+                    onEnter: () => log.push('enter:a.r1.c1.r3.x'),
+                    onExit: () => log.push('exit:a.r1.c1.r3.x'),
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      out: { display: 'Out' },
+    } satisfies States<any>
+    const events = {
+      go: { display: 'go', transitions: [{ from: 'idle', to: 'a' }] },
+      leave: { display: 'leave', transitions: [{ from: 'a', to: 'out' }] },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'NestedEntryExitOrder',
+        initialState: 'idle',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+
+    log.length = 0
+    await sm.fireEvent('go')
+    // Reaches the deepest leaf, expanded.
+    expect(sameComposite(sm.getCurrentState(), 'a.r1.c1.r3.x')).toBe(true)
+    // Entry is strictly outer-to-inner; containers never logged.
+    expect(log).toEqual(['enter:a', 'enter:a.r1.c1', 'enter:a.r1.c1.r3.x'])
+    expect(log).not.toContain('enter:a.r1')
+    expect(log).not.toContain('enter:a.r1.c1.r3')
+
+    log.length = 0
+    await sm.fireEvent('leave')
+    expect(sm.getCurrentState()).toBe('out')
+    // Exit is strictly inner-to-outer; containers never logged.
+    expect(log).toEqual(['exit:a.r1.c1.r3.x', 'exit:a.r1.c1', 'exit:a'])
+    expect(log).not.toContain('exit:a.r1')
+    expect(log).not.toContain('exit:a.r1.c1.r3')
+  })
+
+  it('invoke arms once per region leaf on a transition; the composite parent is entered exactly once (not once-per-region)', async () => {
+    // D2/D7: a transition into a composite arms exactly one invoke timer per
+    // entered region LEAF (keyed by that leaf), so each region's delayed invoke
+    // event advances exactly once. The composite PARENT is entered exactly once
+    // (ancestor-first, before its regions) — its onEnter fires a single time, not
+    // once per region, proving the parent is not double-entered/double-armed.
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    let parentEnterCount = 0
+    const states = {
+      idle: { display: 'Idle' },
+      box: {
+        display: 'Box',
+        initial: 'scan.scanning|poll.polling',
+        onEnter: () => {
+          parentEnterCount += 1
+        },
+        regions: {
+          scan: {
+            scanning: {
+              display: 'Scanning',
+              invoke: [{ delay: 40, event: 'scanDone' }],
+            },
+            done: { display: 'Scan done' },
+          },
+          poll: {
+            polling: {
+              display: 'Polling',
+              invoke: [{ delay: 40, event: 'pollDone' }],
+            },
+            done: { display: 'Poll done' },
+          },
+        },
+      },
+      parked: { display: 'Parked' },
+    } satisfies States<any>
+    const events = {
+      enterBox: {
+        display: 'Enter Box',
+        transitions: [{ from: 'idle', to: 'box' }],
+      },
+      scanDone: {
+        display: 'Scan finished',
+        transitions: [{ from: 'box.scan.scanning', to: 'box.scan.done' }],
+      },
+      pollDone: {
+        display: 'Poll finished',
+        transitions: [{ from: 'box.poll.polling', to: 'box.poll.done' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'InvokeArmOnce',
+        initialState: 'idle',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+
+    await sm.fireEvent('enterBox')
+    // Transition into the bare-root composite expands both region leaves.
+    expect(
+      sameComposite(
+        sm.getCurrentState(),
+        'box.scan.scanning|box.poll.polling',
+      ),
+    ).toBe(true)
+    // Parent entered exactly once across the two regions (ancestor-first, single).
+    expect(parentEnterCount).toBe(1)
+
+    // Let every region invoke timer fire (each @40ms).
+    await new Promise((r) => setTimeout(r, 120))
+
+    // Each region's invoke armed once and advanced that region to done exactly once.
+    expect(sameComposite(sm.getCurrentState(), 'box.scan.done|box.poll.done')).toBe(
+      true,
+    )
+    // No spurious re-entry of the parent occurred while the regions advanced.
+    expect(parentEnterCount).toBe(1)
+  })
+
+  it('partial re-entry preserves the surviving sibling region timer (one armed invoke per surviving leaf)', async () => {
+    // D2/D7: re-entering ONE region of a composite must not re-arm or clear the
+    // OTHER region's already-armed invoke timer. The shared ancestor + surviving
+    // sibling leaf are in NEITHER the enter nor the exit diff, so the surviving
+    // sibling's invoke timer keeps counting down and still fires exactly once.
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    let pollFired = 0
+    const states = {
+      box: {
+        display: 'Box',
+        initial: 'scan.scanning|poll.polling',
+        regions: {
+          scan: {
+            scanning: { display: 'Scanning' },
+            looking: { display: 'Looking' },
+          },
+          poll: {
+            polling: {
+              display: 'Polling',
+              invoke: [
+                {
+                  delay: 60,
+                  event: 'pollDone',
+                  action: () => {
+                    pollFired += 1
+                  },
+                },
+              ],
+            },
+            done: { display: 'Poll done' },
+          },
+        },
+      },
+    } satisfies States<any>
+    const events = {
+      // Re-enter ONLY the scan region (poll untouched) BEFORE poll's timer fires.
+      look: {
+        display: 'look',
+        transitions: [{ from: 'box.scan.scanning', to: 'box.scan.looking' }],
+      },
+      pollDone: {
+        display: 'Poll finished',
+        transitions: [{ from: 'box.poll.polling', to: 'box.poll.done' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'PartialReentryTimer',
+        initialState: 'box',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+
+    expect(
+      sameComposite(sm.getCurrentState(), 'box.scan.scanning|box.poll.polling'),
+    ).toBe(true)
+
+    // Re-enter the scan region while poll's invoke timer is still pending.
+    await sm.fireEvent('look')
+    expect(
+      sameComposite(sm.getCurrentState(), 'box.scan.looking|box.poll.polling'),
+    ).toBe(true)
+
+    // The surviving poll-region timer was NOT cleared by the scan re-entry: it
+    // still fires exactly once and advances poll to done.
+    await new Promise((r) => setTimeout(r, 120))
+    expect(pollFired).toBe(1)
+    expect(
+      sameComposite(sm.getCurrentState(), 'box.scan.looking|box.poll.done'),
+    ).toBe(true)
+  })
+
+  it('isDone guard is ineligible until all-final: false with one region final, true only at all-final', async () => {
+    // D10/D11/D12: a guard authored as () => sm.isDone('C') must stay false while
+    // any region is non-final and become true only once EVERY region's active
+    // atomic leaf is final. Here the join is GUARDED (not a done.state event), so
+    // a plain user event with an isDone guard is the trigger.
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    let sm: StateMachine<any, any>
+    const states = {
+      proc: {
+        display: 'Proc',
+        initial: 'a.run|b.run',
+        regions: {
+          a: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+          b: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+        },
+      },
+      complete: { display: 'Complete' },
+    } satisfies States<any>
+    const events = {
+      finishA: {
+        display: 'finishA',
+        transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }],
+      },
+      finishB: {
+        display: 'finishB',
+        transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }],
+      },
+      // Guarded join on a user event: eligible only when isDone('proc') is true.
+      tryJoin: {
+        display: 'try join',
+        transitions: [
+          {
+            from: 'proc',
+            to: 'complete',
+            guard: () => (sm as any).isDone('proc'),
+          },
+        ],
+      },
+    }
+    sm = new StateMachine(
+      {
+        name: 'IsDoneGuard',
+        initialState: 'proc',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+
+    // No region final yet -> guard false.
+    expect((sm as any).isDone('proc')).toBe(false)
+    await sm.fireEvent('tryJoin')
+    expect(sm.getCurrentState()).not.toBe('complete')
+
+    // One region final -> still not done -> guard still false, join ineligible.
+    await sm.fireEvent('finishA')
+    expect((sm as any).isDone('proc')).toBe(false)
+    await sm.fireEvent('tryJoin')
+    expect(sm.getCurrentState()).not.toBe('complete')
+    expect(sameComposite(sm.getCurrentState(), 'proc.a.done|proc.b.run')).toBe(
+      true,
+    )
+
+    // All regions final -> isDone true -> guarded join now fires.
+    await sm.fireEvent('finishB')
+    expect((sm as any).isDone('proc')).toBe(true)
+    await sm.fireEvent('tryJoin')
+    expect(sm.getCurrentState()).toBe('complete')
+  })
+
+  it('coexistence: from:<C> user-event parallel-exit AND done.state.<C> join are unambiguous (user event preempts while non-final; done.state fires only at all-final)', async () => {
+    // The same composite C declares BOTH a user-event with from:'C' (ANY-leaf
+    // parallel-exit, D3) AND a done.state.C join (all-final only, D10/D11).
+    // Disambiguation is by TRIGGER: the user event preempts at ANY active leaf
+    // (even while non-final); the done.state.C join only ever fires once every
+    // region is final. We exercise both branches with two independent machines
+    // built from the same config.
+    const makeMachine = () => {
+      const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+        state: '',
+        event: () => null,
+      })
+      const states = {
+        proc: {
+          display: 'Proc',
+          initial: 'a.run|b.run',
+          regions: {
+            a: {
+              run: { display: 'run' },
+              done: { display: 'done', final: true },
+            },
+            b: {
+              run: { display: 'run' },
+              done: { display: 'done', final: true },
+            },
+          },
+        },
+        aborted: { display: 'Aborted' },
+        complete: { display: 'Complete' },
+      } satisfies States<any>
+      const events = {
+        finishA: {
+          display: 'finishA',
+          transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }],
+        },
+        finishB: {
+          display: 'finishB',
+          transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }],
+        },
+        // User event parallel-exit: eligible while ANY region leaf is active.
+        abort: {
+          display: 'abort',
+          transitions: [{ from: 'proc', to: 'aborted' }],
+        },
+        // All-final join: enqueued only when every region is final.
+        'done.state.proc': {
+          display: 'all regions final',
+          transitions: [{ from: 'proc', to: 'complete' }],
+        },
+      }
+      return new StateMachine(
+        {
+          name: 'Coexistence',
+          initialState: 'proc',
+          stateAttribute: 'state',
+          states,
+          events,
+        } as any,
+        owner,
+      )
+    }
+
+    // Branch 1: user event preempts while NON-final (any-leaf parallel-exit).
+    const smAbort = makeMachine()
+    expect((smAbort as any).isDone('proc')).toBe(false)
+    await smAbort.fireEvent('abort')
+    expect(smAbort.getCurrentState()).toBe('aborted')
+
+    // Branch 2: drive to all-final; the done.state.proc join fires (not abort).
+    const smJoin = makeMachine()
+    await smJoin.fireEvent('finishA')
+    // Non-final: done.state.proc not raised, machine still inside proc.
+    expect((smJoin as any).isDone('proc')).toBe(false)
+    expect(smJoin.getCurrentState()).not.toBe('complete')
+    await smJoin.fireEvent('finishB')
+    // All-final reached: isDone true at this config before the join drains.
+    expect((smJoin as any).isDone('proc')).toBe(true)
+    await new Promise((r) => setTimeout(r, 0))
+    // The internally-raised done.state.proc fired the join into complete; the
+    // user-event abort did NOT spuriously fire.
+    expect(smJoin.getCurrentState()).toBe('complete')
+  })
 })

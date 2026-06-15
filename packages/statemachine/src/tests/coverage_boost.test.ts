@@ -1968,6 +1968,64 @@ describe('StateMachine getCurrentStateInfo detail branches', () => {
       ['multi.r1.on', 'multi.r2.x'].sort(),
     )
   })
+
+  it('getCurrentStateInfo on a NESTED region-root reached via transition reports dotted region keys + deepest active leaves (T12)', async () => {
+    // T12 (D1/D2): a transition into a nested bare-root composite expands all the
+    // way to the deepest atomic leaves. With TWO top-level parallel regions (each
+    // itself nested), the active config is a genuine '|' composite of deep leaves,
+    // so getCurrentStateInfo reports the deterministic expanded shape — isComposite
+    // true, regions = the dotted region keys of each active leaf, children = the
+    // deepest active leaves (region containers are never reported).
+    const config = {
+      name: 'NestedRegionInfo',
+      initialState: 'idle',
+      stateAttribute: 'state',
+      states: {
+        idle: { display: 'Idle' },
+        top: {
+          display: 'Top',
+          initial: 'left.mid|right.spin',
+          regions: {
+            left: {
+              mid: {
+                display: 'Mid',
+                initial: 'inner.deep',
+                regions: {
+                  inner: {
+                    deep: { display: 'Deep' },
+                  },
+                },
+              },
+            },
+            right: {
+              spin: { display: 'Spin' },
+            },
+          },
+        },
+      },
+      events: { go: { transitions: [{ from: 'idle', to: 'top' }] } },
+    }
+    const adapter = new MemoryAdapter({ state: '' })
+    const sm = new StateMachine(config as any, adapter)
+    await sm.fireEvent('go')
+    // Both top-level regions expand; the left region drills to its deepest leaf.
+    expect(sm.getCurrentState()?.split('|').sort()).toEqual(
+      ['top.left.mid.inner.deep', 'top.right.spin'].sort(),
+    )
+    const info = sm.getCurrentStateInfo()
+    expect(info).toBeDefined()
+    expect(info?.isComposite).toBe(true)
+    // regions = getRegionKey of each active leaf (parent path of the deepest leaf).
+    expect(info?.regions?.slice().sort()).toEqual(
+      ['top.left.mid.inner', 'top.right'].sort(),
+    )
+    // children = the deepest active leaves; region containers never appear.
+    expect(info?.children?.slice().sort()).toEqual(
+      ['top.left.mid.inner.deep', 'top.right.spin'].sort(),
+    )
+    expect(info?.children).not.toContain('top.left')
+    expect(info?.children).not.toContain('top.left.mid.inner')
+  })
 })
 
 // ===== canFireEvent when state is empty string =====
