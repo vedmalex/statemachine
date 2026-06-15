@@ -114,6 +114,9 @@ export class ConfigValidator {
       // Performance validation
       this.validatePerformanceConstraints(smConfig)
 
+      // SCXML/UML final-state + done.state join validation
+      this.validateFinalStates(smConfig)
+
       // ✅ Запуск кастомных правил
       this.runCustomRules(smConfig)
     } catch (error) {
@@ -600,6 +603,14 @@ export class ConfigValidator {
       }
     }
 
+    // A `final:true` leaf is entered via region expansion (when its composite is
+    // entered), never as an explicit transition `to`; treat it as reachable so it
+    // does not spuriously trigger UNREACHABLE_STATE.
+    const finalStatePaths = this.collectFinalStatePaths(smConfig.states)
+    for (const finalPath of finalStatePaths) {
+      reachableStates.add(finalPath)
+    }
+
     // Report unreachable states
     for (const stateName of allStateNames) {
       if (!reachableStates.has(stateName)) {
@@ -611,10 +622,17 @@ export class ConfigValidator {
       }
     }
 
-    // Check for unused events (events with no valid transitions)
+    // Check for unused events (events with no valid transitions).
+    // Engine-generated done.state.<C> join events are reachable whenever their
+    // composite C exists, even though C is not an explicit transition target.
     for (const [eventName, event] of Object.entries(smConfig.events)) {
+      const isDoneStateEvent = eventName.startsWith('done.state.')
       const hasValidTransitions = event.transitions.some(
-        (t) => allStateNames.has(t.from) && allStateNames.has(t.to),
+        (t) =>
+          (allStateNames.has(t.from) ||
+            (isDoneStateEvent &&
+              allStateNames.has(eventName.slice('done.state.'.length)))) &&
+          allStateNames.has(t.to),
       )
       if (!hasValidTransitions) {
         this.addWarning(
@@ -647,6 +665,213 @@ export class ConfigValidator {
         }
       }
     }
+  }
+
+  /**
+   * Collects every state in the tree as {dottedPath, config} entries, walking
+   * region containers (region names are NOT registered states, so they are part
+   * of the path but never emitted as an entry — mirroring runtime expansion).
+   */
+  private collectStateEntries<T extends object>(
+    states: States<T>,
+    prefix: string,
+    collector: Array<{ path: string; state: Omit<State<T>, 'name'> }>,
+  ): void {
+    for (const [stateName, state] of Object.entries(states)) {
+      const fullName = prefix ? `${prefix}.${stateName}` : stateName
+      collector.push({ path: fullName, state })
+
+      if (state.regions) {
+        for (const [regionName, regionStates] of Object.entries(
+          state.regions,
+        )) {
+          this.collectStateEntries(
+            regionStates,
+            `${fullName}.${regionName}`,
+            collector,
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * True when `composite` has at least one `final:true` atomic substate reachable
+   * through its (possibly nested) region tree — i.e. some region of the composite
+   * can become done. Used by REGION_NO_REACHABLE_FINAL.
+   */
+  private hasReachableFinal<T extends object>(
+    composite: Omit<State<T>, 'name'>,
+  ): boolean {
+    if (!composite.regions) return false
+    for (const regionStates of Object.values(composite.regions)) {
+      for (const state of Object.values(regionStates)) {
+        if (state.final) return true
+        if (state.regions && this.hasReachableFinal(state)) return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * SCXML/UML final-state and all-regions-final (done.state.<C>) join validation.
+   *
+   * - FINAL_STATE_HAS_OUTGOING (error): a `final:true` state is the `from` of a
+   *   transition (a final pseudo-state cannot itself transition out).
+   * - FINAL_ON_COMPOSITE (warning): `final:true` on a state that has regions
+   *   (final is meaningful only on an atomic leaf; ignored at runtime).
+   * - REGION_NO_REACHABLE_FINAL (warning): a `done.state.<C>` transition exists
+   *   but composite C declares no `final` substate, so the join can never fire.
+   * - DONE_VS_PARALLEL_EXIT_AMBIGUITY (warning): the same composite C has BOTH a
+   *   `done.state.C` join AND a plain `from:'C'` user-event parallel-exit, which
+   *   can preempt the all-final join (the user event is eligible on ANY leaf).
+   * - REGION_MISSING_INITIAL (advisory warning, valid:true): a region omits an
+   *   explicit `initial`, so expansion relies on first-key insertion order.
+   */
+  private validateFinalStates<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): void {
+    const entries: Array<{ path: string; state: Omit<State<T>, 'name'> }> = []
+    this.collectStateEntries(smConfig.states, '', entries)
+
+    // Index final-leaf paths for the outgoing-transition check.
+    const finalStatePaths = new Set<string>()
+
+    for (const { path, state } of entries) {
+      if (!state.final) continue
+
+      if (state.regions) {
+        // final on a composite is ignored at runtime — flag it.
+        this.addWarning(
+          'FINAL_ON_COMPOSITE',
+          `Final flag on composite state "${path}" is ignored; mark an atomic leaf inside a region as final instead`,
+          `states.${path}.final`,
+          undefined,
+          'Remove `final: true` from this composite and set it on the atomic leaf state that represents the region\'s completion.',
+        )
+      } else {
+        finalStatePaths.add(path)
+      }
+    }
+
+    // Collect `from` states used by user transitions and the set of declared
+    // done.state.<C> composite ids.
+    const userFromStates = new Set<string>()
+    const doneStateComposites = new Set<string>()
+
+    for (const [eventName, event] of Object.entries(smConfig.events)) {
+      if (!event.transitions || !Array.isArray(event.transitions)) continue
+
+      // done.state.<C> engine event: extract the composite id suffix.
+      if (eventName.startsWith('done.state.')) {
+        const compositeId = eventName.slice('done.state.'.length)
+        if (compositeId) doneStateComposites.add(compositeId)
+      }
+
+      for (const transition of event.transitions) {
+        if (typeof transition.from !== 'string') continue
+        for (const fromPart of transition.from.split('|')) {
+          // FINAL_STATE_HAS_OUTGOING: a final leaf must not be a transition source.
+          if (finalStatePaths.has(fromPart)) {
+            this.addError(
+              'FINAL_STATE_HAS_OUTGOING',
+              `Final state "${fromPart}" cannot be the source of transition on event "${eventName}"; a final pseudo-state has no outgoing transitions`,
+              `events.${eventName}`,
+              undefined,
+              `Remove the outgoing transition from "${fromPart}", or clear its \`final: true\` flag if it is not actually a final state.`,
+            )
+          }
+
+          if (!eventName.startsWith('done.state.')) {
+            userFromStates.add(fromPart)
+          }
+        }
+      }
+    }
+
+    // REGION_NO_REACHABLE_FINAL: each done.state.<C> needs a final substate under C.
+    const entryByPath = new Map(entries.map((e) => [e.path, e.state]))
+    for (const compositeId of doneStateComposites) {
+      const composite = entryByPath.get(compositeId)
+      if (!composite) {
+        // Unknown composite id is already caught by transition-path validation;
+        // do not double-report here.
+        continue
+      }
+      if (!this.hasReachableFinal(composite)) {
+        this.addWarning(
+          'REGION_NO_REACHABLE_FINAL',
+          `Join event "done.state.${compositeId}" can never fire: composite "${compositeId}" has no \`final\` substate in any region`,
+          `events.done.state.${compositeId}`,
+          undefined,
+          `Mark the completion leaf of each region under "${compositeId}" with \`final: true\`, or remove the done.state join.`,
+        )
+      }
+
+      // DONE_VS_PARALLEL_EXIT_AMBIGUITY: same composite also used as a plain
+      // user-event parallel-exit source.
+      if (userFromStates.has(compositeId)) {
+        this.addWarning(
+          'DONE_VS_PARALLEL_EXIT_AMBIGUITY',
+          `Composite "${compositeId}" has both a done.state join and a user-event transition with from:"${compositeId}"; the user event can preempt the all-final join because it is eligible on any active leaf`,
+          `events.done.state.${compositeId}`,
+          undefined,
+          `Disambiguate by using the done.state.${compositeId} join exclusively, or scope the user-event transition to a specific leaf instead of the bare composite.`,
+        )
+      }
+    }
+
+    // REGION_MISSING_INITIAL (advisory): a region's starting leaf is not pinned
+    // by the composite's `initial`, so runtime expansion falls back to first-key
+    // insertion order (getInitialStatesForRegions uses Object.keys(region)[0]).
+    for (const { path, state } of entries) {
+      if (!state.regions) continue
+      for (const [regionName, regionStates] of Object.entries(state.regions)) {
+        const regionKeys = Object.keys(regionStates)
+        if (regionKeys.length === 0) continue
+        // The only explicit start-selection mechanism is the parent composite's
+        // `initial` pointing at one of this region's leaves.
+        const parentInitialInRegion =
+          state.initial !== undefined && regionKeys.includes(state.initial)
+        if (!parentInitialInRegion) {
+          this.addWarning(
+            'REGION_MISSING_INITIAL',
+            `Region "${regionName}" of composite "${path}" has no explicit initial; expansion falls back to the first key "${regionKeys[0]}" (insertion-order dependent)`,
+            `states.${path}.regions.${regionName}`,
+            undefined,
+            `Set \`initial\` on composite "${path}" to a leaf of region "${regionName}", to make the starting substate explicit and order-independent.`,
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * Collects the dotted paths of every `final:true` atomic leaf in the tree.
+   */
+  private collectFinalStatePaths<T extends object>(
+    states: States<T>,
+    prefix = '',
+    collector: Set<string> = new Set(),
+  ): Set<string> {
+    for (const [stateName, state] of Object.entries(states)) {
+      const fullName = prefix ? `${prefix}.${stateName}` : stateName
+      if (state.final && !state.regions) {
+        collector.add(fullName)
+      }
+      if (state.regions) {
+        for (const [regionName, regionStates] of Object.entries(
+          state.regions,
+        )) {
+          this.collectFinalStatePaths(
+            regionStates,
+            `${fullName}.${regionName}`,
+            collector,
+          )
+        }
+      }
+    }
+    return collector
   }
 
   private validatePerformanceConstraints<T extends object>(

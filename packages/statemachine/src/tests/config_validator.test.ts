@@ -464,6 +464,268 @@ describe('Configuration Validator', () => {
     })
   })
 
+  describe('Final states and done.state join validation', () => {
+    it('should error when a final state has an outgoing transition (FINAL_STATE_HAS_OUTGOING)', () => {
+      const config = {
+        name: 'FinalOutgoing',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'a',
+            regions: {
+              r1: {
+                a: {},
+                doneR1: { final: true },
+              },
+            },
+          },
+          over: {},
+        },
+        events: {
+          finishR1: {
+            transitions: [
+              { from: 'game.r1.a', to: 'game.r1.doneR1' },
+            ],
+          },
+          leak: {
+            // illegal: a final leaf cannot be a transition source
+            transitions: [{ from: 'game.r1.doneR1', to: 'over' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(false)
+      expect(
+        result.errors.some((e) => e.code === 'FINAL_STATE_HAS_OUTGOING'),
+      ).toBe(true)
+    })
+
+    it('should warn when done.state.<C> has no reachable final substate (REGION_NO_REACHABLE_FINAL)', () => {
+      const config = {
+        name: 'NoReachableFinal',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'a',
+            regions: {
+              r1: {
+                a: {},
+                b: {},
+              },
+            },
+          },
+          over: {},
+        },
+        events: {
+          // join declared, but no final substate under `game`
+          'done.state.game': {
+            transitions: [{ from: 'game', to: 'over' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(true)
+      expect(
+        result.warnings.some((w) => w.code === 'REGION_NO_REACHABLE_FINAL'),
+      ).toBe(true)
+    })
+
+    it('should advise when a region omits explicit initial, staying valid (REGION_MISSING_INITIAL)', () => {
+      const config = {
+        name: 'RegionMissingInitial',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            // no `initial` pointer into any region -> first-key fallback
+            regions: {
+              r1: {
+                a: {},
+                b: {},
+              },
+            },
+          },
+        },
+        events: {
+          go: {
+            transitions: [{ from: 'game.r1.a', to: 'game.r1.b' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(true)
+      expect(
+        result.warnings.some((w) => w.code === 'REGION_MISSING_INITIAL'),
+      ).toBe(true)
+    })
+
+    it('should validate a proper final + done.state config cleanly (no final/done errors)', () => {
+      const config = {
+        name: 'ProperFinal',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'playing',
+            regions: {
+              r1: {
+                playing: {},
+                won: { final: true },
+              },
+            },
+          },
+          over: {},
+        },
+        events: {
+          win: {
+            transitions: [{ from: 'game.r1.playing', to: 'game.r1.won' }],
+          },
+          'done.state.game': {
+            transitions: [{ from: 'game', to: 'over' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(true)
+      expect(
+        result.errors.some((e) => e.code === 'FINAL_STATE_HAS_OUTGOING'),
+      ).toBe(false)
+      expect(
+        result.warnings.some((w) => w.code === 'REGION_NO_REACHABLE_FINAL'),
+      ).toBe(false)
+      expect(
+        result.warnings.some((w) => w.code === 'FINAL_ON_COMPOSITE'),
+      ).toBe(false)
+    })
+
+    it('should not flag a final leaf as UNREACHABLE_STATE', () => {
+      const config = {
+        name: 'FinalReachable',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'playing',
+            regions: {
+              r1: {
+                playing: {},
+                won: { final: true },
+              },
+            },
+          },
+        },
+        events: {
+          win: {
+            transitions: [{ from: 'game.r1.playing', to: 'game.r1.playing' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      // The final leaf `game.r1.won` is entered via region expansion, never as a
+      // transition target, so it must NOT be reported unreachable.
+      expect(
+        result.warnings.some(
+          (w) =>
+            w.code === 'UNREACHABLE_STATE' &&
+            w.message.includes('game.r1.won'),
+        ),
+      ).toBe(false)
+    })
+
+    it('should warn when final is set on a composite (FINAL_ON_COMPOSITE)', () => {
+      const config = {
+        name: 'FinalOnComposite',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'playing',
+            final: true, // illegal placement: composite cannot be final
+            regions: {
+              r1: {
+                playing: {},
+                won: { final: true },
+              },
+            },
+          },
+        },
+        events: {
+          win: {
+            transitions: [{ from: 'game.r1.playing', to: 'game.r1.won' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(true)
+      expect(
+        result.warnings.some((w) => w.code === 'FINAL_ON_COMPOSITE'),
+      ).toBe(true)
+    })
+
+    it('should warn when a done.state join coexists with a from:<C> parallel-exit (DONE_VS_PARALLEL_EXIT_AMBIGUITY)', () => {
+      const config = {
+        name: 'DoneAmbiguity',
+        stateAttribute: 'state',
+        initialState: 'game',
+        states: {
+          game: {
+            initial: 'playing',
+            regions: {
+              r1: {
+                playing: {},
+                won: { final: true },
+              },
+            },
+          },
+          over: {},
+          aborted: {},
+        },
+        events: {
+          'done.state.game': {
+            transitions: [{ from: 'game', to: 'over' }],
+          },
+          // user event using the bare composite as a parallel-exit source
+          abort: {
+            transitions: [{ from: 'game', to: 'aborted' }],
+          },
+        },
+      }
+
+      const result = validateConfig(config as any)
+
+      expect(result.isValid).toBe(true)
+      expect(
+        result.warnings.some(
+          (w) => w.code === 'DONE_VS_PARALLEL_EXIT_AMBIGUITY',
+        ),
+      ).toBe(true)
+    })
+
+    it('should not flag existing region fixtures pass->fail', () => {
+      // hierarchicalConfig pins region1 via parent.initial -> stays valid, no
+      // FINAL_* / done errors.
+      const result = validateConfig(hierarchicalConfig as any)
+      expect(result.isValid).toBe(true)
+      expect(
+        result.errors.some((e) => e.code === 'FINAL_STATE_HAS_OUTGOING'),
+      ).toBe(false)
+    })
+  })
+
   describe('Default validation config', () => {
     it('should have sensible defaults', () => {
       expect(DEFAULT_VALIDATION_CONFIG.strictMode).toBe(false)
