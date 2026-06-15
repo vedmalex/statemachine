@@ -28,6 +28,41 @@ const sm = createMachine({
 })
 ```
 
+## Hierarchical regions, parallel states & join
+
+A state may declare `regions` to run several orthogonal sub-machines at once. Entry/exit follow SCXML/UML ordering, and a region may complete via a `final` state that raises a `done.state.<id>` join event.
+
+```ts
+const sm = createMachine({
+  name: 'proc',
+  initialState: 'proc',
+  states: {
+    proc: {
+      initial: 'a.run|b.run',          // both regions active in parallel
+      onEnter: () => {/* parent runs BEFORE region children (ancestor-first) */},
+      regions: {
+        a: { run: {}, done: { final: true } },
+        b: { run: {}, done: { final: true } },
+      },
+    },
+    complete: {},
+  },
+  events: {
+    finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
+    finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
+    // Join: raised automatically once EVERY region reached a `final` state.
+    'done.state.proc': { transitions: [{ from: 'proc', to: 'complete' }] },
+  },
+})
+```
+
+- **Expansion** — entering `proc` (as initial state *or* via a transition) expands to the parallel configuration `proc.a.run|proc.b.run`.
+- **Ordering** — entry is ancestor-first (`proc` then region children); exit is descendant-first (region children then `proc`).
+- **Parallel-exit** — a plain transition `from: 'proc'` on a user event preempts and exits all active regions immediately (LCCA).
+- **Join** — when all regions are `final`, the engine raises `done.state.proc`; `sm.isDone('proc')` reflects the all-final configuration. (`done.state.*` is never matched by a `from: '*'` wildcard.)
+
+See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, and validation.
+
 ## Documentation
 
 Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)
