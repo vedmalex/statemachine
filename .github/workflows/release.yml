@@ -43,6 +43,12 @@ jobs:
           AUTH_LINE="//registry.npmjs.org/:_authToken=${NPM_TOKEN}"
           printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > ~/.npmrc
           printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > packages/statemachine/.npmrc
+          # Diagnostic (no secret value leaked): confirm the token reached the
+          # runner and the .npmrc was written with an auth line.
+          echo "NPM_TOKEN length: ${#NPM_TOKEN}"
+          echo "~/.npmrc authToken lines: $(grep -c _authToken ~/.npmrc || true)"
+          echo "pkg .npmrc authToken lines: $(grep -c _authToken packages/statemachine/.npmrc || true)"
+          echo "bun version: $(bun --version)"
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
