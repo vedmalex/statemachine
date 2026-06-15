@@ -1,1 +1,1 @@
-/Users/vedmalex/work/statemachine/packages/statemachine/README.md
+../../README.md
