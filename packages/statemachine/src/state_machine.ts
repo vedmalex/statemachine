@@ -1129,7 +1129,14 @@ export class StateMachine<
     const currentStateMap = this.parseCompositeState(currentState)
 
     const newStateParts = state.split('|')
-    const isRootState = newStateParts.length === 1 && !state.includes('.')
+    // D1: a bare-root composite that declares regions must NOT short-circuit
+    // as a simple root; it falls through to the region-expansion branch below
+    // (1158-1167) so its regions expand identically to initialState/dotted
+    // entry. A genuine region-less leaf root still short-circuits unchanged.
+    const isRootState =
+      newStateParts.length === 1 &&
+      !state.includes('.') &&
+      !this.states.get(state)?.regions
     if (isRootState) {
       currentStateMap.clear()
       currentStateMap.set(state, state)
@@ -1925,8 +1932,16 @@ export class StateMachine<
     const currentStateMap = this.parseCompositeState(currentState)
     const toStateParts = toState.split('|')
 
-    // Handle simple root state transition
-    if (toStateParts.length === 1 && !toState.includes('.')) {
+    // Handle simple root state transition (region-LESS roots only).
+    // D1: a bare-root composite that declares regions must NOT short-circuit
+    // here; it falls through to the addRegionStates expansion loop so its
+    // regions expand identically to initialState/dotted entry. A genuine
+    // non-region leaf root still short-circuits byte-for-byte.
+    if (
+      toStateParts.length === 1 &&
+      !toState.includes('.') &&
+      !this.states.get(toState)?.regions
+    ) {
       currentStateMap.clear()
       currentStateMap.set(toState, toState)
       return toState
