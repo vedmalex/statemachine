@@ -63,8 +63,8 @@
   },
   "totalTasks": 20,
   "completed": 20,
-  "status": "all-tasks-done",
-  "updatedAt": "2026-06-15T07:38:56Z",
+  "status": "complete-da-advisory-proceed",
+  "updatedAt": "2026-06-15T08:00:13Z",
   "supersedes": "v1 minimal-surgical plan (approach A) — replaced after scope expansion + standards-first directive",
   "replanWorkflowRunId": "wf_8aaa83ff-944",
   "executionTaskId": "wq3tie1cv",
@@ -75,5 +75,13 @@
       "F-3 edge-triggered done.state"
     ],
     "commit": "908c044"
+  },
+  "mb3Task": "TASK-012",
+  "daGate": {
+    "verdict": "PROCEED (advisory/prose, 5 consistent mb3-critic runs)",
+    "authoritativeGateCleared": false,
+    "blocker": "hook envelope-capture defect: mb3-critic emits prose, no schema:mb3-critic.review/v2 JSON block in lastAssistantMessage -> missing_envelope",
+    "decision": "user accepted prose PROCEED; proceed. Not fabricating da_reviewed (RUNTIME_OWNED/forbidden).",
+    "mb3RuntimePhase": "CREATIVE (left as-is pending infra fix)"
   }
 }
