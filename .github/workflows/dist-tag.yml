@@ -1,0 +1,23 @@
+name: Set dist-tag
+
+# Manually point an npm dist-tag (e.g. `latest`) at an already-published
+# version. Uses the same NPM_CONFIG_TOKEN auth as the Release workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version to tag (e.g. 1.0.0-beta.2)"
+        required: true
+      tag:
+        description: "Dist-tag to move (e.g. latest)"
+        required: true
+        default: latest
+
+jobs:
+  dist-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm dist-tag add "@vedmalex/statemachine@${{ inputs.version }}" "${{ inputs.tag }}"
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm view "@vedmalex/statemachine" dist-tags
