@@ -481,3 +481,303 @@ describe('StateMachine with hierarchical states using regions', () => {
     )
   })
 })
+
+/*
+  T0 — Baseline failing repros (RED on current code).
+
+  These tests encode the desired SCXML/UML-correct behavior for the
+  regions-entry-bugfix work (decisions D1, D2, D3, D10, D11). On the current
+  (buggy) engine they FAIL; they turn GREEN as T1..T8 land. All assertions are
+  order-insensitive: composite '|' part order is map-insertion dependent, so we
+  never compare against a hard-coded ordered composite string. Entry/exit
+  ordering is asserted via relative index (ancestor-first / descendant-first),
+  never absolute sibling order.
+*/
+describe('SCXML/UML regions: ancestor-first entry + final join (T0 repros, red)', () => {
+  // Order-insensitive composite membership: every sorted '|'-part of `expected`
+  // equals the corresponding sorted '|'-part of `actual`.
+  const sortedParts = (s: string | undefined): string[] =>
+    (s ?? '').split('|').filter(Boolean).sort()
+  const sameComposite = (actual: string | undefined, expected: string): boolean => {
+    const a = sortedParts(actual)
+    const e = sortedParts(expected)
+    return a.length === e.length && a.every((p, i) => p === e[i])
+  }
+
+  it('ancestor-first entry: transition into bare-root composite expands regions and fires parent onEnter before each region-child onEnter', async () => {
+    const log: string[] = []
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      idle: { display: 'Idle' },
+      parent: {
+        display: 'Parent',
+        initial: 'r1.c1|r2.c1',
+        onEnter: () => {
+          log.push('parent')
+        },
+        regions: {
+          r1: {
+            c1: {
+              display: 'c1',
+              onEnter: () => {
+                log.push('parent.r1.c1')
+              },
+            },
+          },
+          r2: {
+            c1: {
+              display: 'c1',
+              onEnter: () => {
+                log.push('parent.r2.c1')
+              },
+            },
+          },
+        },
+      },
+    } satisfies States<any>
+    const events = {
+      go: { display: 'go', transitions: [{ from: 'idle', to: 'parent' }] },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'AncestorFirstEntry',
+        initialState: 'idle',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    log.length = 0
+    await sm.fireEvent('go')
+
+    // D1: a bare-root composite transition expands its regions (order-insensitive).
+    expect(
+      sameComposite(sm.getCurrentState(), 'parent.r1.c1|parent.r2.c1'),
+    ).toBe(true)
+    // D2: parent onEnter fires AND precedes each region-child onEnter.
+    expect(log).toContain('parent')
+    expect(log).toContain('parent.r1.c1')
+    expect(log).toContain('parent.r2.c1')
+    expect(log.indexOf('parent')).toBeLessThan(log.indexOf('parent.r1.c1'))
+    expect(log.indexOf('parent')).toBeLessThan(log.indexOf('parent.r2.c1'))
+  })
+
+  it('descendant-first exit: leaving an expanded composite fires region-child onExit before parent onExit', async () => {
+    const log: string[] = []
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      parent: {
+        display: 'Parent',
+        initial: 'r1.c1|r2.c1',
+        onExit: () => {
+          log.push('parent')
+        },
+        regions: {
+          r1: {
+            c1: {
+              display: 'c1',
+              onExit: () => {
+                log.push('parent.r1.c1')
+              },
+            },
+          },
+          r2: {
+            c1: {
+              display: 'c1',
+              onExit: () => {
+                log.push('parent.r2.c1')
+              },
+            },
+          },
+        },
+      },
+      out: { display: 'Out' },
+    } satisfies States<any>
+    const events = {
+      leave: {
+        display: 'leave',
+        transitions: [{ from: 'parent', to: 'out' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'DescendantFirstExit',
+        initialState: 'parent',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    log.length = 0
+    // D3: from:'parent' (composite-parent) is eligible while any region leaf is active.
+    await sm.fireEvent('leave')
+
+    expect(sm.getCurrentState()).toBe('out')
+    // D2: each region-child onExit precedes the parent onExit.
+    expect(log).toContain('parent')
+    expect(log).toContain('parent.r1.c1')
+    expect(log).toContain('parent.r2.c1')
+    expect(log.indexOf('parent.r1.c1')).toBeLessThan(log.indexOf('parent'))
+    expect(log.indexOf('parent.r2.c1')).toBeLessThan(log.indexOf('parent'))
+  })
+
+  it('parallel-exit / join: a transition from a composite-parent matches the expanded config and fires', async () => {
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      council: {
+        display: 'Council',
+        initial: 'a.x|b.y',
+        regions: {
+          a: { x: { display: 'x' } },
+          b: { y: { display: 'y' } },
+        },
+      },
+      finished: { display: 'Finished' },
+    } satisfies States<any>
+    const events = {
+      finish: {
+        display: 'finish',
+        transitions: [{ from: 'council', to: 'finished' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'CompositeParentJoin',
+        initialState: 'council',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    // Expanded initial config; from:'council' must match (D3) — currently throws Invalid event.
+    expect(
+      sameComposite(sm.getCurrentState(), 'council.a.x|council.b.y'),
+    ).toBe(true)
+    await sm.fireEvent('finish')
+    expect(sm.getCurrentState()).toBe('finished')
+  })
+
+  it('all-final join (positive): both regions final raises done.state.<C> once and the join fires', async () => {
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      proc: {
+        display: 'Proc',
+        initial: 'a.run|b.run',
+        regions: {
+          a: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+          b: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+        },
+      },
+      complete: { display: 'Complete' },
+    } satisfies States<any>
+    const events = {
+      finishA: {
+        display: 'finishA',
+        transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }],
+      },
+      finishB: {
+        display: 'finishB',
+        transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }],
+      },
+      // Join authored on the engine-raised completion event.
+      'done.state.proc': {
+        display: 'all regions final',
+        transitions: [{ from: 'proc', to: 'complete' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'AllFinalJoin',
+        initialState: 'proc',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    await sm.fireEvent('finishA')
+    // One region final: NOT done yet, join must NOT have fired.
+    expect((sm as any).isDone?.('proc')).toBe(false)
+    expect(sameComposite(sm.getCurrentState(), 'proc.a.done|proc.b.run')).toBe(
+      true,
+    )
+    await sm.fireEvent('finishB')
+    // Allow the internally-raised done.state.proc to be processed.
+    await new Promise((r) => setTimeout(r, 0))
+    expect((sm as any).isDone?.('proc')).toBe(true)
+    expect(sm.getCurrentState()).toBe('complete')
+  })
+
+  it('all-final join (negative): one region final does not raise done.state.<C> and the join does not fire', async () => {
+    const owner = new MemoryAdapter<{ state: string; event: () => any }>({
+      state: '',
+      event: () => null,
+    })
+    const states = {
+      proc: {
+        display: 'Proc',
+        initial: 'a.run|b.run',
+        regions: {
+          a: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+          b: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+        },
+      },
+      complete: { display: 'Complete' },
+    } satisfies States<any>
+    const events = {
+      finishA: {
+        display: 'finishA',
+        transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }],
+      },
+      'done.state.proc': {
+        display: 'all regions final',
+        transitions: [{ from: 'proc', to: 'complete' }],
+      },
+    }
+    const sm = new StateMachine(
+      {
+        name: 'AllFinalJoinNegative',
+        initialState: 'proc',
+        stateAttribute: 'state',
+        states,
+        events,
+      } as any,
+      owner,
+    )
+    await sm.fireEvent('finishA')
+    await new Promise((r) => setTimeout(r, 0))
+    // Only region a is final -> not done, join must not fire.
+    expect((sm as any).isDone?.('proc')).toBe(false)
+    expect(sm.getCurrentState()).not.toBe('complete')
+    expect(sameComposite(sm.getCurrentState(), 'proc.a.done|proc.b.run')).toBe(
+      true,
+    )
+  })
+})

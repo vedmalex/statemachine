@@ -1,0 +1,71 @@
+{
+  "plan": "regions-entry-bugfix",
+  "version": 2,
+  "approach": "standards-first (SCXML/UML), no back-compat constraint",
+  "branch": "fix/regions-ancestor-entry-and-final-join",
+  "executionWorkflowRunId": "wf_c6cbbcd1-548",
+  "designPrinciple": "standards-first; non-standard tests rewritten to spec; no opt-out flags",
+  "scope": {
+    "R1": "SCXML ancestor-first entry / descendant-first exit (uniform across all 5 entry paths)",
+    "R2": "UML all-regions-final join: State.final + done.state.<C> event + isDone() guard",
+    "mechanics": "D1 updateState guard, D3 isTransitionPossible ancestor-scan (ANY-leaf parallel-exit/LCCA), D5 isInState ancestor-aware"
+  },
+  "configSurface": "State.final?: boolean (LOCKED); join via done.state.<C> event (recommended) or isDone('C') guard; trigger-based disambiguation",
+  "publicApiImpact": "State.final + isDone() widen @stable surface -> api.md + public_surface ratchet + MINOR changeset",
+  "executorTasks": [
+    "T0",
+    "T1",
+    "T2",
+    "T5",
+    "T6",
+    "T7",
+    "T3",
+    "T4",
+    "T9",
+    "T8",
+    "T10",
+    "T11",
+    "T13",
+    "T12",
+    "T14",
+    "T15",
+    "T16"
+  ],
+  "mainSessionTasks": [
+    "T17 docs",
+    "T18 llm-wiki"
+  ],
+  "executionOrder": [
+    "T0",
+    "T1",
+    "T2",
+    "T5",
+    "T6",
+    "T7",
+    "T3",
+    "T4",
+    "T9",
+    "T8",
+    "T10",
+    "T11",
+    "T13",
+    "T12",
+    "T14",
+    "T15",
+    "T16"
+  ],
+  "baseline": {
+    "note": "captured in T0 (vitest, 2026-06-15)",
+    "claimed": "pre-existing ServerAdapter failure is expected, not a regression",
+    "vitestFullSuite": "354 tests: 353 pass / 1 pre-existing instability (performance.test.ts memory-leak ~10.8MB vs 10MB threshold; passes in isolation). ServerAdapter 'save with no state' passes under vitest; it is the bun-test surfacing of the same out-of-scope pre-existing flake. Treated as the single expected non-regression failure.",
+    "hierarchicalPreT0": "6 passed",
+    "hierarchicalPostT0": "11 tests: 6 passed (pre-existing, untouched) / 5 RED new repros (ancestor-first entry, descendant-first exit, composite-parent join, all-final positive, all-final negative)"
+  },
+  "totalTasks": 19,
+  "completed": 1,
+  "status": "executing",
+  "updatedAt": "2026-06-15T06:01:33Z",
+  "supersedes": "v1 minimal-surgical plan (approach A) — replaced after scope expansion + standards-first directive",
+  "replanWorkflowRunId": "wf_8aaa83ff-944",
+  "executionTaskId": "wq3tie1cv"
+}
