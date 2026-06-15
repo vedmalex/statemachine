@@ -28,33 +28,15 @@ jobs:
       - run: bun run knip
         working-directory: packages/statemachine
 
-      # Write ~/.npmrc with the resolved token directly (NOT ${NODE_AUTH_TOKEN} placeholder).
-      # bun publish does NOT perform env-var substitution in .npmrc; it reads the file literally.
-      # actions/setup-node's auto-generated .npmrc uses the placeholder syntax which only npm
-      # CLI expands at runtime. For bun publish to authenticate, the resolved token must be
-      # written into the file directly.
-      - name: Configure npm auth for bun publish
-        run: |
-          # bun publish resolves .npmrc from the publish CWD upward + $HOME.
-          # Writing only ~/.npmrc proved insufficient (bun emitted "missing
-          # authentication"), so write the resolved-token .npmrc into BOTH the
-          # publish working-directory and $HOME. The token is a literal resolved
-          # value (bun does not expand ${...} placeholders in .npmrc).
-          AUTH_LINE="//registry.npmjs.org/:_authToken=${NPM_TOKEN}"
-          printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > ~/.npmrc
-          printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > packages/statemachine/.npmrc
-          # Diagnostic (no secret value leaked): confirm the token reached the
-          # runner and the .npmrc was written with an auth line.
-          echo "NPM_TOKEN length: ${#NPM_TOKEN}"
-          echo "~/.npmrc authToken lines: $(grep -c _authToken ~/.npmrc || true)"
-          echo "pkg .npmrc authToken lines: $(grep -c _authToken packages/statemachine/.npmrc || true)"
-          echo "bun version: $(bun --version)"
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      # bun publish:
-      # - automatically strips workspace: protocol from package.json before publishing
-      # - reads ~/.npmrc (now with literal resolved token) for auth
-      # - --tag beta routes pre-release versions to the `beta` dist-tag instead of default `latest`
+      # bun publish authenticates via the NPM_CONFIG_TOKEN env var — the
+      # documented mechanism for CI/automation (bun's .npmrc `_authToken`
+      # reading proved unreliable here: the token reached the runner and the
+      # .npmrc was written, yet bun still emitted "missing authentication").
+      # See https://bun.sh/docs/cli/publish — "bun publish respects the
+      # NPM_CONFIG_TOKEN environment variable".
+      # --strip-... / workspace: protocol stripping is automatic.
+      # --tag beta routes pre-release versions to the `beta` dist-tag (not `latest`).
       - run: bun publish --access public --tag beta
         working-directory: packages/statemachine
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
