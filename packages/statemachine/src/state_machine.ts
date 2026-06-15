@@ -1239,14 +1239,21 @@ export class StateMachine<
 
     this.setCurrentState(initialStates, targetAdaptee)
 
-    // Trigger enter actions for initial state(s) to start timers and other logic
-    const stateParts = initialStates.split('|')
+    // D8: drive enter actions through the SAME ancestor-first enter set used by
+    // a transition (computeEnterExitSets from the empty old configuration), so
+    // initial entry (and reset, which delegates here) fires a composite
+    // parent's onEnter BEFORE its region children — identical ordering to a
+    // transition into the same composite. Fire-and-forget with .catch to keep
+    // construction non-blocking, as the prior per-leaf loop did.
+    const { enterStates } = this.computeEnterExitSets('', initialStates)
+    const enterFireOrder =
+      enterStates.length > 0 ? enterStates : [initialStates]
     const context: ErrorContext = {
       state: initialStates,
       phase: 'enter',
     }
 
-    for (const statePart of stateParts) {
+    for (const statePart of enterFireOrder) {
       this.executeEnterActions(
         targetAdaptee as unknown as Adapter<TOwner>,
         statePart,
