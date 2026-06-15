@@ -5,7 +5,7 @@
 ```ts
 
 // @public (undocumented)
-export type ActionOrString<T extends object, R = void> = KeysOf<T, EventAction<T, R>> | EventAction<Adapter<T>, R>;
+export type ActionOrString<T extends object, R = void> = KeysOf<T, EventAction<T, R>> | EventAction<T, R>;
 
 // @public (undocumented)
 export interface Adapter<T extends object> {
@@ -336,6 +336,25 @@ export type MethodsOf<T> = {
 };
 
 // @public
+export interface MonitoringConfig {
+    // (undocumented)
+    enabled: boolean;
+    // (undocumented)
+    healthCheckInterval: number;
+    // (undocumented)
+    maxMetricsHistory: number;
+    // (undocumented)
+    metricsInterval: number;
+    // (undocumented)
+    thresholds: {
+        transitionTimeWarning: number;
+        transitionTimeCritical: number;
+        errorRateWarning: number;
+        errorRateCritical: number;
+    };
+}
+
+// @public
 export interface MonitorMetricsSnapshot {
     // (undocumented)
     averageDuration: number;
@@ -436,6 +455,7 @@ export type State<T extends object> = {
     regions?: RegionsConfig<T>;
     initial?: StateName;
     history?: 'deep' | 'shallow';
+    final?: boolean;
     invoke?: StateInvocation<T>[];
 };
 
@@ -486,6 +506,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     getQueuedEvents(): QueuedEventInfo[];
     // (undocumented)
     getStateHistory(): Record<string, string>;
+    isDone(compositeId: string, adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
     isInState(expectedState: StateName, adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
     // (undocumented)
     isProcessingEvents(): boolean;
@@ -517,7 +538,7 @@ export interface StateMachineConfig<T extends object = object> {
     // (undocumented)
     name: string;
     // (undocumented)
-    onError?: KeysOf<T, ErrorHandler<T>>;
+    onError?: ErrorHandlerOrString<T>;
     // (undocumented)
     stateAttribute: KeysOf<PropertiesOf<T>, string>;
     // (undocumented)
@@ -594,13 +615,37 @@ export interface TransitionContext {
     toState: string;
 }
 
-// Warning: (ae-forgotten-export) The symbol "ValidationConfig" needs to be exported by the entry point index.d.ts
-//
 // @public (undocumented)
 export function validateConfig<T extends object>(config: StateMachineConfig<T>, validationConfig?: Partial<ValidationConfig>): ValidationResult;
 
 // @public (undocumented)
 export function validateConfigStrict<T extends object>(config: StateMachineConfig<T>): ValidationResult;
+
+// @public (undocumented)
+export interface ValidationConfig {
+    // (undocumented)
+    allowEmptyEvents: boolean;
+    // (undocumented)
+    allowEmptyStates: boolean;
+    // Warning: (ae-forgotten-export) The symbol "CustomRule" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    customRules?: CustomRule[];
+    // (undocumented)
+    maxEventsCount: number;
+    // (undocumented)
+    maxStateDepth: number;
+    // (undocumented)
+    maxStatesCount: number;
+    // (undocumented)
+    requireInitialState: boolean;
+    // (undocumented)
+    strictMode: boolean;
+    // (undocumented)
+    validateActionReferences: boolean;
+    // (undocumented)
+    validateTransitionPaths: boolean;
+}
 
 // @public (undocumented)
 export interface ValidationError {

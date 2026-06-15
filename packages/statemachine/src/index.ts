@@ -75,6 +75,18 @@ export type {
   ErrorContext,
 } from './types'
 
+/**
+ * @category Unstable
+ * @unstable — validation preset/config shape used by validation helpers and presets.
+ */
+export type { ValidationConfig } from './config_validator'
+
+/**
+ * @category Unstable
+ * @unstable — monitoring preset/config shape used by monitoring helpers and presets.
+ */
+export type { MonitoringConfig } from './monitoring'
+
 // === Public adapter classes (live in types.ts) ===
 
 export {
