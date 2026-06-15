@@ -344,4 +344,75 @@ describe('StateMachine persistence', () => {
       'robot.engine.on|robot.sensors.on|robot.mode.auto.task.cleaning',
     )
   })
+
+  it('should NOT emit done.state on restore of a non-final composite config', async () => {
+    // T13 (D6/D11/D12): checkCompletion runs after setInitialState/reset and
+    // after each transition, but restoreState writes the persisted string
+    // verbatim through setCurrentState (no enter-action / completion pass), so
+    // restoring a NON-final configuration must not raise done.state.<C> and
+    // must not fire the join. isDone stays false; the join target is unentered.
+    const states = {
+      proc: {
+        display: 'Proc',
+        initial: 'a.run|b.run',
+        regions: {
+          a: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+          b: {
+            run: { display: 'run' },
+            done: { display: 'done', final: true },
+          },
+        },
+      },
+      complete: { display: 'Complete' },
+    } satisfies States<any>
+
+    const events = {
+      finishA: {
+        display: 'finishA',
+        transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }],
+      },
+      // Join authored on the engine-raised completion event.
+      'done.state.proc': {
+        display: 'all regions final',
+        transitions: [{ from: 'proc', to: 'complete' }],
+      },
+    }
+
+    const SMC = {
+      name: 'NonFinalRestore',
+      initialState: 'proc',
+      stateAttribute: 'state',
+      states,
+      events,
+    } as any
+
+    const owner = new ServerAdapter({ state: '', event: () => null })
+    const sm = new StateMachine(SMC, owner)
+
+    // Drive only ONE region to final -> non-final composite config.
+    await sm.fireEvent('finishA')
+    await new Promise((r) => setTimeout(r, 0))
+    expect((sm as any).isDone('proc')).toBe(false)
+    expect(sm.getCurrentState()).not.toBe('complete')
+    await sm.saveState()
+
+    // Restore onto a fresh machine + adapter.
+    const sm2 = new StateMachine(
+      SMC,
+      new ServerAdapter({ state: '', event: () => null }),
+    )
+    await sm2.restoreState()
+    // Allow any (erroneously) raised done.state to drain.
+    await new Promise((r) => setTimeout(r, 0))
+
+    // Non-final config restored verbatim: join did NOT fire, isDone false.
+    expect(sm2.getCurrentState()?.split('|').sort()).toEqual(
+      ['proc.a.done', 'proc.b.run'].sort(),
+    )
+    expect(sm2.getCurrentState()).not.toBe('complete')
+    expect((sm2 as any).isDone('proc')).toBe(false)
+  })
 })

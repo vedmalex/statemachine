@@ -333,6 +333,94 @@ describe('StateMachine Serialization/Deserialization', () => {
       'robot.engine.on|robot.sensors.on|robot.mode.auto.task.cleaning',
     )
   })
+
+  it('should round-trip a state reached via transition-into-bare-root composite (preserves expanded string, re-arms region timers)', async () => {
+    // T13 (D1/D6): a transition into a BARE-ROOT composite now expands its
+    // regions to the initial leaves (SCXML/UML), so the stored string is the
+    // expanded '|' composite. Serialization is a verbatim pass-through, so the
+    // expanded string MUST survive a toJSON/fromJSON round-trip, and restore
+    // (resumeTimers) must re-arm one invoke timer per active region leaf — both
+    // region leaves' invoke-driven transitions fire on the restored machine.
+    const states = {
+      idle: { display: 'Idle' },
+      box: {
+        display: 'Box',
+        initial: 'scan.scanning|poll.polling',
+        regions: {
+          scan: {
+            scanning: {
+              display: 'Scanning',
+              invoke: [{ delay: 50, event: 'scanDone' }],
+            },
+            done: { display: 'Scan done' },
+          },
+          poll: {
+            polling: {
+              display: 'Polling',
+              invoke: [{ delay: 50, event: 'pollDone' }],
+            },
+            done: { display: 'Poll done' },
+          },
+        },
+      },
+    } satisfies States<any>
+
+    const events = {
+      enterBox: {
+        display: 'Enter Box',
+        // Bare-root composite target -> regions expand on this transition.
+        transitions: [{ from: 'idle', to: 'box' }],
+      },
+      scanDone: {
+        display: 'Scan finished',
+        transitions: [{ from: 'box.scan.scanning', to: 'box.scan.done' }],
+      },
+      pollDone: {
+        display: 'Poll finished',
+        transitions: [{ from: 'box.poll.polling', to: 'box.poll.done' }],
+      },
+    } satisfies Events<any, typeof states>
+
+    const SMC_BARE_ROOT_COMPOSITE = {
+      name: 'BareRootCompositeRoundTrip',
+      initialState: 'idle',
+      stateAttribute: 'state',
+      states,
+      events,
+    } satisfies StateMachineConfig<any>
+
+    const owner = new MemoryAdapter({ state: '', event: () => null })
+    const sm = new StateMachine(SMC_BARE_ROOT_COMPOSITE, owner)
+
+    // Reach the composite via a transition (NOT as the initial state).
+    await sm.fireEvent('enterBox')
+    const reached = sm.getCurrentState()
+    // The bare-root transition expanded into the parallel '|' composite.
+    expect(reached?.split('|').sort()).toEqual(
+      ['box.poll.polling', 'box.scan.scanning'].sort(),
+    )
+
+    // Serialize from the expanded, timers-armed config and rehydrate into a
+    // fresh owner BEFORE the original machine's timers fire.
+    const serializedSM = sm.toJSON()
+    const restoreOwner = new MemoryAdapter({ state: '', event: () => null })
+    const deserializedSM = StateMachine.fromJSON<
+      any,
+      typeof SMC_BARE_ROOT_COMPOSITE
+    >(serializedSM, restoreOwner)
+
+    // The expanded string survives the round-trip verbatim (order-insensitive).
+    expect(deserializedSM.getCurrentState()?.split('|').sort()).toEqual(
+      reached?.split('|').sort(),
+    )
+
+    // resumeTimers re-armed one invoke timer per active region leaf: after the
+    // delay both region invoke-events fire and each region advances to done.
+    await new Promise((r) => setTimeout(r, 120))
+    expect(deserializedSM.getCurrentState()?.split('|').sort()).toEqual(
+      ['box.poll.done', 'box.scan.done'].sort(),
+    )
+  })
 })
 
 describe('StateMachine.fromData', () => {
