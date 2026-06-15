@@ -35,8 +35,14 @@ jobs:
       # written into the file directly.
       - name: Configure npm auth for bun publish
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
-          echo "registry=https://registry.npmjs.org/" >> ~/.npmrc
+          # bun publish resolves .npmrc from the publish CWD upward + $HOME.
+          # Writing only ~/.npmrc proved insufficient (bun emitted "missing
+          # authentication"), so write the resolved-token .npmrc into BOTH the
+          # publish working-directory and $HOME. The token is a literal resolved
+          # value (bun does not expand ${...} placeholders in .npmrc).
+          AUTH_LINE="//registry.npmjs.org/:_authToken=${NPM_TOKEN}"
+          printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > ~/.npmrc
+          printf '%s\nregistry=https://registry.npmjs.org/\n' "$AUTH_LINE" > packages/statemachine/.npmrc
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
