@@ -1654,13 +1654,24 @@ export class StateMachine<
       // Handle wildcard in parallel state part (e.g. "lobby|*")
       if (fromState === '*') return true
 
+      // Fast path: exact region-key lookup (leaf or in-region ancestor `from`).
       const regionKey = this.getRegionKey(fromState)
       const currentStateForRegion = currentStates.get(regionKey)
-      if (!currentStateForRegion) return false
+      if (
+        currentStateForRegion &&
+        (currentStateForRegion === fromState ||
+          this.isParentState(currentStateForRegion, fromState))
+      ) {
+        return true
+      }
 
-      return (
-        currentStateForRegion === fromState ||
-        this.isParentState(currentStateForRegion, fromState)
+      // Ancestor-scan fallback (D3): a transition whose source is a composite
+      // parent is eligible whenever its parent is in the active configuration,
+      // i.e. `fromState` equals or is an ancestor of any active atomic leaf.
+      // Mirrors SCXML source-in-active-configuration; preserves the outer
+      // .every() so a multi-part `from` still requires every part to match.
+      return Array.from(currentStates.values()).some(
+        (leaf) => leaf === fromState || this.isParentState(fromState, leaf),
       )
     })
   }
