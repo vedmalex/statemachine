@@ -17,7 +17,14 @@ jobs:
   dist-tag:
     runs-on: ubuntu-latest
     steps:
-      - run: npm dist-tag add "@vedmalex/statemachine@${{ inputs.version }}" "${{ inputs.tag }}"
+      # npm CLI (unlike bun) authenticates from .npmrc `_authToken`, not from
+      # NPM_CONFIG_TOKEN. NOTE: `npm dist-tag` is a 2FA-gated write — it succeeds
+      # here only if NPM_TOKEN is an npm *automation* token (which bypasses 2FA);
+      # a granular/classic publish token will get a 401/OTP wall.
+      - name: Configure npm auth
+        run: |
+          printf '//registry.npmjs.org/:_authToken=%s\nregistry=https://registry.npmjs.org/\n' "${NPM_TOKEN}" > ~/.npmrc
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm dist-tag add "@vedmalex/statemachine@${{ inputs.version }}" "${{ inputs.tag }}"
       - run: npm view "@vedmalex/statemachine" dist-tags
