@@ -1,0 +1,1 @@
+/Users/vedmalex/work/statemachine/packages/statemachine/docs/regions-and-parallel.md

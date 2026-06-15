@@ -1,0 +1,1 @@
+/Users/vedmalex/work/statemachine/packages/statemachine/src/tests/hierarchical.test.ts
