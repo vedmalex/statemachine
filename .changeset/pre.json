@@ -5,6 +5,7 @@
     "@vedmalex/statemachine": "1.0.0-beta.0"
   },
   "changesets": [
+    "composite-region-final-join",
     "phase-1-baseline"
   ]
 }
