@@ -1301,6 +1301,103 @@ export class StateMachine<
     return regionStates.join('|')
   }
 
+  /**
+   * Build the registered ancestor chain for an atomic leaf, ordered root-to-leaf.
+   *
+   * Walks every dot-prefix of `leaf` and keeps only the ones that are real
+   * registered states (`this.states.has`). Region containers are never
+   * registered (only composite parents and atomic leaves are — see
+   * processStates/processRegions), so they are filtered out automatically. The
+   * result is exactly `[parent..leaf]` for a leaf inside a composite, and
+   * `[leaf]` for a flat state.
+   *
+   * Example: `ancestorChain('a.r1.c1')` -> `['a', 'a.r1.c1']` (the `a.r1`
+   * region container is excluded). Nested:
+   * `ancestorChain('a.r1.c1.r3.x')` -> `['a', 'a.r1.c1', 'a.r1.c1.r3.x']`.
+   */
+  private ancestorChain(leaf: string): string[] {
+    const chain: string[] = []
+    let dotIndex = leaf.indexOf('.')
+    while (dotIndex !== -1) {
+      const prefix = leaf.substring(0, dotIndex)
+      if (this.states.has(prefix)) {
+        chain.push(prefix)
+      }
+      dotIndex = leaf.indexOf('.', dotIndex + 1)
+    }
+    if (this.states.has(leaf)) {
+      chain.push(leaf)
+    }
+    return chain
+  }
+
+  /**
+   * Compute the ordered enter/exit sets between two composite configurations
+   * (SCXML ancestor-first entry / descendant-first exit).
+   *
+   * For each `|`-separated atomic leaf in `oldComposite` and `newComposite` the
+   * union of its {@link ancestorChain} forms the old/new active ancestry. A
+   * state shared by both ancestries lands in NEITHER diff, so a surviving
+   * ancestor is never re-entered nor exited (no onEnter/onExit re-fire, no
+   * timer re-arm/leak).
+   *
+   * - `enterStates` = new ancestry MINUS old, sorted ascending by depth then
+   *   document (insertion) order -> root-to-leaf entry.
+   * - `exitStates` = old ancestry MINUS new, sorted descending by depth ->
+   *   leaf-to-root exit.
+   *
+   * Consumed by BOTH R1 (applyTransition / setInitialState / reset) and R2.
+   */
+  private computeEnterExitSets(
+    oldComposite: string,
+    newComposite: string,
+  ): { enterStates: string[]; exitStates: string[] } {
+    const collectAncestry = (composite: string): Set<string> => {
+      const ancestry = new Set<string>()
+      if (!composite) return ancestry
+      for (const leaf of composite.split('|')) {
+        if (!leaf) continue
+        for (const ancestor of this.ancestorChain(leaf)) {
+          ancestry.add(ancestor)
+        }
+      }
+      return ancestry
+    }
+
+    const oldAncestry = collectAncestry(oldComposite)
+    const newAncestry = collectAncestry(newComposite)
+
+    const depthOf = (state: string): number => {
+      let depth = 0
+      for (let i = 0; i < state.length; i++) {
+        if (state[i] === '.') depth++
+      }
+      return depth
+    }
+
+    // Preserve document (insertion) order for equal depth via a stable sort on
+    // the original collection order.
+    const enterRaw: string[] = []
+    for (const state of newAncestry) {
+      if (!oldAncestry.has(state)) enterRaw.push(state)
+    }
+    const exitRaw: string[] = []
+    for (const state of oldAncestry) {
+      if (!newAncestry.has(state)) exitRaw.push(state)
+    }
+
+    const enterStates = enterRaw
+      .map((state, index) => ({ state, index, depth: depthOf(state) }))
+      .sort((a, b) => a.depth - b.depth || a.index - b.index)
+      .map((entry) => entry.state)
+    const exitStates = exitRaw
+      .map((state, index) => ({ state, index, depth: depthOf(state) }))
+      .sort((a, b) => b.depth - a.depth || a.index - b.index)
+      .map((entry) => entry.state)
+
+    return { enterStates, exitStates }
+  }
+
   private validateCompositeState(compositeState: string): void {
     const stateParts = compositeState.split('|')
     const regionKeys = new Set<string>()
@@ -1680,8 +1777,18 @@ export class StateMachine<
 
       // Phase 8: State update
       const transitionStartTime = Date.now()
+      // Compute the immutable new configuration together with its SCXML
+      // ancestor-first enter / descendant-first exit sets in a single pass.
+      // T2 wires only the shared helpers and reuses `transitionPlan.newState`
+      // here, preserving existing behaviour; T3 lifts this compute to the
+      // pre-Phase-3 position (~D7) and drives the Phase 3/6 loops from
+      // transitionPlan.enterStates / transitionPlan.exitStates.
       const newState = this.updateState(currentState, targetState)
-      this.setCurrentState(newState, obj as any)
+      const transitionPlan = {
+        newState,
+        ...this.computeEnterExitSets(currentState, newState),
+      }
+      this.setCurrentState(transitionPlan.newState, obj as any)
 
       // Record successful transition
       const transitionTime = Date.now() - transitionStartTime
