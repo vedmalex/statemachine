@@ -62,9 +62,9 @@
     "hierarchicalPostT0": "11 tests: 6 passed (pre-existing, untouched) / 5 RED new repros (ancestor-first entry, descendant-first exit, composite-parent join, all-final positive, all-final negative)"
   },
   "totalTasks": 19,
-  "completed": 16,
+  "completed": 17,
   "status": "executing",
-  "updatedAt": "2026-06-15T07:09:11Z",
+  "updatedAt": "2026-06-15T07:11:25Z",
   "supersedes": "v1 minimal-surgical plan (approach A) — replaced after scope expansion + standards-first directive",
   "replanWorkflowRunId": "wf_8aaa83ff-944",
   "executionTaskId": "wq3tie1cv"
