@@ -67,7 +67,7 @@ describe('StateMachine with hierarchical states using regions', () => {
     toParentChild1: {
       display: 'Перейти в Parent.Child1',
       transitions: [
-        { from: 'state1', to: 'parentState' }, // Переход на parentState восстановит начальные состояния регионов
+        { from: 'state1', to: 'parentState' }, // Переход на parentState восстанавливает начальные состояния регионов (SCXML/UML: bare-root composite re-entry expands regions)
       ],
     },
   } satisfies Events<Person, PersonStates>
@@ -102,7 +102,16 @@ describe('StateMachine with hierarchical states using regions', () => {
     expect(sm.getCurrentState()).toBe('state1')
 
     await sm.fireEvent('toParentChild1')
-    expect(sm.getCurrentState()).toBe('parentState')
+    // Standards-correct (SCXML/UML): a transition into the bare-root composite
+    // re-enters its regions, restoring the initial region substates (D1). The '|'
+    // join-string order is map-insertion dependent, so assert order-insensitively.
+    expect(sm.isInState('parentState')).toBe(true)
+    expect(sm.getCurrentState()?.split('|').sort()).toEqual(
+      [
+        'parentState.region1.childState1',
+        'parentState.region2.childState1',
+      ].sort(),
+    )
   })
 
   it('should throw error for invalid transition from current state in hierarchical state machine with regions', async () => {
