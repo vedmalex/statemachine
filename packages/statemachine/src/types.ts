@@ -222,6 +222,15 @@ export type State<T extends object> = {
   regions?: RegionsConfig<T> // Заменяем `states` на `regions`
   initial?: StateName // Добавляем initial для регионов и иерархических состояний
   history?: 'deep' | 'shallow' // Добавляем свойство для истории состояний
+  /**
+   * Marks this atomic state as the SCXML/UML `<final>` pseudo-substate of its
+   * region. When every region of a composite has its active atomic leaf marked
+   * `final`, that composite is "done": the engine raises the `done.state.<id>`
+   * event and {@link StateMachine.isDone} returns `true`. Only meaningful on a
+   * leaf state (a state without `regions`); set on a composite it is ignored at
+   * runtime and flagged by the config validator.
+   */
+  final?: boolean
   invoke?: StateInvocation<T>[] // Поручения (выполняются при входе в состояние)
 }
 

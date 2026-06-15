@@ -1310,6 +1310,19 @@ export class StateMachine<
   }
 
   /**
+   * Whether `leaf` is a UML/SCXML `<final>` atomic state of its region.
+   *
+   * Reads the `final` marker straight from the flattened state map populated by
+   * processStates, so it works for any registered atomic leaf regardless of
+   * nesting depth. Returns `false` for unregistered names and for composites
+   * (the all-regions-final join derives doneness from atomic leaves, not from a
+   * `final` flag on a composite parent).
+   */
+  private isStateFinal(leaf: string): boolean {
+    return Boolean(this.states.get(leaf)?.final)
+  }
+
+  /**
    * Build the registered ancestor chain for an atomic leaf, ordered root-to-leaf.
    *
    * Walks every dot-prefix of `leaf` and keeps only the ones that are real
@@ -1806,6 +1819,13 @@ export class StateMachine<
       const transitionPlan = {
         newState,
         ...this.computeEnterExitSets(currentState, newState),
+        // T7 wires the `isStateFinal` marker behaviour-neutrally: record which
+        // newly-active atomic leaves are UML/SCXML `<final>` states. Nothing
+        // consumes this yet; T8 replaces it with the real `checkCompletion`
+        // all-regions-final scan + `done.state.<id>` emission (D10/D11).
+        finalLeaves: newState
+          .split('|')
+          .filter((leaf) => leaf && this.isStateFinal(leaf)),
       }
       this.setCurrentState(transitionPlan.newState, obj as any)
 
