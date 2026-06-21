@@ -1,18 +1,15 @@
 # Current Context
 
-Updated: 2026-05-06 07:31
+Updated: 2026-06-21 09:42
 
-## Active Task
-- ID: TASK-010
-- Name: Add mandatory lint and typecheck gates
-- Profile: js-type-hardening
-- Phase: IMPLEMENT
-- Tier: T2:quick  QA: FAST
+## No Active Task
 
-## Quick Resume
-- Next action: Follow-up fix for knip/api-extractor warnings: export missing config types and clean up redundant knip entry.
-- Progress: 0/?
-- Blockers: none
+Use `mb3_task(action="start")` to start a task, or `mb3_task(action="list")` to see pending tasks.
+
+## Recently Completed
+- TASK-011: Normalize dispatch inputs and simplify callback contract
+- TASK-012: SCXML/UML-correct composite regions: ancestor-first entry/exit + all-final join
+- TASK-013: DST clock-injection: options.clock + createVirtualScheduler for deterministic replay
 
 ## Active Roadmap
 - ID: RM-001

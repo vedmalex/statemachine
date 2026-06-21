@@ -4,10 +4,10 @@
 - **Tier**: T4:standard
 - **QA Level**: MAX
 - **Execution Mode**: sequential
-- **Status**: in_progress
-- **Phase**: IMPLEMENT
+- **Status**: completed
+- **Phase**: ARCHIVE
 - **Created**: 2026-06-21T08:29:25Z
-- **Updated**: 2026-06-21T08:31:45Z
+- **Updated**: 2026-06-21T09:16:15Z
 - **Branch**: fix/regions-ancestor-entry-and-final-join
 
 ## Scope
@@ -23,8 +23,8 @@
 
 ## UR Coverage
 
-- [ ] UR-001 — missing
-- [ ] UR-002 — missing
+- [x] UR-001 — covered
+- [x] UR-002 — covered
 
 ## Notes
 
