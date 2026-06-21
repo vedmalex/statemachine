@@ -5,9 +5,9 @@
 - **QA Level**: MAX
 - **Execution Mode**: subagent_driven
 - **Status**: in_progress
-- **Phase**: CREATIVE
+- **Phase**: PLAN
 - **Created**: 2026-05-04T13:45:00Z
-- **Updated**: 2026-05-04T14:47:54Z
+- **Updated**: 2026-05-26T10:47:21Z
 - **Branch**: main
 
 ## Scope
@@ -31,18 +31,16 @@
 
 ## UR Coverage
 
-> CREATIVE-time status. Authoritative coverage matrix lives in `artifacts/creative-decisions.md` §"UR Coverage Matrix". Final ARCHIVE-time satisfaction tracked when TASK-009 closes.
-
-- [x] UR-001 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
-- [x] UR-002 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
-- [x] UR-003 — COVERED by TD-T9-1 (`packages/statemachine-zig/` separate package)
-- [x] UR-004 — SATISFIED (carry-forward from Phase 1 ARCHIVED)
-- [x] UR-005 — COVERED by TD-T9-9 (separate `createMachineZig()` factory; `createMachine()` signature unchanged) + TD-T9-11 (ABI versioning)
-- [x] UR-006 — COVERED by TD-T9-2, TD-T9-3, TD-T9-7, TD-T9-8
-- [x] UR-007 — COVERED by TD-T9-6, TD-T9-10, TD-T9-11, TD-T9-12 (behavioral parity via TASK-014 + Zig-side `std.testing` MUST)
-- [x] UR-008 — COVERED by TD-T9-2 + R-T9-8 closure
-- [x] UR-009 — COVERED (PRIMARY DRIVER for all TD-T9-*)
-- [x] UR-010 — COVERED by TD-T9-1, TD-T9-5 (EP catalog preserved)
-- [ ] UR-011 — PARTIAL (TASK-017 owns final verification; TD-T9-1 carries `PENDING UR-011` marker on Zig package name)
-- [x] UR-012 — COVERED (Phase 2 entry decomposition complete)
-- [x] UR-013 — COVERED by TigerStyle methodology adoption + ZTB lens registration in `CODING_RULES.md` + `project-config.json`
+- [ ] UR-001 — partial
+- [ ] UR-002 — partial
+- [ ] UR-003 — partial
+- [ ] UR-004 — partial
+- [ ] UR-005 — partial
+- [ ] UR-006 — partial
+- [ ] UR-007 — partial
+- [ ] UR-008 — partial
+- [ ] UR-009 — partial
+- [ ] UR-010 — partial
+- [ ] UR-011 — partial
+- [ ] UR-012 — partial
+- [ ] UR-013 — partial
