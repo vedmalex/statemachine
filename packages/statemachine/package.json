@@ -1,6 +1,6 @@
 {
   "name": "@vedmalex/statemachine",
-  "version": "1.0.0-beta.2",
+  "version": "1.0.0-beta.3",
   "description": "Hierarchical state machine for TypeScript with monitoring, validation, and persistence (lite-only DI-free surface).",
   "keywords": [
     "state-machine",
