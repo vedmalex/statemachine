@@ -2041,6 +2041,9 @@ export class StateMachine<
       // Phase 8: State update — reuse the immutable `newState` computed once
       // before Phase 3 (D7); never recompute. updateState is side-effect-free,
       // so only the setCurrentState write stays late.
+      // Intentional wall-clock telemetry (NOT this.clock()): measures real
+      // transition latency for monitor.recordTransition. Must stay Date.now() —
+      // a virtual clock would report meaningless ~0ms durations. Do not virtualize.
       const transitionStartTime = Date.now()
       this.setCurrentState(newState, obj as any)
 
