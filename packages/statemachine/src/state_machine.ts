@@ -78,6 +78,8 @@ export class StateMachine<
   private monitor: IMonitor
   private scheduler: ITimerScheduler
   private errorHandler: IErrorHandler
+  private clock: () => number
+  private schedulerProvided: boolean
 
   // Свойства
   private states: Map<keyof SMConfig['states'], State<TOwner>>
@@ -149,7 +151,9 @@ export class StateMachine<
     // Если передали - используем, если нет - fallback на легковесные версии
     this.logger = options?.logger ?? ConsoleLogger
     this.monitor = options?.monitor ?? createDefaultMonitor()
+    this.schedulerProvided = options?.scheduler !== undefined
     this.scheduler = options?.scheduler ?? createDefaultScheduler()
+    this.clock = options?.clock ?? Date.now
     this.errorHandler = options?.errorHandler ?? createDefaultErrorHandler()
 
     if (adaptee) {
@@ -244,7 +248,7 @@ export class StateMachine<
           args,
           resolve,
           reject,
-          timestamp: Date.now(),
+          timestamp: this.clock(),
           type: 'external',
         })
         this.scheduleProcessing()
@@ -257,7 +261,7 @@ export class StateMachine<
       eventName,
       obj,
       args,
-      timestamp: Date.now(),
+      timestamp: this.clock(),
       type: 'internal',
     })
     /* c8 ignore next */
@@ -274,7 +278,7 @@ export class StateMachine<
       eventName,
       obj,
       args,
-      timestamp: Date.now(),
+      timestamp: this.clock(),
       type: 'internal',
     })
   }
@@ -489,7 +493,7 @@ export class StateMachine<
   }
 
   public getQueuedEvents(): QueuedEventInfo[] {
-    const now = Date.now()
+    const now = this.clock()
     const mapEvent = (evt: QueuedEvent<TOwner>): QueuedEventInfo => ({
       id: evt.id,
       event: evt.eventName,
@@ -652,13 +656,41 @@ export class StateMachine<
     object: any,
     eventMap: { [key: string]: string },
   ): void {
-    for (const objectEventName in eventMap) {
-      if (eventMap.hasOwnProperty(objectEventName)) {
-        const stateMachineEventName = eventMap[objectEventName]
-        /* c8 ignore next */ if (stateMachineEventName === undefined) continue
-        if (typeof object.addEventListener === 'function') {
-          object.addEventListener(objectEventName, (...args: any[]) => {
-            this.fireEvent(stateMachineEventName, object, ...args).catch((e) =>
+    for (const objectEventName of Object.keys(eventMap)) {
+      const stateMachineEventName = eventMap[objectEventName]
+      /* c8 ignore next */ if (stateMachineEventName === undefined) continue
+      if (typeof object.addEventListener === 'function') {
+        object.addEventListener(objectEventName, (...args: any[]) => {
+          this.fireEvent(stateMachineEventName, object, ...args).catch((e) =>
+            this.logger.error(
+              'Error firing event',
+              {
+                objectEventName,
+                stateMachineEventName,
+              },
+              /* c8 ignore next */
+              e instanceof Error ? e : new Error(String(e)),
+            ),
+          )
+        })
+      } else if (typeof object.on === 'function') {
+        object.on(objectEventName, (...args: any[]) => {
+          this.fireEvent(stateMachineEventName, object, ...args).catch((e) =>
+            this.logger.error(
+              'Error firing event',
+              {
+                objectEventName,
+                stateMachineEventName,
+              },
+              /* c8 ignore next */
+              e instanceof Error ? e : new Error(String(e)),
+            ),
+          )
+        })
+      } else {
+        object[`on${objectEventName}`] = async (...args: any[]) => {
+          return this.fireEvent(stateMachineEventName, object, ...args).catch(
+            (e) =>
               this.logger.error(
                 'Error firing event',
                 {
@@ -668,37 +700,7 @@ export class StateMachine<
                 /* c8 ignore next */
                 e instanceof Error ? e : new Error(String(e)),
               ),
-            )
-          })
-        } else if (typeof object.on === 'function') {
-          object.on(objectEventName, (...args: any[]) => {
-            this.fireEvent(stateMachineEventName, object, ...args).catch((e) =>
-              this.logger.error(
-                'Error firing event',
-                {
-                  objectEventName,
-                  stateMachineEventName,
-                },
-                /* c8 ignore next */
-                e instanceof Error ? e : new Error(String(e)),
-              ),
-            )
-          })
-        } else {
-          object[`on${objectEventName}`] = async (...args: any[]) => {
-            return this.fireEvent(stateMachineEventName, object, ...args).catch(
-              (e) =>
-                this.logger.error(
-                  'Error firing event',
-                  {
-                    objectEventName,
-                    stateMachineEventName,
-                  },
-                  /* c8 ignore next */
-                  e instanceof Error ? e : new Error(String(e)),
-                ),
-            )
-          }
+          )
         }
       }
     }
@@ -1782,19 +1784,22 @@ export class StateMachine<
 
     // Apply timeout if configured
     if (this.transitionTimeout && this.transitionTimeout > 0) {
-      return Promise.race([
-        executeAction(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new StateMachineError('Transition timeout', {
-              /* c8 ignore next */
-              action: typeof actionName === 'string' ? actionName : 'anonymous',
-              phase: 'action'
-            })),
-            this.transitionTimeout
-          )
-        )
-      ])
+      const timeoutMs = this.transitionTimeout
+      let timeoutHandle: any
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const fire = () => reject(new StateMachineError('Transition timeout', {
+          /* c8 ignore next */
+          action: typeof actionName === 'string' ? actionName : 'anonymous',
+          phase: 'action',
+        }))
+        timeoutHandle = this.setTimer(fire, timeoutMs)
+      })
+      if (this.schedulerProvided) {
+        return Promise.race([executeAction(), timeoutPromise]).finally(() => {
+          this.clearTimer(timeoutHandle)
+        })
+      }
+      return Promise.race([executeAction(), timeoutPromise])
     }
 
     return executeAction()
@@ -2134,7 +2139,7 @@ export class StateMachine<
     if (toState.invoke && toState.invoke.length > 0) {
       // Record entry time if not already recorded (e.g. from resumeTimers)
       if (!this.stateEntryTimes.has(toStateName)) {
-        this.stateEntryTimes.set(toStateName, Date.now())
+        this.stateEntryTimes.set(toStateName, this.clock())
       }
 
       const timers: any[] = []
@@ -2184,9 +2189,15 @@ export class StateMachine<
    * Helper to set timer (native or scheduled)
    */
   private setTimer(callback: () => void, delay: number): any {
-    // If scheduler is running (lazy mode enabled), use it.
-    // Otherwise fallback to native setTimeout for standard behavior.
     const scheduler = this.scheduler
+    // Blocker #2: when a scheduler was EXPLICITLY provided (e.g. a virtual
+    // scheduler), ALWAYS route through it — never fall back to real setTimeout.
+    // The scheduler computes executeAt against its own injected clock.
+    if (this.schedulerProvided) {
+      return scheduler.schedule(delay, callback)
+    }
+    // Default (no scheduler option): preserve the original isActive()-gated
+    // behavior — use the lazy real scheduler if running, else native setTimeout.
     if (scheduler.isActive()) {
       return scheduler.schedule(delay, callback)
     }
@@ -2198,8 +2209,13 @@ export class StateMachine<
    */
   private clearTimer(timerId: any): void {
     const scheduler = this.scheduler
-    // We can try to cancel in scheduler even if inactive (it handles untracked tokens gracefully)
-    // But to be safe and correct with types:
+    // Blocker #2 symmetry: explicitly-provided scheduler always cancels via it.
+    // (cancel() handles unknown tokens gracefully.)
+    if (this.schedulerProvided) {
+      if (timerId !== undefined) scheduler.cancel(timerId)
+      return
+    }
+    // Default: preserve the original token-heuristic gating.
     // Note: TimerToken is object, setTimeout returns Timeout (Node) or number (Browser).
     // We check if it looks like our token (simple object) or native handle.
     if (
@@ -2443,16 +2459,20 @@ export class StateMachine<
       }
     }
 
-    const now = Date.now()
+    const now = this.clock()
 
     for (const stateName of activeStates) {
       const state = this.states.get(stateName)
       if (!state || !state.invoke || state.invoke.length === 0) continue
 
       const entryTime = this.stateEntryTimes.get(stateName)
-      // If no entry time recorded, assume just entered (fallback for old data)
-      const startTime = entryTime || now
-      if (!entryTime) {
+      // If no entry time recorded, assume just entered (fallback for old data).
+      // Use ?? / === undefined (not ||) so a legitimate entry time of 0 — valid
+      // under an injected virtual clock that starts at t=0 — is preserved
+      // instead of being treated as "missing". With the default Date.now clock
+      // an entry time is never 0, so the default path stays byte-identical.
+      const startTime = entryTime ?? now
+      if (entryTime === undefined) {
         this.stateEntryTimes.set(stateName, startTime)
       }
 

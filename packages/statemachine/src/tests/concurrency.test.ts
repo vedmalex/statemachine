@@ -7,26 +7,26 @@ interface TrafficLight {
   count: number
 }
 
+// Synchronous onEnter that simply counts entries. No real setTimeout: the
+// run-to-completion queue serialization is what these tests exercise, not wall
+// time, so the previous sleep-in-onEnter pattern is removed.
 const config: StateMachineConfig<TrafficLight> = {
   name: 'TrafficLight',
   stateAttribute: 'state',
   initialState: 'green',
   states: {
     green: {
-      onEnter: async (owner: TrafficLight) => {
-        await new Promise((resolve) => setTimeout(resolve, 10))
+      onEnter: (owner: TrafficLight) => {
         owner.count++
       },
     },
     yellow: {
-      onEnter: async (owner: TrafficLight) => {
-        await new Promise((resolve) => setTimeout(resolve, 10))
+      onEnter: (owner: TrafficLight) => {
         owner.count++
       },
     },
     red: {
-      onEnter: async (owner: TrafficLight) => {
-        await new Promise((resolve) => setTimeout(resolve, 10))
+      onEnter: (owner: TrafficLight) => {
         owner.count++
       },
     },
@@ -50,21 +50,26 @@ describe('Concurrency Tests', () => {
     })
     const sm = new StateMachine<TrafficLight, typeof config>(config, adapter)
 
+    // Fire three events concurrently. The run-to-completion queue serializes
+    // them, so they apply in order: green -> yellow -> red -> green.
     const results = await Promise.allSettled([
       sm.fireEvent('next'),
       sm.fireEvent('next'),
       sm.fireEvent('next'),
     ])
 
+    // All three are accepted (no rejection / dropped event).
+    expect(results.every((r) => r.status === 'fulfilled')).toBe(true)
     const successes = results.filter(
       (r) => r.status === 'fulfilled' && r.value === true,
     ).length
+    expect(successes).toBe(3)
 
-    console.log(`Concurrent transitions success count: ${successes}`)
-    console.log(`Final state: ${sm.currentState}`)
-    console.log(`Transition count: ${adapter.adaptee.count}`)
-
-    expect(results.every((r) => r.status === 'fulfilled')).toBe(true)
+    // Three serialized transitions cycle back to green.
+    expect(sm.currentState).toBe('green')
+    // onEnter fires once on initial entry to `green` plus once per accepted
+    // transition (green->yellow->red->green) = 1 + 3 = 4.
+    expect(adapter.adaptee.count).toBe(4)
   })
 
   test('Race condition on same transition', async () => {
@@ -74,12 +79,21 @@ describe('Concurrency Tests', () => {
     })
     const sm = new StateMachine<TrafficLight, typeof config>(config, adapter)
 
+    // Two events fired "simultaneously" against the same start state. Queue
+    // serialization means BOTH are honored sequentially (green->yellow->red),
+    // not that one is dropped — assert the deterministic serialized outcome.
     const p1 = sm.fireEvent('next')
     const p2 = sm.fireEvent('next')
 
     const [r1, r2] = await Promise.all([p1, p2])
 
-    console.log(`Race results: ${r1}, ${r2}`)
+    expect(r1).toBe(true)
+    expect(r2).toBe(true)
+    // Exactly two transitions applied: green -> yellow -> red.
+    expect(sm.currentState).toBe('red')
+    // onEnter fires once on initial entry to `green` plus once per accepted
+    // transition (green->yellow->red) = 1 + 2 = 3.
+    expect(adapter.adaptee.count).toBe(3)
   })
 
   test('Async Action Serialization Integrity', async () => {

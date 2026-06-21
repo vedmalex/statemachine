@@ -67,6 +67,12 @@ export interface ITimerScheduler {
   isActive(): boolean
   schedule(delay: number, callback: () => void): object
   cancel(token: object): void
+  /**
+   * Optional manual drain — advance virtual time and fire all timers whose
+   * `executeAt <= now` (default `now` is the scheduler's own clock). Real-time
+   * schedulers driven by setInterval may leave this unimplemented.
+   */
+  process?(now?: number): void
 }
 
 /** @unstable — transition observability context (additive on IMonitor). */
@@ -113,6 +119,13 @@ export interface StateMachineOptions {
   monitor?: IMonitor        // EXISTING; element type evolves additively per TD-T4-2
   scheduler?: ITimerScheduler   // NEW per TD-T4-2a
   errorHandler?: IErrorHandler  // NEW per TD-T4-2b
+  /**
+   * Clock function returning the current time in milliseconds.
+   * Default: `Date.now`. Inject a virtual clock together with a
+   * `scheduler` (see `createVirtualScheduler`) for deterministic replay / DST.
+   * Used for `stateEntryTimes`, `resumeTimers`, and `getQueuedEvents` age math.
+   */
+  clock?: () => number
   /**
    * Maximum time (ms) to wait for async entry/exit actions.
    * If exceeded, the transition aborts with an error.

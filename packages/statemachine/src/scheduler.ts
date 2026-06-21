@@ -1,6 +1,12 @@
 import type { ITimerScheduler } from './types'
 
 /**
+ * Clock function type: returns the current virtual or real time in ms.
+ * Matches the signature of `Date.now`.
+ */
+export type Clock = () => number
+
+/**
  * Тип для идентификатора таймера
  */
 type TimerToken = object
@@ -25,8 +31,11 @@ export class TimerScheduler {
 
   private intervalId: any = null
   private pollingInterval = 100 // ms
+  private readonly clock: Clock
 
-  constructor() {}
+  constructor(clock: Clock = Date.now) {
+    this.clock = clock
+  }
 
   /**
    * Настройка режима опроса
@@ -52,7 +61,7 @@ export class TimerScheduler {
    */
   public start() {
     if (this.intervalId) return
-    this.intervalId = setInterval(() => this.process(), this.pollingInterval)
+    this.intervalId = setInterval(() => this.process(this.clock()), this.pollingInterval)
   }
 
   /**
@@ -73,7 +82,7 @@ export class TimerScheduler {
    */
   public schedule(delay: number, callback: () => void): TimerToken {
     const token = {}
-    const executeAt = Date.now() + delay
+    const executeAt = this.clock() + delay
 
     const task: TimerTask = { token, executeAt, callback }
 
@@ -96,7 +105,7 @@ export class TimerScheduler {
   /**
    * Обработать очередь (вызывается таймером или вручную)
    */
-  public process(now: number = Date.now()) {
+  public process(now: number = this.clock()) {
     while (this.heap.length > 0) {
       // Смотрим на самый ранний таймер
       const task = this.heap[0]
@@ -222,4 +231,48 @@ export class TimerScheduler {
  */
 export function createDefaultScheduler(): ITimerScheduler {
   return new TimerScheduler()
+}
+
+/**
+ * Returns a deterministic virtual-time scheduler driven entirely by the
+ * supplied `clock` function. Intended for tests, simulation, and DST.
+ *
+ * Guarantees:
+ *  - `isActive()` always returns `true` — StateMachine routes all timers
+ *    through it and never touches real `setTimeout`/`setInterval`.
+ *  - No real timer is ever created.
+ *  - `schedule(delay, cb)` queues a task at `clock() + delay`.
+ *  - `process(now?)` drains every task whose `executeAt <= now`
+ *    (default `now` is `clock()`).
+ *
+ * @example
+ * ```ts
+ * let t = 0
+ * const clock = () => t
+ * const scheduler = createVirtualScheduler(clock)
+ * const sm = new StateMachine(config, adaptee, { clock, scheduler })
+ * await Promise.resolve() // flush microtasks: enter initial state + arm invoke timers
+ * t = 1000
+ * scheduler.process() // fires all tasks due by t=1000
+ * ```
+ */
+export function createVirtualScheduler(clock: Clock): ITimerScheduler {
+  // Reuse TimerScheduler's heap + lazy-cancel logic; the inner instance is
+  // constructed with the same clock, so schedule()/process() use virtual time.
+  const inner = new TimerScheduler(clock)
+
+  return {
+    isActive(): boolean {
+      return true
+    },
+    schedule(delay: number, callback: () => void): object {
+      return inner.schedule(delay, callback)
+    },
+    cancel(token: object): void {
+      inner.cancel(token)
+    },
+    process(now?: number): void {
+      inner.process(now ?? clock())
+    },
+  }
 }

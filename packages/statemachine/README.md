@@ -94,6 +94,83 @@ Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedma
 
 This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
 
+## Deterministic testing (DST)
+
+Machines that use `invoke` delays or a `transitionTimeout` normally depend on real wall-clock time (`Date.now` + `setTimeout`). That makes tests slow, flaky, and sensitive to scheduling jitter. The DST API swaps the clock and the timer scheduler for virtual counterparts so timer-driven behavior replays deterministically with **zero** real time elapsed.
+
+```ts
+import { StateMachine, createVirtualScheduler } from '@vedmalex/statemachine'
+
+let t = 0
+const clock = () => t
+const scheduler = createVirtualScheduler(clock)
+
+const sm = new StateMachine(config, adapter, { clock, scheduler })
+// ... arm the initial state's invoke timers
+await Promise.resolve() // flush microtasks
+
+t = 1000
+scheduler.process() // fire every timer whose deadline <= 1000
+await Promise.resolve() // flush microtasks so the transition settles
+// assert sm.currentState === 'next'
+```
+
+### How it works
+
+- `clock` replaces `Date.now` for `stateEntryTimes`, `resumeTimers`, and `getQueuedEvents` age math (and for the event-queue timestamps those ages are measured against, so age stays coherent under virtual time).
+- `createVirtualScheduler(clock)` returns an `ITimerScheduler` whose `isActive()` is always `true`, so the `StateMachine` routes **all** `invoke` timers and the `transitionTimeout` through it.
+- An **explicitly provided** scheduler is always used — the machine never falls back to real `setTimeout` while one is injected.
+- `scheduler.process(now?)` drains every timer whose deadline `<= now` (default `now` is `clock()`), advancing zero real time. It is idempotent — draining twice does not re-fire a timer.
+- `invoke` callbacks are async (they raise an event and queue the transition on a microtask), so after each `process()` you must flush microtasks (`await Promise.resolve()`, a few times for chained transitions) before asserting.
+
+### Replaying serialized state
+
+`toJSON()` / `fromJSON()` round-trips the recorded entry times as raw numbers. Restore into a fresh machine whose clock already reads the serialize time, and the remaining invoke delay is recomputed correctly:
+
+```ts
+// Original machine, invoke delay 1000ms, entered at t=0:
+let t = 0
+const clock = () => t
+const sm = new StateMachine(config, adapter, { clock, scheduler: createVirtualScheduler(clock) })
+
+t = 400
+const json = sm.toJSON()           // snapshot 400ms in
+
+const scheduler2 = createVirtualScheduler(clock)
+const sm2 = StateMachine.fromJSON(json, freshAdapter, { clock, scheduler: scheduler2 })
+// 600ms remain:
+t = 1000
+scheduler2.process()               // the invoke fires here, not at t=1400
+```
+
+### transitionTimeout under virtual time
+
+The `transitionTimeout` deadline is also routed through the injected scheduler, so it triggers on a virtual-time advance rather than a real timer:
+
+```ts
+const sm = new StateMachine(config, adapter, { clock, scheduler, transitionTimeout: 500 })
+const fired = sm.fireEvent('go')   // enters a state whose action never resolves
+await Promise.resolve()
+t = 500
+scheduler.process()                // the race rejects deterministically
+await expect(fired).rejects.toThrow(/timeout/i)
+```
+
+When the action wins the race instead, the pending timeout token is auto-cancelled so no ghost rejection fires on a later `process()`.
+
+### Back-compatibility
+
+> Omitting **both** `clock` and `scheduler` keeps runtime behavior byte-identical to prior releases: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before. The DST machinery only engages when you opt in by injecting a scheduler.
+
+### API reference
+
+| Symbol | Kind | Purpose |
+| --- | --- | --- |
+| `createVirtualScheduler(clock)` | function | Build a deterministic, non-real-time `ITimerScheduler`. |
+| `Clock` | type | `() => number`; matches the `clock` option signature. |
+| `StateMachineOptions.clock?` | option | Inject a virtual clock (default `Date.now`). |
+| `ITimerScheduler.process?(now?)` | method | Optional manual drain; implemented by `createVirtualScheduler`. |
+
 ## Stability policy
 
 5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. The all-regions-final join API lives on these stable symbols — `State.final?: boolean`, `StateMachine.isDone(compositeId)`, and the engine-raised `done.state.<id>` event (all reflected in `etc/statemachine.api.md`). Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.

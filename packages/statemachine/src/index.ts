@@ -145,6 +145,31 @@ export type { ITimerScheduler } from './types'
 
 /**
  * @category Unstable
+ * @unstable — virtual-clock type alias; matches the `clock` option in StateMachineOptions.
+ */
+export type { Clock } from './scheduler'
+
+/**
+ * @category Unstable
+ * @unstable — factory for a deterministic, non-real-time scheduler. Pass the
+ * returned scheduler together with the same `clock` function in StateMachine
+ * options to enable virtual-time (DST) testing without real setTimeout.
+ *
+ * @example
+ * ```ts
+ * let t = 0
+ * const clock = () => t
+ * const scheduler = createVirtualScheduler(clock)
+ * const sm = new StateMachine(config, adapter, { clock, scheduler })
+ * await Promise.resolve() // flush microtasks: enter initial state + arm invoke timers
+ * t = 1000
+ * scheduler.process() // advance virtual time to 1000 ms
+ * ```
+ */
+export { createVirtualScheduler } from './scheduler'
+
+/**
+ * @category Unstable
  * @unstable — error-handler injection contract; implement to replace built-in recovery.
  */
 export type { IErrorHandler } from './types'

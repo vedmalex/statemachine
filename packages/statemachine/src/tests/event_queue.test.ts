@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest'
+import { createVirtualScheduler } from '../scheduler'
 import { StateMachine } from '../state_machine'
 import {
   MemoryAdapter,
@@ -10,6 +11,14 @@ interface Counter {
   state: string
   value: number
   log: string[]
+}
+
+// Microtask flush helper for deterministic virtual-clock tests: lets queued
+// invoke -> raiseEvent -> processQueues chains settle after scheduler.process().
+async function flush(times = 16): Promise<void> {
+  for (let i = 0; i < times; i++) {
+    await Promise.resolve()
+  }
 }
 
 describe('Event Queue', () => {
@@ -159,14 +168,37 @@ describe('Event Queue', () => {
       },
     }
 
+    // Drive the reentrant invoke chain deterministically through a virtual
+    // clock + scheduler instead of sleeping 50ms of real time.
+    let t = 0
+    const clock = () => t
+    const scheduler = createVirtualScheduler(clock)
     const adapter = new MemoryAdapter<Counter>({
       state: 'start',
       value: 0,
       log: [],
     })
-    const sm = new StateMachine<Counter, typeof config>(config, adapter)
+    const sm = new StateMachine<Counter, typeof config>(config, adapter, {
+      clock,
+      scheduler,
+    })
+    await flush()
 
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(log).toContain('enter:start')
+    expect(sm.currentState).toBe('start')
+
+    // First invoke (start -> middle) is due at t=10.
+    t = 10
+    scheduler.process()
+    await flush()
+    expect(log).toContain('enter:middle')
+    expect(sm.currentState).toBe('middle')
+
+    // Reentrant invoke (middle -> finish -> end) is armed on entry to `middle`
+    // at t=10, so it is due at t=20.
+    t = 20
+    scheduler.process()
+    await flush()
 
     expect(log).toContain('enter:start')
     expect(log).toContain('enter:middle')
