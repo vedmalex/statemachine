@@ -17,6 +17,9 @@ export interface Adapter<T extends object> {
     set(property: keyof T, value: T[keyof T]): void;
 }
 
+// @public
+export type Clock = () => number;
+
 // @public (undocumented)
 export function createEnhancedError(message: string, context: ErrorContext, options?: {
     severity?: ErrorSeverity;
@@ -27,6 +30,9 @@ export function createEnhancedError(message: string, context: ErrorContext, opti
 
 // @public
 export function createMachine<T extends object>(config: StateMachineConfig<T>, owner?: T | Adapter<T>, options?: StateMachineOptions): StateMachine<T, any>;
+
+// @public
+export function createVirtualScheduler(clock: Clock): ITimerScheduler;
 
 // Warning: (ae-forgotten-export) The symbol "StringKey" needs to be exported by the entry point index.d.ts
 //
@@ -283,6 +289,7 @@ export interface ITimerScheduler {
     cancel(token: object): void;
     // (undocumented)
     isActive(): boolean;
+    process?(now?: number): void;
     // (undocumented)
     schedule(delay: number, callback: () => void): object;
 }
@@ -557,6 +564,7 @@ export class StateMachineError extends Error {
 // @public (undocumented)
 export interface StateMachineOptions {
     abortOnExitError?: boolean;
+    clock?: () => number;
     // (undocumented)
     errorHandler?: IErrorHandler;
     errorState?: string;

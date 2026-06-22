@@ -27,29 +27,35 @@ jobs:
       - run: node test/verify-dist.cjs
 
   tier-a-node:
+    # Latest LTS only (Node 24). Older lines (18/20/22) are intentionally NOT
+    # supported — see package.json engines (>=24). All gates run on this single
+    # leg, so the former node-18/20 matrix and its per-version `if:` guards are
+    # gone.
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: [18, 20]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "${{ matrix.node-version }}" }
+        with: { node-version: 24 }
       - run: npm install --no-workspaces
       - run: npm run check
       - run: npm run build
       - run: npm test
-      - if: matrix.node-version == 20
-        run: npm run knip
+      - run: npm run knip
       - run: npm run test:cjs-smoke
       - run: node test/verify-dist.cjs
-      - if: matrix.node-version == 20
-        run: npm run test:coverage
-      - if: matrix.node-version == 20
-        run: npm run api:check
-      - if: matrix.node-version == 20
-        run: git diff --exit-code etc/statemachine.api.md
+      - run: npm run test:coverage
+      - run: npm run api:check
+      - run: git diff --exit-code etc/statemachine.api.md
+      # --- TASK-014 Step 11 (B/C): DST PR-fast gate ---
+      # Bounded safety+liveness+coverage+perf-smoke budget (incl. an ISS-030
+      # async-action witness). The heavy nightly sweep stays in sim-nightly.yml.
+      - run: SM_SIM=1 SIM_SEEDS=64 SIM_STEPS=200 npm run sim:pr
+      - run: npm run api:check:sim
+      - run: git diff --exit-code etc/statemachine-sim.api.md
+      # Core-bundle byte/hash guard (D8/R23): dist/index.{js,cjs} byte-stable.
+      # Baseline is measured on Node 24 (== this leg); refresh with
+      # SM_DIST_UPDATE_BASELINE=1 on a Node 24 runner.
+      - run: node test/verify-dist-bytes.cjs
 
   tier-b-deno:
     runs-on: ubuntu-latest
@@ -57,7 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 24 }
       - uses: denoland/setup-deno@v1
         with: { deno-version: vx.x.x }
       - run: npm install --no-workspaces
@@ -71,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 24 }
       - run: npm install --no-workspaces
       - run: npm run check
       - run: npm run build

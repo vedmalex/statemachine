@@ -1,6 +1,6 @@
 {
   "name": "@vedmalex/statemachine",
-  "version": "1.0.0-beta.3",
+  "version": "1.0.0-beta.4",
   "description": "Hierarchical state machine for TypeScript with monitoring, validation, and persistence (lite-only DI-free surface).",
   "keywords": [
     "state-machine",
@@ -30,6 +30,11 @@
       "types": "./types/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./sim": {
+      "types": "./types/sim/index.d.ts",
+      "import": "./dist/sim/index.js",
+      "require": "./dist/sim/index.cjs"
     }
   },
   "files": [
@@ -39,7 +44,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "scripts": {
     "clean": "rm -rf dist types coverage tsconfig.tsbuildinfo",
@@ -56,7 +61,14 @@
     "test:browser": "playwright test",
     "knip": "knip --no-progress",
     "api:check": "api-extractor run --local --verbose",
-    "prepublishOnly": "npm run check && npm run build && node test/verify-dist.cjs"
+    "api:check:sim": "api-extractor run --local --config api-extractor.sim.json",
+    "sim:coverage": "SM_SIM=1 vitest run src/tests/sim/sim-coverage.run.test.ts",
+    "sim:perf": "SM_SIM=1 NODE_OPTIONS=--expose-gc vitest run src/tests/sim/metrics.perf.test.ts",
+    "sim:perf:baseline": "SM_SIM=1 SM_PERF_UPDATE_BASELINE=1 NODE_OPTIONS=--expose-gc vitest run src/tests/sim/metrics.perf.test.ts",
+    "sim:pr": "SM_SIM=1 vitest run src/tests/sim/sim-pr.run.test.ts",
+    "sim:sweep": "SM_SIM=1 vitest run src/tests/sim/sim-sweep.run.test.ts",
+    "verify-dist-bytes": "node test/verify-dist-bytes.cjs",
+    "prepublishOnly": "npm run check && npm run build && node test/verify-dist.cjs && node test/verify-dist-bytes.cjs"
   },
   "dependencies": {},
   "peerDependencies": {},

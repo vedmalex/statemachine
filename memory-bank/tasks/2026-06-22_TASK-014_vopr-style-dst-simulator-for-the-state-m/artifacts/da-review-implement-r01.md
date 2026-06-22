@@ -1,0 +1,75 @@
+# DA Review — TASK-014 — IMPLEMENT — Iteration 1
+
+- Task: TASK-014
+- Phase: IMPLEMENT
+- Iteration: 1
+- Status: rejected
+- Verdict: REVISE
+- Source: claude-hook
+- Review Mode: subagent
+- Gate Authority: authoritative
+- Timestamp: 2026-06-22T13:17:21.907Z
+- Review Schema: mb3-critic.review/v2
+- Lens: IMPLEMENT / Plan Fidelity
+- UR Refs: UR-004, UR-002, UR-003, UR-005
+- Follow-up Issues: ISS-049, ISS-050, ISS-051, ISS-052
+
+## Follow-up Issues
+
+- ISS-049
+- ISS-050
+- ISS-051
+- ISS-052
+
+## Report
+
+## DA Report:
+
+- Task: TASK-014
+- Phase: IMPLEMENT
+- Lens: IMPLEMENT / Plan Fidelity
+- Verdict: REVISE
+- Date: 2026-06-22
+- Source: claude-hook
+
+### Executive Summary
+
+Two HIGH Plan-Fidelity divergences from the FROZEN TECH_SPEC block the IMPLEMENT->QA gate. (1) DOCUMENTED_GAP_IDS was widened from the frozen 4-id set (TECH_SPEC §3.7 lines 531-533) to 12 ids, silently weakening the ADR-8 mandatory coverage gate that is the entire UR-004 thesis — and no test pins the gap-set contents, so the 'sim:coverage exit 0 / zero drift / registry fully covered' evidence is true only against the widened set. (2) The public Simulator/runSimulation never consumes the frozen SimOptions.invariants field, never populates StepOutcome.violation / SimResult.violation, and hardcodes SimResult.ok=true — three frozen public fields are dead, so the public Safety-mode path (UR-002) and the public bug-hunter constructibility (UR-003) advertised by the ./sim ABI are wired to nothing and untested. Much of the build is faithful and strong: the engine src is genuinely byte-frozen (zero sim refs in state_machine.ts; inFlightAsyncCount lives wholly in the harness), the core etc/statemachine.api.md has ZERO sim-symbol leak, the errorClass 7-member enum + FaultKind 7-literal+separate corrupt-state + the genuine 39-literal closed-union CapabilityId with tsc totality teeth all match the freeze, there is exactly ONE settleMacrostep (no flush/drain/untilIdle), the determinism grep is clean in hashed paths, and ISS-031 (single synthetic corrupt-state frame + vacuous-on-removal) and ISS-033 (non-vacuous ≥2-region + same-depth-sibling pins) are non-vacuously discharged via the real engine. The node-20 baseline caveat (ISS-048) is correctly an honest LOW carry-forward, not a code defect. No CRITICAL architectural showstopper exists, so the verdict is REVISE, not BLOCK. PROCEED carry-forward after the two HIGH fixes: F-3 (settle.ts QUIET_FLUSH heuristic) to CODE_REVIEW; F-4/ISS-048 node-20 baseline refresh to QA/REFLECT.
+
+### UR-Goal Traceability
+
+| UR-ID | Goal | Status | Evidence |
+|---|---|---|---|
+| UR-002 | Real engine, seed->bit-exact replay, fault injection, Safety + Liveness modes, shrinker, long-running CI | PARTIAL | Replay/AC-1 four-run canary, faults, ObservableScheduler, and internal runSafety/liveness are faithful, BUT the public Simulator/runSimulation Safety path never evaluates SimOptions.invariants and never populates violation/ok=false (public.ts:105 declared, 405-417 ok hardcoded true, step() omits violation) — public-consumer Safety mode is dead (F-2). |
+| UR-003 | Dual bug-hunter AND permanent load/debug tool; constructible for arbitrary consumer machines via ./sim | PARTIAL | runSimulation/Simulator construct from the public entry (public_sim_surface.test.ts:155-173), but a consumer supplying invariants to hunt bugs in their own machine always gets ok:true/violation:undefined; AC-4 'generated repro re-fails through public runSimulation' (repro-codegen.ts:9-22, DoD 9b) is structurally unmet because the public path ignores invariants (F-2). |
+| UR-004 | Cover ALL functionality via a MANDATORY programmatic capability-coverage gate (defense-in-depth) | PARTIAL | CapabilityId is a genuine 39-literal closed union with total-Record tsc teeth (capabilities.ts:38-77, capabilities_totality.test.ts:44-69) and probes are errorClass-keyed/pure, BUT computeCoverage excludes DOCUMENTED_GAP_IDS (coverage.ts:378) which was expanded from the frozen 4 to 12 ids (capabilities.ts:494-507 vs TECH_SPEC §3.7:531-533), and no test pins the gap-set contents — the mandatory gate now enforces ~27 of 39 ids (F-1). |
+| UR-005 | Both internal harness AND public ./sim; ABI zero-diff + bundle budget; perf regression gate; full v1 fault set | COVERED | Engine src byte-frozen (zero sim refs in state_machine.ts), core etc/statemachine.api.md has ZERO sim-symbol leak, separate ./sim entry + tsup 2nd entry + api-extractor.sim + dist-bytes guard wired, seven-kind fault set + corrupt-state probe present; perf plane (metrics.ts/perf-run.ts) is structurally walled from hashTrace. |
+
+### Phase-Specific Challenges
+
+- [HIGH] DOCUMENTED_GAP_IDS widened from frozen 4 to 12 — coverage gate silently weakened
+  - Challenge: TECH_SPEC §3.7 (lines 531-533) FREEZES DOCUMENTED_GAP_IDS to exactly four ids {error.guard-throw, error.action-throw, error.recovery.abortOnExitError (string-method), queue.depth-bound.max-transition (dormant)}. The implemented set (capabilities.ts:494-507) contains TWELVE ids, adding queue.backpressure.overflow, queue.internal-before-external, timer.transitionTimeout, timer.resume, persistence.serialize, persistence.deserialize, event.onSuccess, event.onError. computeCoverage uses this set as the gate-exclusion (coverage.ts:378), so the ADR-8 'mandatory coverage gate' — the UR-004 defense-in-depth thesis — now only forces ~27 of 39 ids. The scope contract (TECH_SPEC line 5) says a frozen config contract deviation 'requires re-opening TECH_SPEC'; DOCUMENTED_GAP_IDS is an enumerated config set, not a measurement. No test pins the gap-set CONTENTS (coverage.test.ts:278-283 only checks gap ids are real CapabilityIds; the covered+gap partition test at :285-292 passes trivially regardless of gap-set size), so the reported 'sim:coverage exit 0 / zero drift / registry fully covered' evidence is true only against the unilaterally widened set.
+  - Alternative: Reconcile the divergence rather than ship a silently-wider gate: either (a) re-open/amend the TECH_SPEC freeze to ratify the expanded gap set with the per-id structural-unreachability rationale (most of the additions ARE genuinely unreachable from the fault-free runScenario the gate drives — overflow/timeout need Step-5 faults, persistence/timer.resume need the snapshot/restore surface), and add a test that pins DOCUMENTED_GAP_IDS to the ratified set so it cannot drift again; or (b) extend the registered COVERAGE_SCENARIOS / coverage runner to drive the fault and snapshot/restore paths so the originally-frozen-as-gated ids are actually covered. Record the chosen reconciliation in REFLECT.
+  - Risk: The mandatory coverage gate — the explicit UR-004 'cover ALL functionality, programmatic gate, defense-in-depth' requirement and ADR-8's whole reason to exist — silently degrades: 8 engine capabilities (overflow backpressure, transitionTimeout, persistence round-trip, timer-resume, internal-before-external ordering) can regress to zero coverage without the gate firing, and a future implementer can move any failing id into the unpinned gap set undetected.
+  - Ref: packages/statemachine/src/sim/capabilities.ts:494-507 vs .plan/TASK-014-tech-spec-sim-api.md:531-533; gate use packages/statemachine/src/sim/coverage.ts:378; unpinned test packages/statemachine/src/tests/sim/coverage.test.ts:278-292
+- [HIGH] Public Simulator/runSimulation ignores SimOptions.invariants; violation never populated; ok hardcoded true
+  - Challenge: The FROZEN public ./sim surface (TECH_SPEC §1) declares SimOptions.invariants?, StepOutcome.violation? ('lowest-step violation so far, safety mode'), and SimResult.violation?/ok. The implementation (public.ts) declares SimOptions.invariants (line 105) but NEVER threads it into the SimDriver (init() at :338-372 passes onTrace/policy but not invariants), step() builds a StepOutcome with NO violation field (:387-394), run() hardcodes ok:true (:410) and omits violation. So a UR-003 consumer who supplies invariants to runSimulation/Simulator to hunt violations in their own machine ALWAYS receives ok:true and violation:undefined regardless of whether their invariants would fire. The public-surface test only asserts ok===true on a clean run (public_sim_surface.test.ts:160) — there is NO test where a violating invariant through the PUBLIC entry yields ok:false / a populated violation. AC-3 (Safety catches each planted violation) and AC-4 (generated repro re-fails) are proven only on the INTERNAL runSafety path (invariants.test.ts/shrinker.test.ts), never the public Simulator; repro-codegen.ts:9-22 itself admits the public-runSimulation re-fail (DoD 9b) is a Step-10 re-validation — and Step 10 (this public surface) does not evaluate invariants.
+  - Alternative: Wire opts.invariants through the Simulator: evaluate the blind runSafety registry against the accumulating canonical trace at each step() boundary, populate StepOutcome.violation with the lowest-step Violation, set SimResult.violation and ok = (violation === undefined) in run(); then add a public-path test that runSimulation with a planted-violating invariant returns ok:false + the expected fingerprint, and a generated *.repro.test.ts that re-fails through the real ./sim runSimulation. If v1 deliberately scopes the public surface to trace-only (no public Safety mode), then the frozen contract must be amended to REMOVE invariants/violation/ok-as-violation-signal from the public types (re-open TECH_SPEC) rather than ship dead fields.
+  - Risk: The public ./sim ABI advertises a Safety-mode bug-hunting capability (supply invariants -> detect violations) that is wired to nothing. A consumer's safety check silently passes on a real violation (false-negative bug hunter), directly defeating UR-002 public Safety mode and UR-003 'constructible bug-hunter for arbitrary consumer machines', and making the AC-4 public-entry repro re-fail unprovable. Because ok is hardcoded true, even runSimulation's own result is a constant.
+  - Ref: packages/statemachine/src/sim/public.ts:105,338-372,387-394,405-417; test gap packages/statemachine/src/tests/sim/public_sim_surface.test.ts:155-173; repro coupling packages/statemachine/src/sim/repro-codegen.ts:9-22
+- [MEDIUM] settle.ts diverges from the literal frozen ADR-4 mechanism via a QUIET_FLUSH heuristic + deferred timer processing
+  - Challenge: The FROZEN ADR-4 mechanism (build-plan Step-3 M1; settle.ts module-doc :13-28; DoD#2 'pump body is await Promise.resolve() only') specifies scheduler.process(clock.now()) interleaved with a microtask drain checking the 4-conjunct predicate. The implementation instead introduces an internal QUIET_FLUSH=16 stability window and deliberately does NOT call scheduler.process every turn — it drains microtasks to a 'quiet' fingerprint, then fires due timers once (settle.ts:169-178,199-248). The frozen observable predicate is preserved exactly in isQuiescent() (:112-123), so this is a mechanism refinement, not a signature break — but QUIET_FLUSH=16 is an undocumented-in-spec magic constant whose adequacy is asserted only empirically ('~5-6 turns ... 1024 budget leaves headroom'), exactly the kind of heuristic that can mask a determinism stall at an unusual scenario depth.
+  - Alternative: Carry to CODE_REVIEW: justify QUIET_FLUSH=16 against the deepest registered scenario's observed microtask-chain depth with a falsifiable margin test (a scenario whose quiet window legitimately exceeds 16 must still settle, not falsely report quiescence), and document the deferred-timer-processing rationale in REFLECT as a ratified deviation from the literal 'process each turn' mechanism since the build plan carried 'validate maxTurns/healWindow vs deepest scenario' to IMPLEMENT.
+  - Risk: A future scenario deeper than the empirical ~5-6 microtask chain could either burn budget (false microtask-budget finding) or, worse, the QUIET_FLUSH window could declare quiescence one layer before a delayed follow-on enqueue, producing a non-reproducible traceHash that the AC-1 canary (fixed seeds) would not catch.
+  - Ref: packages/statemachine/src/sim/settle.ts:154-289 (QUIET_FLUSH :188; quiet/stuck windows :210-235) vs .plan/TASK-014-build-plan.md Step-3 M1 + DoD#2
+- [LOW] node-20 perf/dist-byte baselines measured on node v24.9.0 (ISS-048)
+  - Challenge: etc/sim-perf.baseline.json and etc/dist-bytes.baseline.json were measured on node v24.9.0 (no node-20 in the build env), per the reported honest carry-forward ISS-048. These are MEASUREMENT values that TECH_SPEC §5 explicitly excludes from the freeze and carries to IMPLEMENT/REFLECT, so this is not a frozen-contract or code defect.
+  - Alternative: Refresh both baselines on a node-20 runner during QA/CI and record the runner class in REFLECT; keep ISS-048 open as the tracking issue until the node-20 values land.
+  - Risk: Until refreshed, the perf-regression and dist-byte gates compare against an off-toolchain baseline, so a real node-20 regression or byte drift could pass or a benign toolchain delta could spuriously fail — but only on the perf/dist guards, not the determinism or coverage core.
+  - Ref: packages/statemachine/etc/sim-perf.baseline.json, packages/statemachine/etc/dist-bytes.baseline.json (ISS-048)
+
+### Verdict
+
+**REVISE**
+
+Two HIGH Plan-Fidelity divergences from the FROZEN TECH_SPEC block the IMPLEMENT->QA gate. (1) DOCUMENTED_GAP_IDS was widened from the frozen 4-id set (TECH_SPEC §3.7 lines 531-533) to 12 ids, silently weakening the ADR-8 mandatory coverage gate that is the entire UR-004 thesis — and no test pins the gap-set contents, so the 'sim:coverage exit 0 / zero drift / registry fully covered' evidence is true only against the widened set. (2) The public Simulator/runSimulation never consumes the frozen SimOptions.invariants field, never populates StepOutcome.violation / SimResult.violation, and hardcodes SimResult.ok=true — three frozen public fields are dead, so the public Safety-mode path (UR-002) and the public bug-hunter constructibility (UR-003) advertised by the ./sim ABI are wired to nothing and untested. Much of the build is faithful and strong: the engine src is genuinely byte-frozen (zero sim refs in state_machine.ts; inFlightAsyncCount lives wholly in the harness), the core etc/statemachine.api.md has ZERO sim-symbol leak, the errorClass 7-member enum + FaultKind 7-literal+separate corrupt-state + the genuine 39-literal closed-union CapabilityId with tsc totality teeth all match the freeze, there is exactly ONE settleMacrostep (no flush/drain/untilIdle), the determinism grep is clean in hashed paths, and ISS-031 (single synthetic corrupt-state frame + vacuous-on-removal) and ISS-033 (non-vacuous ≥2-region + same-depth-sibling pins) are non-vacuously discharged via the real engine. The node-20 baseline caveat (ISS-048) is correctly an honest LOW carry-forward, not a code defect. No CRITICAL architectural showstopper exists, so the verdict is REVISE, not BLOCK. PROCEED carry-forward after the two HIGH fixes: F-3 (settle.ts QUIET_FLUSH heuristic) to CODE_REVIEW; F-4/ISS-048 node-20 baseline refresh to QA/REFLECT.

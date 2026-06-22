@@ -158,6 +158,81 @@ await expect(fired).rejects.toThrow(/timeout/i)
 
 When the action wins the race instead, the pending timeout token is auto-cancelled so no ghost rejection fires on a later `process()`.
 
+## Simulation / DST
+
+> **`@unstable`.** Everything under the `@vedmalex/statemachine/sim` entrypoint is `@unstable` and may change between minor versions. The core public API and bundle bytes are unaffected by this island.
+
+The `./sim` entrypoint is a VOPR-style **Deterministic Simulation Testing** environment for state machines. It drives a machine through a seed-derived sequence of events with optional fault injection, evaluates Safety and Liveness oracles against the resulting trace, and (on a violation) shrinks the failing run to a minimal, runnable reproduction. Every run is **bit-exact replayable**: the same `seed` yields the same trace and the same `traceHash`.
+
+```ts
+import { runSimulation } from '@vedmalex/statemachine/sim'
+import type { SimEnv, SimTarget } from '@vedmalex/statemachine/sim'
+
+const result = await runSimulation(
+  // setup: receives the deterministic env (five seams + random/now), returns a target.
+  (env: SimEnv): SimTarget<{ state: string }> => ({
+    config: doorConfig,        // your StateMachineConfig
+    owner: { state: 'closed' }, // plain owner or an Adapter<T>
+  }),
+  {
+    seed: '0x1234',            // bigint | string — canonicalized to a bigint PRNG seed
+    steps: 64,                 // number of macrosteps to drive
+    invariants: myInvariants,  // readonly Invariant[] (Safety oracle registry)
+    mode: 'safety',            // 'safety' | 'liveness'
+  },
+)
+
+if (!result.ok) {
+  console.error('violation at step', result.violation?.step, 'seed', result.seed)
+}
+```
+
+### Entry points
+
+| Symbol | Kind | Purpose |
+| --- | --- | --- |
+| `runSimulation(setup, opts)` | function | One-shot convenience: construct, `init()`, `run()`, return a `SimResult`. |
+| `Simulator` | class | The inspectable driver. `init()` / `step()` / `run()` / `snapshot()`. |
+| `wire(env, config, owner)` | function | Construct a consumer machine against the sim env (the sanctioned DI-first path). |
+
+`Simulator` gives step-level control:
+
+- `await sim.init()` — mandatory post-construction settle plus a behavioral sentinel-scheduler probe (fails loudly if timers do not route through the injected virtual scheduler). Idempotent.
+- `await sim.step()` — drive exactly one macrostep; returns a `StepOutcome` (`step`, `t`, `frames`, `traceHash`, `quiescent`, `done`, optional `violation`).
+- `await sim.run()` — drive `opts.steps` macrosteps; returns the aggregate `SimResult` (`ok`, `seed`, `steps`, `traceHash`, `trace`, optional `violation`, `metrics`).
+- `sim.snapshot()` — a serializable mid-run checkpoint (`SimSnapshot`: `seed`, `machine`, `prngState`, `t`, `step`); never hashed.
+
+`wire(env, config, owner)` constructs `new StateMachine(config, owner, { clock, scheduler, monitor, errorHandler, logger })` with all five deterministic seams pre-forwarded from `env`, so the scheduler-omission footgun is structurally impossible.
+
+### SimOptions
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `seed` | `bigint \| string` | Required. Drives the PRNG; the only source of nondeterminism. |
+| `steps?` | `number` | Macrostep budget (default 16). |
+| `faults?` | `FaultPlan` | Seed-keyed fault injection plan (see the 7 kinds below). |
+| `invariants?` | `readonly Invariant[]` | Safety-oracle registry evaluated at each step boundary. |
+| `mode?` | `'safety' \| 'liveness'` | Oracle policy (default `'safety'`). |
+| `onTrace?` | `(frame: TraceFrame) => void` | Per-frame streaming callback. |
+
+### Fault injection (7 kinds)
+
+A `FaultPlan` may inject any of the seven fault kinds (`FaultKind`), keyed deterministically off the seed:
+
+1. **reorder** — permute queued events
+2. **drop** — discard a queued event
+3. **dup** — duplicate a queued event
+4. **overflow** — flood the queue past its bound
+5. **clock-skew** — perturb the logical clock
+6. **timer-jitter** — perturb armed-timer deadlines
+7. **callback-throw** — make an action/guard/invoke callback throw
+
+Fault-free runs behave exactly as a simulation with no plan.
+
+### Seed → bit-exact replay & minimal repro
+
+The same `seed` always produces the same trace and the same `result.traceHash`, so any failing run is replayable verbatim. On a violation, the delta-debugging shrinker reduces the failing run to a `MinimalRepro` — the smallest seed/step/fault subset that still reproduces the violation — and `buildMinimalRepro` / `emitRepro` emit a self-contained runnable repro test against this same public `./sim` surface.
+
 ### Back-compatibility
 
 > Omitting **both** `clock` and `scheduler` keeps runtime behavior byte-identical to prior releases: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before. The DST machinery only engages when you opt in by injecting a scheduler.

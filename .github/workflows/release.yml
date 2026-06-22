@@ -25,6 +25,11 @@ jobs:
         working-directory: packages/statemachine
       - run: node test/verify-dist.cjs
         working-directory: packages/statemachine
+      # TASK-014 Step 11 (C) [FOLD conform-11 HIGH]: the release chain runs via
+      # `bun run` and does NOT invoke `prepublishOnly`, so the core-bundle
+      # byte/hash guard must be wired here explicitly, after verify-dist.cjs.
+      - run: node test/verify-dist-bytes.cjs
+        working-directory: packages/statemachine
       - run: bun run knip
         working-directory: packages/statemachine
 

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "note": "sha256 of dist/index.{js,cjs} with the trailing //# sourceMappingURL= line stripped. Pinned to the toolchain below. Refresh with SM_DIST_UPDATE_BASELINE=1.",
+  "toolchain": {
+    "node": "v24.9.0"
+  },
+  "hashes": {
+    "dist/index.js": "7d37cb9f89b673f4201431d834718675873190a6080251419ac3a08d0c9add76",
+    "dist/index.cjs": "148d5e2158d17f10c7f773282d673f7c76ef58f5f2b74c2af6277921b0963165"
+  }
+}

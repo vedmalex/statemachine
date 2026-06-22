@@ -1,0 +1,385 @@
+/**
+ * @module sim/define
+ * @unstable
+ *
+ * ADR-1/3/4 Step-4 scenario derivation surface:
+ *  - {@link defineScenario}: identity validator/normalizer for a {@link ScenarioSpec}.
+ *  - {@link runScenario}: derive a machine config from `spec.topology`, drive the
+ *    Step-3 {@link SimDriver} over `spec.ops`, and return the canonical
+ *    content-only {@link CanonicalTrace}. Pure in `(spec.seed, spec, header.runtime)`.
+ *  - {@link toEngineConfig}: turn a {@link TopologySpec} into the engine
+ *    {@link StateMachineConfig} (re-creating each closure-free literal callback's
+ *    live `fn`).
+ *  - {@link generateScenario}: one-seed → full {@link ScenarioSpec} (topology +
+ *    closed-loop ops + empty fault plan). The CLOSED-LOOP genOps drive runs here.
+ *
+ * faults are STUBBED EMPTY (`{ faults: [] }`) until Step 5. `runScenario` builds
+ * the SAME `genConfig`/`genOps` derivation every time, so two runs of the same
+ * spec produce a bit-identical `traceHash` (R14: stability is RUNNER-scoped, not
+ * a pure-generator claim).
+ */
+
+import { MemoryAdapter } from '../index'
+import type { Adapter, StateMachineConfig } from '../index'
+import { makeSimClock } from './clock'
+import { type DriverOp, SimDriver } from './driver'
+import { makeObservableScheduler } from './env'
+import { NoopLogger } from './noop-logger'
+import { buildPlanJitter, makeObservableSchedulerWithJitter } from './observable-scheduler'
+import { makePrng } from './prng'
+import type { Bounds, EventSpec, FaultPlan, Op, ScenarioSpec, StateSpec, TopologySpec } from './scenario'
+import { SimErrorHandler } from './sim-error-handler'
+import { SimMonitor } from './sim-monitor'
+import type { CanonicalTrace } from './trace'
+import { genConfig } from './topology'
+import { type GenOpsParams, genOps } from './ops'
+
+/** Default generation bounds (validator-clean; depth well under the :253 ERROR clamp). */
+export const DEFAULT_BOUNDS: Bounds = {
+  maxStateDepth: 10,
+  maxStatesCount: 1000,
+  maxEventsCount: 1000,
+  maxOps: 32,
+  maxArmedDelay: 5,
+}
+
+/** Default closed-loop op params. */
+export const DEFAULT_GENOPS_PARAMS: GenOpsParams = {
+  maxOps: 32,
+  pBlind: 0.25,
+  pAdvance: 0.35,
+}
+
+/** The runtime tag pinned into every generated trace header. */
+export const SCENARIO_RUNTIME = 'node-sim-v1'
+
+/**
+ * Re-create the live function for a closure-free literal callback. The source is
+ * a function-EXPRESSION reading only its parameter; we re-create it through the
+ * same restricted-scope contract the engine uses (`security.ts:640`) so a
+ * re-created callback is behaviorally identical to the generator's own `fn`.
+ *
+ * NOTE: this is the harness-side re-eval used when a {@link ScenarioSpec} arrives
+ * as pure JSON (no live `fn`); the generator's own `fn` is used directly when
+ * present. The created function ignores extra args and reads only the owner.
+ */
+function recreateLiteral(source: string): (...args: unknown[]) => unknown {
+  // Mirror security.ts:640: shadow dangerous globals, evaluate the source as an
+  // expression, call it with (adaptee, ...args). Closure-free source survives.
+  const executor = new Function(
+    'adaptee',
+    'args',
+    `
+    var eval = undefined;
+    var Function = undefined;
+    var setTimeout = undefined;
+    var setInterval = undefined;
+    var document = undefined;
+    var window = undefined;
+    var global = undefined;
+    var process = undefined;
+    var require = undefined;
+    const __fn = (${source});
+    if (typeof __fn !== 'function') { throw new Error('literal source is not a function'); }
+    return __fn(adaptee, ...(Array.isArray(args) ? args : []));
+  `,
+  ) as (adaptee: unknown, args: unknown[]) => unknown
+  return (adaptee: unknown, ...args: unknown[]) => executor(adaptee, args)
+}
+
+/**
+ * Convert a {@link StateSpec} to the engine state node, materializing each
+ * closure-free literal callback by ALWAYS re-creating it from `source` through
+ * {@link recreateLiteral}.
+ *
+ * Why re-create from `source` rather than reuse the generator's live `fn`: the
+ * driver computes `header.configHash = configHash(config)` which folds every
+ * callback's `Function.prototype.toString()` (trace.ts:structuralWalk). A live
+ * arrow `fn` and a JSON-round-tripped spec (where `fn` is dropped and only
+ * `source` survives) would stringify DIFFERENTLY, yielding a different
+ * configHash and breaking DoD#10 (same spec → same traceHash after JSON
+ * round-trip). Re-creating EVERY callback the SAME way (via `recreateLiteral`)
+ * makes the configHash path identical whether the spec is live or JSON. The
+ * `source` strings still vary per topology (inlined constants, delays), so
+ * distinct topologies still hash distinctly via their structure.
+ */
+function toEngineState(spec: StateSpec): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (spec.final) {
+    out['final'] = true
+  }
+  if (spec.history) {
+    out['history'] = spec.history
+  }
+  if (spec.initial) {
+    out['initial'] = spec.initial
+  }
+  if (spec.onEnter) {
+    out['onEnter'] = recreateLiteral(spec.onEnter.source)
+  }
+  if (spec.onExit) {
+    out['onExit'] = recreateLiteral(spec.onExit.source)
+  }
+  // ADDITIVE Step-9 hook-triad authoring surface (the Step-4 generator never sets
+  // these); each maps 1:1 onto the engine state node (types.ts:228-233).
+  if (spec.onBeforeEnter) {
+    out['onBeforeEnter'] = recreateLiteral(spec.onBeforeEnter.source)
+  }
+  if (spec.onAfterEnter) {
+    out['onAfterEnter'] = recreateLiteral(spec.onAfterEnter.source)
+  }
+  if (spec.onBeforeExit) {
+    out['onBeforeExit'] = recreateLiteral(spec.onBeforeExit.source)
+  }
+  if (spec.onAfterExit) {
+    out['onAfterExit'] = recreateLiteral(spec.onAfterExit.source)
+  }
+  if (spec.invoke) {
+    out['invoke'] = spec.invoke.map((inv) => {
+      const e: Record<string, unknown> = { delay: inv.delay, event: inv.event }
+      if (inv.cond) {
+        e['cond'] = recreateLiteral(inv.cond.source)
+      }
+      if (inv.action) {
+        e['action'] = recreateLiteral(inv.action.source)
+      }
+      return e
+    })
+  }
+  if (spec.regions) {
+    const regions: Record<string, Record<string, unknown>> = {}
+    for (const [rn, region] of Object.entries(spec.regions)) {
+      const rstates: Record<string, unknown> = {}
+      for (const [sn, ss] of Object.entries(region)) {
+        rstates[sn] = toEngineState(ss)
+      }
+      regions[rn] = rstates
+    }
+    out['regions'] = regions
+  }
+  // ADDITIVE Step-9: hierarchical single-region sub-states (the engine accepts a
+  // `states` field on a composite node).
+  if (spec.states) {
+    const nested: Record<string, unknown> = {}
+    for (const [sn, ss] of Object.entries(spec.states)) {
+      nested[sn] = toEngineState(ss)
+    }
+    out['states'] = nested
+  }
+  return out
+}
+
+/** Convert an {@link EventSpec} to the engine event node (materializing callbacks). */
+function toEngineEvent(spec: EventSpec): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    transitions: spec.transitions.map((t) => {
+      const e: Record<string, unknown> = { from: t.from, to: t.to }
+      if (t.priority !== undefined) {
+        e['priority'] = t.priority
+      }
+      if (t.guard) {
+        e['guard'] = recreateLiteral(t.guard.source)
+      }
+      if (t.onTransition) {
+        e['onTransition'] = recreateLiteral(t.onTransition.source)
+      }
+      return e
+    }),
+  }
+  // ADDITIVE Step-9 event-level hook authoring surface (types.ts:280-283).
+  if (spec.onBefore) {
+    out['onBefore'] = recreateLiteral(spec.onBefore.source)
+  }
+  if (spec.onAfter) {
+    out['onAfter'] = recreateLiteral(spec.onAfter.source)
+  }
+  if (spec.onSuccess) {
+    out['onSuccess'] = recreateLiteral(spec.onSuccess.source)
+  }
+  return out
+}
+
+/**
+ * Build the engine {@link StateMachineConfig} from a {@link TopologySpec}. All
+ * callbacks are live functions (closure-free literal bodies).
+ */
+export function toEngineConfig<T extends object = { state: string; log: number[]; k: number }>(
+  topology: TopologySpec,
+): StateMachineConfig<T> {
+  const states: Record<string, unknown> = {}
+  for (const [name, spec] of Object.entries(topology.states)) {
+    states[name] = toEngineState(spec)
+  }
+  const events: Record<string, unknown> = {}
+  for (const [name, spec] of Object.entries(topology.events)) {
+    events[name] = toEngineEvent(spec)
+  }
+  return {
+    name: topology.name,
+    stateAttribute: topology.stateAttribute,
+    initialState: topology.initialState,
+    states,
+    events,
+  } as unknown as StateMachineConfig<T>
+}
+
+/** The owner shape the generated machine drives. */
+export interface GenOwner {
+  state: string
+  log: number[]
+  k: number
+}
+
+/**
+ * Build a fresh owner object seeded from `topology.ownerSeed`. `log` is always a
+ * fresh array so two runs of the same spec do not share mutable state.
+ */
+export function makeOwner(topology: TopologySpec): GenOwner {
+  const seed = topology.ownerSeed as { log?: unknown; k?: unknown }
+  return {
+    state: String(topology.initialState),
+    log: Array.isArray(seed.log) ? [...(seed.log as number[])] : [],
+    k: typeof seed.k === 'number' ? seed.k : 0,
+  }
+}
+
+/**
+ * Identity validator/normalizer for a {@link ScenarioSpec}. Confirms the spec is
+ * JSON-shaped (string seed, version 1) and returns it unchanged. A non-conforming
+ * spec throws (a generator bug, never silently coerced).
+ */
+export function defineScenario(spec: ScenarioSpec): ScenarioSpec {
+  if (spec.version !== 1) {
+    throw new Error(`defineScenario: unsupported version ${String(spec.version)}`)
+  }
+  if (typeof spec.seed !== 'string') {
+    throw new Error('defineScenario: seed must be a serialized-bigint string')
+  }
+  return spec
+}
+
+/**
+ * Construct (but do not init) a {@link SimDriver} for `topology` + `seed`. Shared
+ * by {@link runScenario} and {@link generateScenario}'s closed-loop op generation
+ * so BOTH drive the IDENTICAL wiring.
+ *
+ * When `faults` carries a non-empty plan the driver routes external fires through
+ * the fault-aware path and the scheduler is built with the plan's seed-derived
+ * timer-jitter (via {@link buildPlanJitter} over `fork('faults')`), so faults
+ * ACTUALLY fire during the run while staying deterministic (same `(seed, plan)` →
+ * identical `FaultRecord[]` + bit-identical traceHash).
+ */
+function buildDriver(topology: TopologySpec, seed: bigint, faults: FaultPlan = { faults: [] }): SimDriver<GenOwner> {
+  const config = toEngineConfig<GenOwner>(topology)
+  const clock = makeSimClock(0)
+  const hasFaults = faults.faults.length > 0
+  // The scheduler carries the plan jitter when faults are wired; otherwise the
+  // plain Step-3 shim (identity jitter). Both expose the SAME SchedulerView.
+  const { scheduler, view } = hasFaults
+    ? makeObservableSchedulerWithJitter(clock, buildPlanJitter(faults, makePrng(seed).fork('faults')).jitterFn)
+    : makeObservableScheduler(clock)
+  return new SimDriver<GenOwner>({
+    config,
+    owner: new MemoryAdapter<GenOwner>(makeOwner(topology)) as unknown as Adapter<GenOwner>,
+    clock,
+    // makeObservableScheduler always implements `process` (env.ts); the
+    // ITimerScheduler.process? optionality is widened away here to match the
+    // driver's non-optional process contract.
+    scheduler: scheduler as { process(now?: number): void; isActive(): boolean; schedule(d: number, cb: () => void): object; cancel(t: object): void },
+    schedulerView: view,
+    monitor: new SimMonitor(),
+    errorHandler: new SimErrorHandler(),
+    logger: NoopLogger,
+    prng: makePrng(seed),
+    runtime: SCENARIO_RUNTIME,
+    // The generator emits armed timers; 'liveness' lets the driver jump the clock
+    // to fire them so done.state joins and invoke chains actually run.
+    policy: 'liveness',
+    ...(hasFaults ? { faults } : {}),
+  })
+}
+
+/** Map a closed-union {@link Op} onto the Step-3 {@link DriverOp} the driver runs.
+ * The op's STABLE `id` is carried as `opId` so the driver can resolve per-op
+ * channel faults keyed by that id (R22). */
+function toDriverOp(op: Op): DriverOp | null {
+  switch (op.kind) {
+    case 'fire':
+      return { kind: 'fire', event: op.event, args: op.args, opId: op.id }
+    case 'advance':
+      return { kind: 'advance', dtMs: op.dtMs, opId: op.id }
+    case 'noop':
+      return { kind: 'noop', opId: op.id }
+    // snapshot/restore are part of the frozen Op union but are not driven until
+    // the Simulator lands snapshot/restore (Step 10); skip them here.
+    default:
+      return null
+  }
+}
+
+/**
+ * Derive a machine from `spec.topology`, drive the Step-3 driver over `spec.ops`,
+ * and return the canonical content-only trace. Pure in `(spec.seed, spec,
+ * header.runtime)`: two calls with the same spec produce a bit-identical
+ * `traceHash` (proven by `replay.test.ts`).
+ */
+export async function runScenario(spec: ScenarioSpec): Promise<CanonicalTrace> {
+  defineScenario(spec)
+  const seed = BigInt(spec.seed)
+  // Honor a provided fault plan: a non-empty `spec.faults` is carried into the
+  // driver so the faults ACTUALLY fire during the run (Step 5 integration). A
+  // generated scenario whose plan is empty replays exactly as before.
+  const driver = buildDriver(spec.topology, seed, spec.faults)
+  await driver.init()
+  for (const op of spec.ops) {
+    const dop = toDriverOp(op)
+    if (dop !== null) {
+      await driver.step(dop)
+    }
+  }
+  return driver.trace()
+}
+
+/**
+ * One seed → a full {@link ScenarioSpec}: generate the topology with `fork('topology')`,
+ * then drive a closed-loop op stream with `fork('ops')` against a LIVE driver
+ * (genOps probes `getAvailableEvents` after the shared `settleMacrostep`). The
+ * fault plan is STUBBED EMPTY until Step 5 (`fork('faults')` is reserved). The
+ * returned spec replays to a bit-identical `traceHash` via {@link runScenario}.
+ */
+export async function generateScenario(
+  seed: bigint,
+  bounds: Bounds = DEFAULT_BOUNDS,
+  params: GenOpsParams = DEFAULT_GENOPS_PARAMS,
+): Promise<ScenarioSpec> {
+  const root = makePrng(seed)
+  const { topology } = genConfig(root.fork('topology'), bounds)
+
+  // Closed-loop op generation drives a LIVE throwaway driver so genOps can probe
+  // getAvailableEvents after the shared settleMacrostep.
+  const opDriver = buildDriver(topology, seed)
+  await opDriver.init()
+  const ops = await genOps(root.fork('ops'), opDriver, params)
+
+  const faults: FaultPlan = { faults: [] } // stubbed empty until Step 5
+
+  return {
+    seed: seed.toString(),
+    version: 1,
+    topology,
+    ops,
+    faults,
+    bounds,
+  }
+}
+
+/** Pin a topology fragment for snapshot-style tests (identity passthrough). */
+export function pinTopology(topology: TopologySpec): TopologySpec {
+  return topology
+}
+
+/** Pin an op list for snapshot-style tests (identity passthrough). */
+export function pinOps(ops: readonly Op[]): readonly Op[] {
+  return ops
+}
+

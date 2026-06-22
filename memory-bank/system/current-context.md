@@ -1,15 +1,18 @@
 # Current Context
 
-Updated: 2026-06-21 09:42
+Updated: 2026-06-22 15:43
 
-## No Active Task
+## Active Task
+- ID: TASK-014
+- Name: VOPR-style DST simulator for the state machine (deterministic simulation testing)
+- Profile: creative-first
+- Phase: ARCHIVE
+- Tier: T4:standard  QA: MAX
 
-Use `mb3_task(action="start")` to start a task, or `mb3_task(action="list")` to see pending tasks.
-
-## Recently Completed
-- TASK-011: Normalize dispatch inputs and simplify callback contract
-- TASK-012: SCXML/UML-correct composite regions: ancestor-first entry/exit + all-final join
-- TASK-013: DST clock-injection: options.clock + createVirtualScheduler for deterministic replay
+## Quick Resume
+- Next action: All 7 DA-gated phases PROCEED (CREATIVE/PLAN/TECH_SPEC/IMPLEMENT/QA/CODE_REVIEW/REFLECT). REFLECT closeReady=true. ARCHIVE: changeset + version bump (beta.3→beta.4), README Simulation/DST section + CHANGELOG, ISS-072..075↔original-ID mapping note (F-R-1), capability-registry snapshot, full-repo commit. Then UR-006 release: publish via gh after explicit user confirmation of version + latest-tag behavior (irreversible).
+- Progress: 0/?
+- Blockers: none
 
 ## Active Roadmap
 - ID: RM-001

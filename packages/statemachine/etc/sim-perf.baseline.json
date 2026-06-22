@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "1.0.0-beta.3",
+  "runtime": "node",
+  "node": "v24.9.0",
+  "baseline": {
+    "wallNs": "12921708",
+    "eventsPerSec": 13310.9338177275,
+    "transitionsPerSec": 19811.622426385118,
+    "latency": {
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "max": 0,
+      "mean": 0,
+      "resolution": "ms-coarse"
+    },
+    "heapPeakBytes": 21282048,
+    "heapAvgBytes": 17688156,
+    "heapEndBytes": 17542888,
+    "gcProxy": 20531,
+    "traceLen": 560,
+    "queueDepthPeak": 0
+  },
+  "gates": {
+    "latencyGated": false,
+    "memoryGated": true
+  }
+}

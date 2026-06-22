@@ -19,6 +19,10 @@ export default defineConfig({
         'src/tests/**',    // test source itself
         'src/presets.ts',  // example fixtures, not consumer-runtime API
         'src/security.ts', // unreachable from dist (TD-T3-8 + Step 5 artifact-grep verification)
+        // TASK-014 §6 frozen decision: the @unstable ./sim island owns its own
+        // coverage via the separate `sim:coverage` CLI; exclude it from the core
+        // vitest threshold so a sim no-op branch never trips the core 90% gate.
+        'src/sim/**',
       ],
       thresholds: {
         lines: 90,

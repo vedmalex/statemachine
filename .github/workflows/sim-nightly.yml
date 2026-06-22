@@ -1,0 +1,53 @@
+name: Sim Nightly Seed-Sweep
+
+# TASK-014 Step 11 (D) — the heavy DST seed-sweep that is too slow for the PR
+# leg. Runs on a cron schedule + manual dispatch. Each shard sweeps its slice of
+# the candidate seed window through the safety+liveness oracles; on a violation
+# the Step-7 shrinker writes a minimized repro that is uploaded as an artifact.
+# The median-of-N perf REGRESSION (bands 20/25/30 + traceLen-zero, --expose-gc)
+# also lives here, NOT on the PR leg (slow-runner-flake avoidance, Step 11 E).
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: packages/statemachine
+
+jobs:
+  seed-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: npm install --no-workspaces
+      - run: npm run build
+      - name: Seed-sweep shard ${{ matrix.shard }}
+        env:
+          SM_SIM: "1"
+          SIM_SHARD: "${{ matrix.shard }}"
+          SIM_SHARDS: "8"
+        run: npm run sim:sweep
+      - name: Perf regression (median-of-5, --expose-gc)
+        if: always()
+        run: npm run sim:perf
+      - name: Upload repro artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-repro-shard-${{ matrix.shard }}
+          path: packages/statemachine/.sim-out/**
+          if-no-files-found: ignore
+      - name: Open tracking issue on failure
+        if: failure()
+        continue-on-error: true
+        run: echo "nightly sweep shard ${{ matrix.shard }} failed — see uploaded repro artifacts"

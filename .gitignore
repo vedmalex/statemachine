@@ -7,3 +7,6 @@ types/
 coverage/
 temp/
 docs/api-html/
+# TASK-014 Step 11: nightly seed-sweep repro artifacts (uploaded by CI, never committed)
+.sim-out/
+**/.sim-out/
