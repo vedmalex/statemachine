@@ -1,17 +1,30 @@
-name: Sim Nightly Seed-Sweep
+name: Sim Seed-Sweep
 
-# TASK-014 Step 11 (D) — the heavy DST seed-sweep that is too slow for the PR
-# leg. Runs on a cron schedule + manual dispatch. Each shard sweeps its slice of
+# TASK-014 Step 11 (D) — the DST seed-sweep. Each shard sweeps its slice of
 # the candidate seed window through the safety+liveness oracles; on a violation
 # the Step-7 shrinker writes a minimized repro that is uploaded as an artifact.
 # The median-of-N perf REGRESSION (bands 20/25/30 + traceLen-zero, --expose-gc)
 # also lives here, NOT on the PR leg (slow-runner-flake avoidance, Step 11 E).
+#
+# TASK-016 — EVENT-DRIVEN, no cron (the ai-connect CI pattern): the sweep
+# enumerates a FIXED deterministic seed window [0, SIM_SWEEP_SEEDS), so
+# re-running it on unchanged code reproduces the same result by construction —
+# a daily schedule only burned CI minutes and mailed redundant failures. Runs
+# on push to main (paths-filtered) + manual dispatch; the PR leg is ci.yml.
 
 on:
-  schedule:
-    # 03:00 UTC daily.
-    - cron: "0 3 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/statemachine/**"
+      - ".github/workflows/sim-nightly.yml"
   workflow_dispatch:
+
+# Cancel superseded runs on the same ref so a fresh push wins immediately.
+concurrency:
+  group: sim-sweep-${{ github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:
