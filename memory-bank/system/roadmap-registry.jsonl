@@ -9,3 +9,4 @@
 {"event":"roadmap_phase_completed","id":"RM-001-P02","roadmap_id":"RM-001","status":"completed","ts":"2026-05-06T07:31:38Z"}
 {"event":"roadmap_task_linked","task_id":"TASK-014","roadmap_id":"RM-001","phase_id":"RM-001-P03","ts":"2026-06-22T02:26:54Z","__mb3_idempotency":"roadmap_add_task:RM-001:RM-001-P03:TASK-014"}
 {"event":"roadmap_phase_started","id":"RM-001-P03","roadmap_id":"RM-001","status":"in_progress","ts":"2026-06-22T02:26:54Z","__mb3_idempotency":"roadmap_phase_started:RM-001:RM-001-P03"}
+{"event":"roadmap_phase_completed","id":"RM-001-P03","roadmap_id":"RM-001","status":"completed","ts":"2026-06-22T16:05:53Z"}

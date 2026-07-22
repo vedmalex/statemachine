@@ -4,10 +4,10 @@
 - **Tier**: T4:standard
 - **QA Level**: MAX
 - **Execution Mode**: subagent_driven
-- **Status**: in_progress
+- **Status**: completed
 - **Phase**: ARCHIVE
 - **Created**: 2026-06-22T02:26:02Z
-- **Updated**: 2026-06-22T15:43:43Z
+- **Updated**: 2026-06-22T16:05:53Z
 - **Branch**: feat/dst-simulation-TASK-014
 - **Continues**: TASK-013
 - **Continuation reason**: TASK-013 landed the deterministic-replay seam (options.clock + createVirtualScheduler). This epic builds the VOPR-style deterministic simulator on top of that seam: a seed-driven scenario generator, a fault-injection layer adapted to a single-process state machine (event reorder/drop/dup, callback errors/throws, clock skew, scheduler jitter, event-queue overflow), safety+liveness modes, invariant checkers, failing-trace shrinker/minimizer, and long-running CI integration. Reuses the clock/scheduler injection contract from TASK-013 and the region-join semantics from TASK-012.
