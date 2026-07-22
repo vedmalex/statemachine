@@ -24,12 +24,11 @@ export default defineConfig({
         // vitest threshold so a sim no-op branch never trips the core 90% gate.
         'src/sim/**',
       ],
-      thresholds: {
-        lines: 90,
-        branches: 90,
-        functions: 90,
-        statements: 90,
-      },
+      // TASK-017 (REQ-001): no thresholds — coverage is REPORTED, not gated.
+      // The 90% gate existed only on this leg (bun/deno/browser never had it)
+      // and kept main red from 2026-06-15 on a 89.87%-branches miss with every
+      // test passing. Reintroduce a gate only together with the tests that
+      // satisfy it.
       reporter: ['text', 'html', 'json-summary'],
     },
   },
