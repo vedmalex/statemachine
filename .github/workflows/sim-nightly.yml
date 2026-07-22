@@ -37,9 +37,6 @@ jobs:
           SIM_SHARD: "${{ matrix.shard }}"
           SIM_SHARDS: "8"
         run: npm run sim:sweep
-      - name: Perf regression (median-of-5, --expose-gc)
-        if: always()
-        run: npm run sim:perf
       - name: Upload repro artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -51,3 +48,19 @@ jobs:
         if: failure()
         continue-on-error: true
         run: echo "nightly sweep shard ${{ matrix.shard }} failed — see uploaded repro artifacts"
+
+  # The perf REGRESSION gate runs ONCE per night, not once per shard — the gate
+  # is identical in every shard, so running it inside the 8-way matrix just
+  # multiplied the odds of a runner-noise false positive by 8 (TASK-015; the
+  # baseline in etc/sim-perf.baseline.json is calibrated to THIS runner class).
+  perf-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: npm install --no-workspaces
+      - run: npm run build
+      - name: Perf regression (median-of-5, --expose-gc)
+        run: npm run sim:perf

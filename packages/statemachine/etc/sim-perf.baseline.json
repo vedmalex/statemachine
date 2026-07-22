@@ -1,11 +1,12 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "1.0.0-beta.3",
+  "packageVersion": "1.0.0-beta.4",
   "runtime": "node",
-  "node": "v24.9.0",
+  "node": "v24 (github-actions ubuntu-latest)",
+  "calibration": "TASK-015: gated fields (eventsPerSec, heapPeakBytes) recalibrated to the CI runner envelope observed across nightly runs 2026-06-23..2026-07-22 — the local v24.9.0 capture tripped the memory band on the runners' high heap cluster (~27.0MB vs local 21.28MB peak). eventsPerSec=12000 is a conservative LOW-END floor anchor (CI observed 10917..19300; gate floor 9600), not a median. heapPeakBytes=27030000 sits just above the higher of the two observed CI heap clusters (~22.45MB / ~27.0MB); ACCEPTED TRADE-OFF: with the 25% band the ceiling is ~33.8MB, so a real heap regression must exceed ~25% over the worst observed cluster (~50% over the low cluster) before the gate fires — accepted to eliminate the bimodal false positive; tighten by re-capturing the FULL baseline via sim:perf:baseline on the CI runner class. Informational fields (wallNs, transitionsPerSec, heapAvg/EndBytes, gcProxy) are STALE from the original local capture and no longer describe one coherent measured run.",
   "baseline": {
     "wallNs": "12921708",
-    "eventsPerSec": 13310.9338177275,
+    "eventsPerSec": 12000,
     "transitionsPerSec": 19811.622426385118,
     "latency": {
       "p50": 0,
@@ -15,7 +16,7 @@
       "mean": 0,
       "resolution": "ms-coarse"
     },
-    "heapPeakBytes": 21282048,
+    "heapPeakBytes": 27030000,
     "heapAvgBytes": 17688156,
     "heapEndBytes": 17542888,
     "gcProxy": 20531,
