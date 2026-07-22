@@ -233,8 +233,18 @@ export interface CoverageScenario {
     readonly expects?: readonly CapabilityId[];
     // (undocumented)
     readonly name: string;
+    readonly overflow?: {
+        readonly event: string;
+        readonly maxQueueDepth: number;
+        readonly floodCount: number;
+    };
+    readonly snapshotRestore?: boolean;
     // (undocumented)
     readonly spec: ScenarioSpec;
+    readonly transitionTimeout?: {
+        readonly event: string;
+        readonly timeoutMs: number;
+    };
 }
 
 // @public
@@ -271,6 +281,7 @@ export interface DriverConfig<T extends object> {
     // (undocumented)
     readonly errorHandler: SimErrorHandler;
     readonly errorState?: string;
+    readonly faults?: FaultPlan;
     // (undocumented)
     readonly logger: ILogger;
     readonly maxQueueDepth?: number;
@@ -296,11 +307,14 @@ export type DriverOp = {
     readonly kind: 'fire';
     readonly event: string;
     readonly args?: readonly unknown[];
+    readonly opId?: string;
 } | {
     readonly kind: 'advance';
     readonly dtMs: number;
+    readonly opId?: string;
 } | {
     readonly kind: 'noop';
+    readonly opId?: string;
 };
 
 // @public
@@ -898,6 +912,9 @@ export interface OpDriverView {
 }
 
 // @public
+export const overflowScenario: CoverageScenario;
+
+// @public
 export const PERF_BASELINE_PATH: string;
 
 // @public
@@ -1218,6 +1235,12 @@ export interface SimClock {
 export class SimDriver<T extends object> {
     constructor(cfg: DriverConfig<T>);
     get environment(): Env;
+    faultRecordsList(): readonly FaultRecord[];
+    fireMany(ops: ReadonlyArray<{
+        event: string;
+        args?: readonly number[];
+        opId: string;
+    }>): Promise<readonly FireResult[]>;
     init(): Promise<void>;
     get machine(): StateMachine<T, StateMachineConfig<T>>;
     step(op: DriverOp): Promise<DriverStepResult>;
@@ -1589,6 +1612,9 @@ export interface TransitionSpec {
     // (undocumented)
     readonly to: string;
 }
+
+// @public
+export const transitionTimeoutScenario: CoverageScenario;
 
 // @public
 export interface UncoveredMarker {
