@@ -2,9 +2,10 @@
  * @module sim/cli/sim-sweep
  * @unstable
  *
- * Step-11 (D) — the NIGHTLY seed-sweep entry (`sim:sweep`), invoked by
- * `.github/workflows/sim-nightly.yml` as
- * `SM_SIM=1 SIM_SHARD=k SIM_SHARDS=8 npm run sim:sweep`.
+ * Step-11 (D) — the seed-sweep entry (`sim:sweep`), invoked by
+ * `.github/workflows/sim-nightly.yml` (event-driven since TASK-016: push to
+ * main + workflow_dispatch, no cron — the file name is kept for run-history
+ * continuity) as `SM_SIM=1 SIM_SHARD=k SIM_SHARDS=8 npm run sim:sweep`.
  *
  * Mechanism (build-plan Step 11 D):
  *  - Enumerate a CONCRETE candidate seed window `[0, SIM_SWEEP_SEEDS)` (NOT the

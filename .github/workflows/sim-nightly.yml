@@ -11,6 +11,16 @@ name: Sim Seed-Sweep
 # re-running it on unchanged code reproduces the same result by construction —
 # a daily schedule only burned CI minutes and mailed redundant failures. Runs
 # on push to main (paths-filtered) + manual dispatch; the PR leg is ci.yml.
+#
+# ACCEPTED TRADE-OFF (TASK-016 DA F-D1-2): dropping the schedule also drops the
+# perf-gate's PERIODIC environment-drift probe (the TASK-015 incident WAS
+# runner-environment drift). Accepted because the gate still runs on EVERY code
+# push — drift is caught at the next push instead of the next night — and the
+# TASK-015-calibrated baseline envelope absorbs the known runner variance.
+# Compensating control: on a perf-gate failure with NO plausible code cause,
+# first suspect environment drift and re-capture the baseline on the CI runner
+# class (sim:perf:baseline), per the calibration note in
+# packages/statemachine/etc/sim-perf.baseline.json.
 
 on:
   push:
@@ -62,10 +72,11 @@ jobs:
         continue-on-error: true
         run: echo "nightly sweep shard ${{ matrix.shard }} failed — see uploaded repro artifacts"
 
-  # The perf REGRESSION gate runs ONCE per night, not once per shard — the gate
-  # is identical in every shard, so running it inside the 8-way matrix just
-  # multiplied the odds of a runner-noise false positive by 8 (TASK-015; the
-  # baseline in etc/sim-perf.baseline.json is calibrated to THIS runner class).
+  # The perf REGRESSION gate runs ONCE per triggering event, not once per shard
+  # — the gate is identical in every shard, so running it inside the 8-way
+  # matrix just multiplied the odds of a runner-noise false positive by 8
+  # (TASK-015; the baseline in etc/sim-perf.baseline.json is calibrated to THIS
+  # runner class).
   perf-gate:
     runs-on: ubuntu-latest
     timeout-minutes: 15

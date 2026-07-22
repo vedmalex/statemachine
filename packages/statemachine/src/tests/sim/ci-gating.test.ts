@@ -78,14 +78,26 @@ describe('Step 11 — ci.yml latest-LTS (Node 24) DST gate (DoD 1)', () => {
 })
 
 // ── DoD 7: sim-nightly.yml is a SEPARATE file with the required structure ─────
+// TASK-016: the sweep is EVENT-DRIVEN (push to main + workflow_dispatch), no
+// cron — the fixed deterministic seed window makes scheduled re-runs of
+// unchanged code pure redundancy.
 
 describe('Step 11 — sim-nightly.yml structural check (DoD 7)', () => {
   const nightly = readRepo('.github/workflows/sim-nightly.yml')
 
-  it('has a cron schedule + workflow_dispatch trigger', () => {
-    expect(nightly).toMatch(/schedule:/)
-    expect(nightly).toMatch(/cron:\s*["']0 3 \* \* \*["']/)
+  it('is event-driven: push-to-main (paths-filtered) + workflow_dispatch, NO cron', () => {
+    expect(nightly).toMatch(/push:/)
+    expect(nightly).toMatch(/branches:\s*\n\s*- main/)
+    expect(nightly).toMatch(/paths:/)
+    expect(nightly).toMatch(/packages\/statemachine\/\*\*/)
     expect(nightly).toMatch(/workflow_dispatch:/)
+    expect(nightly).not.toMatch(/schedule:/)
+    expect(nightly).not.toMatch(/cron:/)
+  })
+
+  it('cancels superseded runs via a ref-scoped concurrency group', () => {
+    expect(nightly).toMatch(/concurrency:/)
+    expect(nightly).toMatch(/cancel-in-progress:\s*true/)
   })
 
   it('shards 0..7 (length 8), fail-fast:false, timeout 60, working-directory pinned', () => {
@@ -104,7 +116,7 @@ describe('Step 11 — sim-nightly.yml structural check (DoD 7)', () => {
     expect(nightly).toMatch(/packages\/statemachine\/\.sim-out\/\*\*/)
   })
 
-  it('the perf REGRESSION (sim:perf) runs in nightly, NOT on the PR leg', () => {
+  it('the perf REGRESSION (sim:perf) runs in the sweep workflow, NOT on the PR leg', () => {
     expect(nightly).toMatch(/npm run sim:perf/)
     const ci = readRepo('.github/workflows/ci.yml')
     expect(ci, 'sim:perf regression must NOT be on the ci.yml PR leg').not.toContain('npm run sim:perf')
