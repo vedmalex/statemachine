@@ -75,8 +75,9 @@ Module-level mutable state is BANNED (per TASK-004 ISS-007/008 closure). All hos
 
 ## Coverage threshold
 
-- ≥90% on all 4 metrics (statements, branches, functions, lines) via vitest+@vitest/coverage-v8.
-- Adding to `coverage.exclude` list requires per-entry justification in implementation.md.
+- REMOVED (TASK-017 / REQ-001, user directive 2026-07-22): coverage is REPORTED (text/html/json-summary via vitest+@vitest/coverage-v8) but NOT gated — no threshold on any metric, on any CI leg. The former node-leg-only ≥90% gate kept main's CI red since 2026-06-15 (branches 89.87% with every test passing) while no other leg carried the requirement.
+- Reintroduction rule: a coverage gate may return ONLY together with the tests that satisfy it (never as a bare threshold bump), via its own MB3 task. Tracked as a low-priority backlog item (see FT/TODO from TASK-017 F-IMPL-3).
+- Adding to `coverage.exclude` list still requires per-entry justification in implementation.md.
 
 ## Public-surface ratchet
 

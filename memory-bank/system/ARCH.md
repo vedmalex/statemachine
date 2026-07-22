@@ -1,6 +1,6 @@
 # Architecture — @vedmalex/statemachine
 
-Updated: 2026-05-04
+Updated: 2026-07-22
 
 ## Overview
 
@@ -36,7 +36,7 @@ Standalone TypeScript hierarchical state machine library. Lite-only DI-free publ
 │       ├── tsconfig.json                  ← strict TS (8 flags)
 │       ├── tsconfig.build.json            ← --emitDeclarationOnly profile
 │       ├── tsup.config.ts                 ← ESM+CJS dual emit (target node18)
-│       ├── vitest.config.ts               ← coverage thresholds (≥90% all metrics)
+│       ├── vitest.config.ts               ← coverage reported-only (no thresholds, TASK-017)
 │       ├── knip.json                      ← unused-exports auditor
 │       ├── api-extractor.json             ← surface-snapshot config
 │       ├── playwright.config.ts           ← browser smoke
@@ -87,7 +87,7 @@ All other exports: `@unstable` per package-level JSDoc default (see `src/index.t
 
 - `tsup` (esbuild-based) → ESM `dist/index.js` + CJS `dist/index.cjs` + sourcemaps
 - `tsc --emitDeclarationOnly` → `types/*.d.ts`
-- Coverage gate ≥90% all 4 metrics via vitest+@vitest/coverage-v8
+- Coverage reported (not gated) via vitest+@vitest/coverage-v8 — the ≥90% gate was removed in TASK-017/REQ-001
 - knip + api-extractor in CI for surface drift detection
 
 ## CI/CD
