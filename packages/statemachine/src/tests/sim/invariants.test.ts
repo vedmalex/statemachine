@@ -226,6 +226,22 @@ describe('each I-2..I-12 catch/pass with normalized witness (DoD 3)', () => {
     expect(runSafety(INVARIANTS, clean, baseCtx())).toBeNull()
   })
 
+  it('I-3 (U1 precision): EXCLUDES the two legitimate waits (WAITING_ON_TIMER / WAITING_ON_TRANSITION_TIMEOUT) and FLAGS WAITING_ON_INTERNAL + no-reason', () => {
+    const nonQuiescentBoundary = (settleReason?: string): CanonicalTrace => ({
+      header: HEADER,
+      frames: [frame({ step: 1, fireOutcome: 'resolve-true', quiescent: false, ...(settleReason ? { settleReason: settleReason as never } : {}) })],
+    })
+    // legitimate waits — I-3 stays clean (the anti-FP contract; the WAITING_ON_TIMER
+    // half is C1, the WAITING_ON_TRANSITION_TIMEOUT half is the new U1 exclusion,
+    // sound because settle assigns it only when inFlightAsyncCount()>0).
+    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_TIMER'), baseCtx())).toBeNull()
+    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_TRANSITION_TIMEOUT'), baseCtx())).toBeNull()
+    // genuine RTC concerns — I-3 fires: a wedged internal queue / a settle-boundary
+    // with no documented reason at all.
+    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_INTERNAL'), baseCtx())?.invariantId).toBe('I-3')
+    expect(runSafety(INVARIANTS, nonQuiescentBoundary(undefined), baseCtx())?.invariantId).toBe('I-3')
+  })
+
   it('I-6 catches a duplicate-region composite without the guard firing; passes when the guard fired', () => {
     const cfg = {
       states: {

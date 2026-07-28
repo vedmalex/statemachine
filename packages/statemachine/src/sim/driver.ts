@@ -236,10 +236,12 @@ export class SimDriver<T extends object> {
       seed: cfg.prng.seed.toString(),
       configHash: configHash(cfg.config),
       engine: '@vedmalex/statemachine',
-      // '2' (was '1'): the TraceFrame gained the hashed `settleReason` field (C1),
-      // so per the trace.ts version contract ("bump on hashed-field change") the
-      // schema version advances — a non-quiescent scenario now hashes differently.
-      version: '2',
+      // '3' (was '1'→'2'): '2' added the hashed `settleReason` field (C1); '3'
+      // re-semantizes its closed union (U1: the `pending ∧ inFlight==0` case that
+      // hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as WAITING_ON_INTERNAL),
+      // so per the trace.ts version contract ("bump on closed-union/hashed-field
+      // change") the schema version advances again.
+      version: '3',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,

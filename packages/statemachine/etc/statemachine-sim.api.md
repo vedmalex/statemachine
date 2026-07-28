@@ -1278,7 +1278,7 @@ export function settleMacrostep(args: SettleArgs): Promise<SettleResult>;
 export type SettlePolicy = 'safety' | 'liveness';
 
 // @public
-export type SettleReason = 'microtask-budget' | 'WAITING_ON_TIMER' | 'WAITING_ON_TRANSITION_TIMEOUT';
+export type SettleReason = 'microtask-budget' | 'WAITING_ON_TIMER' | 'WAITING_ON_TRANSITION_TIMEOUT' | 'WAITING_ON_INTERNAL';
 
 // @public
 export interface SettleResult {

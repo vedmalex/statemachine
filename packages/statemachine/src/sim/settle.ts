@@ -57,7 +57,8 @@ export type SettlePolicy = 'safety' | 'liveness'
 export type SettleReason =
   | 'microtask-budget' // microtask pump exhausted maxTurns before the predicate held
   | 'WAITING_ON_TIMER' // queues+inFlight empty but a future timer is pending (safety: no jump)
-  | 'WAITING_ON_TRANSITION_TIMEOUT' // in-flight/queued work blocked on a future transitionTimeout (safety: no jump)
+  | 'WAITING_ON_TRANSITION_TIMEOUT' // GENUINE in-flight async (inFlight>0) racing a future deadline (safety: no jump)
+  | 'WAITING_ON_INTERNAL' // pending queue/processing with NO tracked in-flight async + a future timer — a wedged-flag / undrained-queue RTC concern (U1)
 
 /** Outcome of one {@link settleMacrostep} call. */
 export interface SettleResult {
@@ -273,12 +274,30 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
 
     if (policy === 'safety') {
       // A FUTURE timer is armed (the single clock-jump lives in 'liveness').
-      // Distinguish the two waits by whether non-timer work is still pending:
-      //  - pendingNow === true  -> in-flight/queued work blocked on a future
-      //    deadline only a jump can fire: WAITING_ON_TRANSITION_TIMEOUT.
-      //  - pendingNow === false -> a plain empty-queue armed timer:
-      //    WAITING_ON_TIMER.
-      const reason: SettleReason = pendingNow ? 'WAITING_ON_TRANSITION_TIMEOUT' : 'WAITING_ON_TIMER'
+      // THREE-WAY taxonomy (U1 I-3 precision) by WHAT is still pending:
+      //  - !pendingNow                    -> a plain empty-queue armed timer:
+      //    WAITING_ON_TIMER (the fired region observably completed; only a
+      //    sibling's future deadline remains — legitimate, I-3 excludes it).
+      //  - pendingNow && inFlight > 0     -> a genuine AWAITED async action racing
+      //    a future deadline only a jump can fire: WAITING_ON_TRANSITION_TIMEOUT
+      //    (legitimate async-in-flight — the jurisdiction of liveness, not an RTC
+      //    break; I-3 now excludes it SOUNDLY because inFlight>0 proves real
+      //    in-flight work, not a wedged flag).
+      //  - pendingNow && inFlight === 0   -> queued/processing work with NO tracked
+      //    in-flight async, accompanied by a future timer: WAITING_ON_INTERNAL — a
+      //    wedged processing flag / undrained internal queue is a real RTC concern
+      //    (I-3 witness). CAVEAT (ISS-030): inFlightAsyncCount does NOT track
+      //    string-method invoke actions, so a machine awaiting one can appear here
+      //    with inFlight==0 — hence I-3's DEFAULT-set promotion is gated on the
+      //    zero-false-positive corpus (string-method configs included).
+      let reason: SettleReason
+      if (!pendingNow) {
+        reason = 'WAITING_ON_TIMER'
+      } else if (args.env.inFlightAsyncCount() > 0) {
+        reason = 'WAITING_ON_TRANSITION_TIMEOUT'
+      } else {
+        reason = 'WAITING_ON_INTERNAL'
+      }
       return { quiescent: false, turns, reason, t: clock.now() }
     }
 

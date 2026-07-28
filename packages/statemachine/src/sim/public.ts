@@ -217,11 +217,13 @@ export interface SimResult {
  *  - I-9 is INCLUDED: after the A3 fix it only fires on a QUIESCENT boundary whose
  *    combined queue exceeds an explicitly-configured `maxQueueDepth`, and it is
  *    VACUOUS when no bound is set (the default path sets none) — sound and inert.
- *  - I-3 is still EXCLUDED: the C1 fix makes its WAITING_ON_TIMER exclusion sound,
- *    but WAITING_ON_TRANSITION_TIMEOUT stays un-excluded (to avoid masking a real
- *    RTC break), so I-3 could false-positive on a legitimate in-flight-with-timeout
- *    resolve-true boundary. It stays opt-in (explicit `invariants`) until the
- *    settle.ts reason-precision follow-up lands.
+ *  - I-3 is still EXCLUDED: the C1 + U1 fixes now make BOTH WAITING_ON_TIMER and
+ *    (precise, inFlight>0) WAITING_ON_TRANSITION_TIMEOUT sound exclusions, so I-3 no
+ *    longer false-positives on a legitimate function-async in-flight boundary. It
+ *    stays opt-in because of the ISS-030 residual: `inFlightAsyncCount` does NOT
+ *    track STRING-METHOD invoke actions, so a correct machine awaiting one surfaces
+ *    as WAITING_ON_INTERNAL (which I-3 flags) → a reachable false-positive in the
+ *    DEFAULT path. Until string-method actions are tracked, I-3 is explicit-only.
  *  - I-5 is EXCLUDED: it is a documented no-op (its class is not soundly observable
  *    from the current trace plane), so including it would add nothing.
  */
@@ -378,8 +380,9 @@ function emptyHeader(seed: string): CanonicalHeader {
     seed,
     configHash: '',
     engine: '@vedmalex/statemachine',
-    // '2': kept in lockstep with the driver's canonical header (C1 settleReason).
-    version: '2',
+    // '3': kept in lockstep with the driver's canonical header (C1 settleReason +
+    // U1 WAITING_ON_INTERNAL re-semantization).
+    version: '3',
     runtime: 'node-sim-v1',
     prngVersion: 'splitmix64-bigint-v1',
     errorHandlerEnabled: true,

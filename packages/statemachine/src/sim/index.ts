@@ -101,12 +101,20 @@ export type {
 } from './env'
 
 // --- Step-4 scenario generator (VALUE symbols) ---
-// ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt): `toEngineConfig`
-// and `runScenario` COMPILE each callback `source` string via `new Function`
-// (define.ts `recreateLiteral`). The restricted-scope shadowing is hardening,
-// NOT a sandbox — a crafted `source` is RCE-class. Pass ONLY author-side trusted
-// specs; NEVER a ScenarioSpec/TopologySpec reconstructed from untrusted JSON.
-// Untrusted input belongs on the non-compiling `StateMachine.fromJSON` path.
+// ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26, W7 U2 учёт/закалка):
+// `toEngineConfig` and `runScenario` COMPILE each callback `source` string via
+// `new Function` (define.ts `recreateLiteral`). `recreateLiteral` now runs a
+// fail-fast RUNTIME GUARD (FUNCTION_LITERAL_PATTERN) that throws on an
+// empty/non-string/non-function-shaped `source` before it ever reaches
+// `new Function` — this is hygiene/fail-fast, NOT a sandbox: a crafted,
+// syntactically-valid-looking malicious literal still compiles. Pass ONLY
+// author-side trusted specs; NEVER a ScenarioSpec/TopologySpec reconstructed
+// from untrusted JSON. Untrusted input belongs on the non-compiling
+// `StateMachine.fromJSON`/`fromSecureJSON` path, which resolves callbacks BY
+// NAME from a caller-supplied `FunctionRegistry` (`state_machine.ts`
+// `deserializeAction`) and never reaches `recreateLiteral`/`new Function` — a
+// contract fixed by `src/tests/sim/define_trusted_boundary.test.ts`
+// (trusted `define` compiles; untrusted `fromJSON` does not).
 export { genConfig } from './topology'
 export type { GeneratedTopology } from './topology'
 export { genOps } from './ops'

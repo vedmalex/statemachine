@@ -285,7 +285,7 @@ describe('settle.ts: policy-parameterized clock jump (DoD 6)', () => {
     expect(sm.getCurrentState()).toBe('next')
   })
 
-  it("policy:'safety' classifies WAITING_ON_TRANSITION_TIMEOUT for an in-flight action blocked on a future deadline", async () => {
+  it("policy:'safety' classifies WAITING_ON_INTERNAL for pending work with NO tracked in-flight async (ISS-030: an un-bracketed onEnter is not counted)", async () => {
     const clock = makeSimClock(0)
     const { scheduler, view } = makeObservableScheduler(clock)
     const env = makeEnv(makeAsyncCounter(), view)
@@ -296,8 +296,12 @@ describe('settle.ts: policy-parameterized clock jump (DoD 6)', () => {
       states: {
         idle: {},
         // onEnter never resolves; only the transitionTimeout timer (future) can
-        // clear the in-flight transition. In 'safety' (no jump) the macrostep is
-        // blocked on that future deadline.
+        // clear the in-flight transition. It is NOT bracketed, so
+        // inFlightAsyncCount() stays 0 — the U1 taxonomy classifies "pending work
+        // (processing) + a future timer, inFlight==0" as WAITING_ON_INTERNAL. This
+        // is the documented ISS-030 boundary: an un-tracked in-flight action is
+        // indistinguishable from a wedged queue, which is exactly why I-3 stays
+        // opt-in (not in the DEFAULT builtin set).
         busy: { onEnter: () => new Promise<void>(() => {}) },
       },
       events: { go: { transitions: [{ from: 'idle', to: 'busy' }] } },
@@ -315,12 +319,38 @@ describe('settle.ts: policy-parameterized clock jump (DoD 6)', () => {
 
     const result = await settleMacrostep({ sm, scheduler, clock, env, policy: 'safety', maxTurns: 32 })
     expect(result.quiescent).toBe(false)
-    expect(result.reason).toBe('WAITING_ON_TRANSITION_TIMEOUT')
+    expect(result.reason).toBe('WAITING_ON_INTERNAL')
 
     // 'liveness' jumps so the timeout fires and the in-flight transition rejects.
     const live = await settleMacrostep({ sm, scheduler, clock, env, policy: 'liveness', maxTurns: 64 })
     expect(clock.now()).toBe(500)
     expect(live.quiescent).toBe(true)
+  })
+
+  it("policy:'safety' classifies WAITING_ON_TRANSITION_TIMEOUT when a BRACKETED async action is genuinely in flight (inFlightAsyncCount>0)", async () => {
+    const clock = makeSimClock(0)
+    const { scheduler, view } = makeObservableScheduler(clock)
+    const env = makeEnv(makeAsyncCounter(), view)
+    const config: StateMachineConfig<Box> = {
+      name: 'InFlightSM',
+      stateAttribute: 'state',
+      initialState: 'idle',
+      states: {
+        idle: {},
+        // BRACKETED pending action → inFlightAsyncCount() > 0 during settle, so the
+        // U1 taxonomy reports a GENUINE in-flight async racing the future deadline.
+        busy: { onEnter: bracketAsync(env, () => new Promise<void>(() => {})) },
+      },
+      events: { go: { transitions: [{ from: 'idle', to: 'busy' }] } },
+    }
+    const adapter = new MemoryAdapter<Box>({ state: 'idle', count: 0 })
+    const sm = new StateMachine<Box, typeof config>(config, adapter, { clock: clock.now, scheduler, transitionTimeout: 500 })
+    await settleMacrostep({ sm, scheduler, clock, env, policy: 'safety' })
+    sm.fireEvent('go').catch(() => {})
+    const result = await settleMacrostep({ sm, scheduler, clock, env, policy: 'safety', maxTurns: 32 })
+    expect(result.quiescent).toBe(false)
+    expect(env.inFlightAsyncCount()).toBeGreaterThan(0)
+    expect(result.reason).toBe('WAITING_ON_TRANSITION_TIMEOUT')
   })
 })
 

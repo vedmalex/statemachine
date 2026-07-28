@@ -314,23 +314,26 @@ const I3: Invariant = {
     // a wedged in-flight transition is the I-3 witness only when the run claimed
     // settlement. Step-level I-3 here checks monotonic frame steps + that a
     // resolve-true settle boundary is quiescent.
-    // C1 fix: a WAITING_ON_TIMER non-quiescence is a DOCUMENTED, legitimate wait —
-    // a concurrent parallel region's OWN pending future timer with NO other pending
-    // work (settle.ts assigns it only when `hasPendingWork()===false`, i.e. queues
-    // empty, not processing, nothing in-flight: the fired region OBSERVABLY ran to
-    // completion and only a sibling's future deadline remains). That is NOT an
-    // RTC-serialization break.
-    //
-    // We DELIBERATELY do NOT exclude WAITING_ON_TRANSITION_TIMEOUT: settle.ts
-    // assigns it whenever ANY work is pending (`hasPendingWork()===true`) alongside
-    // a future timer, WITHOUT tying that work to the timer — so a genuine RTC break
-    // (a wedged processing-flag / undrained internal queue) that merely coexists
-    // with an unrelated armed timer would be MASKED if we excluded it (a
-    // false-negative). Leaving it in keeps that break catchable. `microtask-budget`
-    // (a livelock the run could not drain) likewise REMAINS an I-3 witness. Making
-    // WAITING_ON_TRANSITION_TIMEOUT precise (only when `inFlightAsyncCount()>0`) so
-    // it too can be soundly excluded is a settle.ts refinement tracked as follow-up.
-    const legitimateWait = frame.settleReason === 'WAITING_ON_TIMER'
+    // Two DOCUMENTED, legitimate non-quiescence waits are EXCLUDED (not RTC breaks):
+    //  - WAITING_ON_TIMER (C1): the fired region observably completed
+    //    (`hasPendingWork()===false`); only a sibling's future timer remains.
+    //  - WAITING_ON_TRANSITION_TIMEOUT (U1 precision): settle.ts now assigns this
+    //    ONLY when `inFlightAsyncCount() > 0` — a GENUINE awaited async action racing
+    //    a future deadline (liveness' jurisdiction), not a wedged flag. Before U1 it
+    //    fired on ANY pending work + a timer, so excluding it risked a false-negative;
+    //    now the inFlight>0 guarantee makes the exclusion SOUND.
+    // STILL flagged as I-3 witnesses:
+    //  - WAITING_ON_INTERNAL (U1): pending queue/processing with NO tracked in-flight
+    //    async + a timer — a wedged processing-flag / undrained internal queue.
+    //  - microtask-budget: a livelock the run could not drain.
+    //  - a resolve-true boundary with NO settleReason at all (should have settled).
+    // CAVEAT (ISS-030): `inFlightAsyncCount` does not track string-method invoke
+    // actions, so a machine legitimately awaiting one can surface as
+    // WAITING_ON_INTERNAL — which is why I-3's DEFAULT-set membership is gated on the
+    // zero-false-positive corpus (see oracle_self_test); if that corpus shows the FP
+    // reachable, I-3 stays opt-in.
+    const legitimateWait =
+      frame.settleReason === 'WAITING_ON_TIMER' || frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&

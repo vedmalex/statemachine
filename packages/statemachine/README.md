@@ -293,9 +293,27 @@ if (!report.ok) throw new Error(`checkMachine failed: ${report.failedOn.join(', 
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 
+## Performance
+
+The composite-write hot path (`setCurrentState` region-conflict scan and the
+all-regions-final completion check) is **O(R)** in the number of parallel regions
+R. Two former Θ(R²) sites — the per-part conflict scan and the per-region
+completion scan — were reduced to linear (measured with a deterministic counting
+probe over R ∈ {40…320}: ~65× → ~8× growth per 8× region increase), behaviour
+preserved (the full suite is the oracle). Entering a leaf is a dot-boundary-exact
+region replacement, so a prefix-named sibling region (`r1` vs `r10`) is never
+evicted.
+
 ## Known gaps in 1.0.0-beta
 
 - **Multi-runtime CI (Tier B)**: Deno + Browser smokes run with `continue-on-error: true` and are tracked for full enablement at stable 1.0.0.
+- **`checkMachine` (dynamic check)**: fuzzing, not model-checking (see
+  [`docs/dynamic-check.md`](./docs/dynamic-check.md)). Object-valued event payloads
+  are not yet driven end-to-end (arg-free fuzzing + a `no-payload` advisory today);
+  `guardOutcomes` / `nonConvergingRegions` and shrink-minimized repro traces are
+  reserved report fields. The `I-4`/`I-5` sim oracles are documented no-ops (their
+  enter-order / parallel-join-miss classes are not soundly observable from the
+  content-only trace) — the converse done-event gating IS enforced (`I-12`).
 
 ## Known internal debt (Phase 1)
 

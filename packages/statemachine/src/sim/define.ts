@@ -54,6 +54,18 @@ export const DEFAULT_GENOPS_PARAMS: GenOpsParams = {
 export const SCENARIO_RUNTIME = 'node-sim-v1'
 
 /**
+ * Cheap syntactic gate on a literal-callback `source` BEFORE it reaches
+ * `new Function` (W7 U2 / task #26 / defect B4-учёт). NOT a sandbox and NOT an
+ * attacker mitigation — a determined caller can still craft a `source` that
+ * matches this pattern and does harm; it is fail-fast hygiene against an
+ * empty/malformed/non-function `source` (e.g. an accidental `''`, `undefined`
+ * coerced to a string, or a stray non-callable expression) reaching the
+ * compiler, with a message that names the TRUSTED-INPUT-ONLY boundary instead
+ * of surfacing an opaque `SyntaxError` from inside `new Function`.
+ */
+const FUNCTION_LITERAL_PATTERN = /^(async\s+)?function\b|=>/
+
+/**
  * Re-create the live function for a closure-free literal callback. The source is
  * a function-EXPRESSION reading only its parameter; we re-create it through the
  * same restricted-scope contract the engine uses (`security.ts:640`) so a
@@ -62,8 +74,27 @@ export const SCENARIO_RUNTIME = 'node-sim-v1'
  * NOTE: this is the harness-side re-eval used when a {@link ScenarioSpec} arrives
  * as pure JSON (no live `fn`); the generator's own `fn` is used directly when
  * present. The created function ignores extra args and reads only the owner.
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26). `source` is COMPILED via
+ * `new Function` below; the {@link FUNCTION_LITERAL_PATTERN} guard is fail-fast
+ * hygiene on an empty/malformed source, NOT a sandbox — it does not defend
+ * against a crafted, syntactically-valid-looking malicious literal. Callers
+ * MUST treat `source` as author-side trusted input (see `./index` barrel doc
+ * and `toEngineConfig`/`runScenario` for the full contract). The engine's own
+ * untrusted-JSON path (`StateMachine.fromJSON`/`fromSecureJSON`) never reaches
+ * this function — it resolves callbacks by NAME from a caller-supplied
+ * `FunctionRegistry` (`state_machine.ts` `deserializeAction`), never compiling
+ * a source string.
  */
 function recreateLiteral(source: string): (...args: unknown[]) => unknown {
+  const trimmed = typeof source === 'string' ? source.trim() : ''
+  if (trimmed.length === 0 || !FUNCTION_LITERAL_PATTERN.test(trimmed)) {
+    const shown = typeof source === 'string' ? source : String(source)
+    const truncated = shown.length > 120 ? `${shown.slice(0, 120)}…` : shown
+    throw new Error(
+      `recreateLiteral: refusing to compile a non-function / empty source '${truncated}' — trusted author-side function literals only`,
+    )
+  }
   // Mirror security.ts:640: shadow dangerous globals, evaluate the source as an
   // expression, call it with (adaptee, ...args). Closure-free source survives.
   const executor = new Function(
@@ -85,6 +116,30 @@ function recreateLiteral(source: string): (...args: unknown[]) => unknown {
   `,
   ) as (adaptee: unknown, args: unknown[]) => unknown
   return (adaptee: unknown, ...args: unknown[]) => executor(adaptee, args)
+}
+
+/**
+ * `InvokeSpec.cond`/`InvokeSpec.action` are typed as {@link LiteralCallback},
+ * but an off-label / hand-rolled `TopologySpec` (e.g. a coverage-harness
+ * fixture proving the string-method-invoke residual, ISS-029) may pass a bare
+ * STRING method-name instead. A bare string has no `.source`, so calling
+ * {@link recreateLiteral} on it would now hit the new guard and throw at
+ * config-BUILD time — a behavior change from the pre-guard code (which
+ * compiled `(${undefined})` without erroring until the wrapper was actually
+ * invoked). Preserve pass-through for anything that is not LiteralCallback
+ * SHAPED (an object with a string `.source`): only a genuine literal-callback
+ * value is compiled; anything else (e.g. a string method-name reference)
+ * flows to the engine unchanged, exactly as a `string | Action` field would.
+ */
+function recreateLiteralIfShaped(value: unknown): unknown {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { source?: unknown }).source === 'string'
+  ) {
+    return recreateLiteral((value as { source: string }).source)
+  }
+  return value
 }
 
 /**
@@ -138,10 +193,10 @@ function toEngineState(spec: StateSpec): Record<string, unknown> {
     out['invoke'] = spec.invoke.map((inv) => {
       const e: Record<string, unknown> = { delay: inv.delay, event: inv.event }
       if (inv.cond) {
-        e['cond'] = recreateLiteral(inv.cond.source)
+        e['cond'] = recreateLiteralIfShaped(inv.cond)
       }
       if (inv.action) {
-        e['action'] = recreateLiteral(inv.action.source)
+        e['action'] = recreateLiteralIfShaped(inv.action)
       }
       return e
     })
