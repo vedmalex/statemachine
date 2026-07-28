@@ -264,6 +264,32 @@ export class StateMachine<
     args: any[],
     type: 'internal' | 'external',
   ): Promise<boolean> {
+    // П3: a reentrant external `fireEvent` issued from WITHIN the processing
+    // stack (an onEnter/onExit/onTransition/guard that does `await
+    // sm.fireEvent(...)`) can never be drained — the single-threaded drain is
+    // already suspended on that very action, so `isProcessing` stays true, the
+    // reentrant event sits behind it forever, the outer promise never settles,
+    // and the public API (canFireEvent/getAvailableEvents) lies. Reject it
+    // immediately with a clear error. `isProcessing === true` at an EXTERNAL
+    // enqueue can ONLY happen from inside the drain (external code runs while
+    // the drain is idle, i.e. isProcessing === false), so this never rejects a
+    // legitimate outside-the-drain queue of consecutive external fireEvents.
+    // The internal `raiseEvent` path (used by invoke timers and `done.state.*`
+    // completion) bypasses enqueueEvent entirely and stays the legal way to
+    // post an event from within an action.
+    if (type === 'external' && this.isProcessing) {
+      const _sr = this.getCurrentState(obj)
+      return Promise.reject(
+        new StateMachineError(
+          'Reentrant fireEvent from within an action/guard is not supported; ' +
+            'raise an internal event instead',
+          {
+            ...(_sr !== undefined ? { state: _sr } : {}),
+            event: eventName,
+          },
+        ),
+      )
+    }
     if (
       this.externalQueue.length + this.internalQueue.length >=
       this.maxQueueDepth
@@ -332,49 +358,137 @@ export class StateMachine<
     /* c8 ignore next */
     if (this.isProcessing) return
     this.isProcessing = true
+    // П8: run-away bound is counted PER DRAIN — the number of transitions this
+    // single continuous drain has processed — NOT the recursion depth around one
+    // `await`. The old `transitionDepth++/--` around a single await could only
+    // ever reach {0,1}, so MAX_TRANSITION_DEPTH was unreachable by construction
+    // and a self-sustaining internal loop (queue held at 0-1) starved the
+    // macrotask queue forever. A flat per-drain iteration counter closes that.
+    this.transitionDepth = 0
 
     try {
       while (this.internalQueue.length > 0 || this.externalQueue.length > 0) {
         if (this.transitionDepth >= this.MAX_TRANSITION_DEPTH) {
           const _s1 = this.getCurrentState()
-          /* c8 ignore next */
+          const runawayCtx: ErrorContext = {
+            ...(_s1 !== undefined ? { state: _s1 } : {}),
+            event: 'processQueues',
+          }
           const error = new StateMachineError(
             'Max transition depth exceeded — possible infinite loop',
-            /* c8 ignore next */
-            { ...(_s1 !== undefined ? { state: _s1 } : {}), event: 'processQueues' },
+            runawayCtx,
           )
+          // П8: the run-away MUST be OBSERVABLE (monitor / onError), not a silent
+          // self-limit and not a floating `unhandledRejection` out of the drain
+          // microtask — the simulator has to see it as a violation, not silence.
+          this.reportRuntimeError(error, runawayCtx, this.adaptee)
+          // Pending EXTERNAL callers must be settled, never left hanging.
           while (this.externalQueue.length > 0) {
             const evt = this.externalQueue.shift()!
             evt.reject?.(error)
           }
           this.internalQueue.length = 0
-          throw error
+          break
         }
 
         if (this.internalQueue.length > 0) {
-          const evt = this.internalQueue.shift()!
+          // П8: the run-away bound counts ONLY internal (raised) transitions —
+          // a self-sustaining loop is an ACTION re-raising the same event. An
+          // EXTERNAL event is a fresh RTC macrostep (see the external branch,
+          // which resets the counter), so a legitimate synchronous batch of
+          // >100 external fireEvent calls drained in one processQueues pass must
+          // NOT trip the bound. Incrementing before the branch (as the first П8
+          // fix did) counted external events too and falsely rejected the 101st.
           this.transitionDepth++
+          const evt = this.internalQueue.shift()!
           try {
             await this.executeQueuedTransition(evt)
-          } finally {
-            this.transitionDepth--
+          } catch (error) {
+            // П2: a throw in the INTERNAL branch (e.g. an invoke timer that
+            // raised an unknown event, or a `done.state.*` completion event with
+            // no matching transition) must NOT kill the drain nor escape the
+            // floating `queueMicrotask(processQueues)` as a real process
+            // `unhandledRejection`. Report it through the OBSERVABLE channel and
+            // keep draining the remaining queued events.
+            const err = error instanceof Error ? error : new Error(String(error))
+            const _s = this.getCurrentState(evt.obj)
+            this.reportRuntimeError(
+              err,
+              {
+                ...(_s !== undefined ? { state: _s } : {}),
+                event: String(evt.eventName),
+              },
+              evt.obj,
+            )
           }
         } else {
+          // An external event begins a fresh RTC macrostep — reset the run-away
+          // counter so a long batch/stream of external events never accumulates
+          // toward MAX_TRANSITION_DEPTH (that bound is for internal self-loops).
+          this.transitionDepth = 0
           const evt = this.externalQueue.shift()!
-          this.transitionDepth++
           try {
             const result = await this.executeQueuedTransition(evt)
             evt.resolve?.(result)
           } catch (error) {
             evt.reject?.(error)
-          } finally {
-            this.transitionDepth--
           }
         }
       }
     } finally {
       this.isProcessing = false
       this.transitionDepth = 0
+    }
+  }
+
+  /**
+   * П2 / П8: route a runtime/internal-drain error to an OBSERVABLE channel
+   * (`monitor.recordError` and/or the config-level `onError`) WITHOUT letting it
+   * escape the floating drain microtask as a process `unhandledRejection`. This
+   * is the visibility contract the simulator (W5 sim A1) relies on to see a
+   * failure as a violation instead of silence. Never throws.
+   */
+  private reportRuntimeError(
+    error: Error,
+    context: ErrorContext,
+    obj?: Adapter<PropertiesOf<TOwner>>,
+  ): void {
+    // Channel #1 — monitor.recordError, gated by the error handler exactly like
+    // the external-branch path in applyTransition.
+    if (this.errorHandler.isEnabled()) {
+      try {
+        this.monitor.recordError(error, context)
+      } catch {
+        /* a monitor sink must never break the drain */
+      }
+    }
+    // Channel #2 — config-level onError (best-effort). A rejecting/throwing
+    // handler is logged, never re-thrown into the drain.
+    if (this.onError !== undefined) {
+      const target = (obj ?? this.adaptee) as unknown as
+        | Adapter<TOwner>
+        | undefined
+      if (target) {
+        try {
+          const handler = this.processError(target, context, this.onError)
+          const r = handler(target, error) as unknown
+          if (r instanceof Promise) {
+            r.catch((e) =>
+              this.logger.error(
+                'onError handler rejected',
+                context,
+                e instanceof Error ? e : new Error(String(e)),
+              ),
+            )
+          }
+        } catch (e) {
+          this.logger.error(
+            'onError handler threw',
+            context,
+            e instanceof Error ? e : new Error(String(e)),
+          )
+        }
+      }
     }
   }
 
@@ -2896,13 +3010,15 @@ export class StateMachine<
               if (invocation.action && this.adaptee) {
                 await this.callAction(this.adaptee as any, invocation.action)
               }
-              await this.fireEvent(invocation.event as any).catch((err) => {
-                this.logger.error(
-                  'Resumed timer transition error',
-                  { state: stateName, event: invocation.event },
-                  err,
-                )
-              })
+              // П3: an invoke-generated event is engine-internal, so it goes on
+              // the INTERNAL queue (like the primary invoke path in
+              // executeEnterActions) — never through the public external
+              // fireEvent, which the reentrancy guard would reject if this
+              // resumed timer happened to fire while a drain is in flight.
+              if (this.adaptee) {
+                this.raiseEvent(invocation.event as string, this.adaptee)
+                this.scheduleProcessing()
+              }
             } catch (_err) {
               /* log */
             }
