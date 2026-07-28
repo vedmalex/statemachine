@@ -202,6 +202,17 @@ function toEngineEvent(spec: EventSpec): Record<string, unknown> {
 /**
  * Build the engine {@link StateMachineConfig} from a {@link TopologySpec}. All
  * callbacks are live functions (closure-free literal bodies).
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt). Every callback
+ * `source` string in `topology` is COMPILED via `new Function` in
+ * {@link recreateLiteral} (define.ts). The restricted-scope shadowing there is
+ * a hardening measure, NOT a sandbox: a crafted `source` is RCE-class. Treat
+ * `topology` (and any {@link ScenarioSpec} / {@link TopologySpec} you pass here
+ * or to {@link runScenario}) as a TRUSTED author-side input. NEVER feed
+ * untrusted JSON — a JSON payload carrying `source` strings would be compiled
+ * and executed. This is a harness/author surface exposed through the public
+ * `./sim` entry; the engine's own JSON deserialization (`StateMachine.fromJSON`)
+ * never compiles bodies and is the path for untrusted input.
  */
 export function toEngineConfig<T extends object = { state: string; log: number[]; k: number }>(
   topology: TopologySpec,
@@ -322,6 +333,14 @@ function toDriverOp(op: Op): DriverOp | null {
  * and return the canonical content-only trace. Pure in `(spec.seed, spec,
  * header.runtime)`: two calls with the same spec produce a bit-identical
  * `traceHash` (proven by `replay.test.ts`).
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt). `spec` is a
+ * TRUSTED author-side input. Its callback `source` strings are COMPILED via
+ * `new Function` ({@link recreateLiteral} / {@link toEngineConfig}); the
+ * restricted-scope shadowing is hardening, NOT a sandbox, so a crafted `source`
+ * is RCE-class. NEVER pass a `ScenarioSpec` reconstructed from untrusted JSON —
+ * its `source` strings would be compiled and executed. Untrusted input belongs
+ * on the engine's non-compiling `StateMachine.fromJSON` path instead.
  */
 export async function runScenario(spec: ScenarioSpec): Promise<CanonicalTrace> {
   defineScenario(spec)

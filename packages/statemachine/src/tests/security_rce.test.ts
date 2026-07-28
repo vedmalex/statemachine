@@ -142,6 +142,72 @@ describe('W0 RCE — string function bodies must not be executed on deserializat
     expect((globalThis as any)[MARKER]).toBeUndefined()
   })
 
+  it('B1: a bare-string guard named after a prototype builtin must NOT resolve (no authz bypass)', async () => {
+    // Forged config: guard is the RAW STRING 'constructor'. deserializeAction
+    // passes bare strings through untouched, so at fireEvent time the guard is
+    // resolved by NAME against context/adaptee. `context['constructor']` /
+    // `adaptee['constructor']` walk the prototype chain to Object.prototype's
+    // `constructor` (itself typeof 'function'), the guard is invoked, returns a
+    // truthy value, and the transition a->b is ALLOWED — an authorization bypass
+    // straight out of untrusted JSON, with no registry involved.
+    //
+    // Invariant: a guard name that is NOT an OWN property of context/owner must
+    // fail to resolve (guard not satisfied) and the machine must NOT transition.
+    const cfg = {
+      config: {
+        name: 'ForgedProtoGuardSM',
+        initialState: 'a',
+        stateAttribute: 'state',
+        states: { a: {}, b: {} },
+        events: {
+          go: {
+            transitions: [{ from: 'a', to: 'b', guard: 'constructor' }],
+          },
+        },
+      },
+      currentState: 'a',
+      historyMap: [],
+      stateEntryTimes: [],
+    }
+    const owner = new MemoryAdapter<Owner>({ state: '', event: () => null })
+    const sm = StateMachine.fromJSON<Owner, any>(JSON.stringify(cfg), owner)
+    await sm.fireEvent('go').catch(() => {})
+
+    // On the vulnerable HEAD the machine has moved to 'b'. It must stay in 'a'.
+    expect(sm.currentState).toBe('a')
+  })
+
+  it('B1: a {type:"string",name:"toString"} guard must NOT resolve to a prototype builtin', async () => {
+    // deserializeAction unwraps { type: 'string', name } to the bare string
+    // 'toString'. At fireEvent time `context['toString']` / `adaptee['toString']`
+    // resolve via the prototype chain to Object.prototype.toString (typeof
+    // 'function'), which returns a truthy string when invoked -> guard satisfied
+    // -> transition ALLOWED. Same authorization bypass, string-object branch.
+    const cfg = {
+      config: {
+        name: 'ForgedProtoStringGuardSM',
+        initialState: 'a',
+        stateAttribute: 'state',
+        states: { a: {}, b: {} },
+        events: {
+          go: {
+            transitions: [
+              { from: 'a', to: 'b', guard: { type: 'string', name: 'toString' } },
+            ],
+          },
+        },
+      },
+      currentState: 'a',
+      historyMap: [],
+      stateEntryTimes: [],
+    }
+    const owner = new MemoryAdapter<Owner>({ state: '', event: () => null })
+    const sm = StateMachine.fromJSON<Owner, any>(JSON.stringify(cfg), owner)
+    await sm.fireEvent('go').catch(() => {})
+
+    expect(sm.currentState).toBe('a')
+  })
+
   it('registry lookup is OWN-key only: a prototype name resolves to no function (V6b)', async () => {
     // A serialized function reference named after an Object.prototype member
     // ('constructor'/'toString'/…) must NOT resolve to a builtin via the

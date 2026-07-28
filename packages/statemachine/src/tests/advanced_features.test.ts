@@ -372,32 +372,66 @@ describe('Advanced Features: Wildcards & Timers', () => {
     expect(sm3.getCurrentState()).toBe('checked')
   })
 
-  it('should reject unsafe legacy function strings during deserialization', () => {
-    // This test demonstrates that unsafe function strings are blocked during deserialization
-    const safeConfig = {
-      name: 'SafeSM',
-      initialState: 'start',
+  it('does not compile or execute a function-body string injected into onEnter', async () => {
+    // W0 B2 — honest replacement for the former "reject unsafe legacy function
+    // strings" test, which injected via `.replace('"onEnter":null', …)`. That
+    // token never existed in the serialized JSON (serializeAction drops falsy
+    // handlers, so JSON.stringify omits the key entirely), making the replace a
+    // no-op: the test asserted only `toBeDefined()` and could not go red under
+    // ANY implementation — pure test theater.
+    //
+    // This version injects into a handler that is REALLY present in the JSON and
+    // asserts real behavior: an attacker-controlled function-body string placed
+    // in onEnter must be neither compiled into a callable nor executed. On the
+    // vulnerable (body-compiling) code path both assertions go red.
+    const MARKER = '__w0_b2_onenter_marker__'
+    delete (globalThis as any)[MARKER]
+
+    // Target-state onEnter is a real, present-in-JSON string reference.
+    // serializeAction passes strings through untouched, so the token appears
+    // verbatim in the serialized JSON and can be swapped for a forged body.
+    const config = {
+      name: 'OnEnterInjectSM',
+      initialState: 'a',
       stateAttribute: 'state',
       states: {
-        start: {},
+        a: {},
+        b: { onEnter: '__legit_onEnter__' },
       },
-      events: {},
+      events: {
+        go: { transitions: [{ from: 'a', to: 'b' }] },
+      },
     }
+    const sm = new StateMachine(config as any, new MemoryAdapter({ state: 'a' }))
+    const json = sm.toJSON()
 
-    const sm = new StateMachine(safeConfig as any)
-    const jsonData = sm.toJSON()
+    // Guard against silent-no-op injection (the exact defect this test replaces):
+    // the onEnter reference MUST really be present in the serialized JSON.
+    expect(json).toContain('"onEnter":"__legit_onEnter__"')
 
-    // Manually inject unsafe function string (simulating malicious JSON)
-    const maliciousJson = jsonData.replace(
-      '"onEnter":null',
-      '"onEnter":"function() { process.exit(1) }"',
+    // Forge a raw arrow-function-body string that stamps a global marker.
+    const body = "() => { globalThis['" + MARKER + "'] = 'pwned'; return true }"
+    const maliciousJson = json.replace(
+      '"__legit_onEnter__"',
+      JSON.stringify(body),
+    )
+    expect(maliciousJson).toContain(MARKER) // injection actually landed
+
+    const restored = StateMachine.fromJSON(
+      maliciousJson,
+      new MemoryAdapter({ state: 'a' }),
     )
 
-    // Should not crash - the unsafe function should be rejected and set to undefined
-    const deserializedSM = StateMachine.fromJSON(maliciousJson)
+    // (b) The injected body must NOT have been compiled into a function.
+    const restoredOnEnter = (restored as any).states.get('b')?.onEnter
+    expect(typeof restoredOnEnter).not.toBe('function')
 
-    // The unsafe function should be undefined, not executed
-    expect(deserializedSM).toBeDefined()
-    // Since onEnter is undefined, it won't cause issues
+    // Trigger entry into 'b' so any (wrongly) compiled onEnter would run.
+    await restored.fireEvent('go').catch(() => {})
+
+    // (a) The attacker-controlled string must never have executed.
+    expect((globalThis as any)[MARKER]).toBeUndefined()
+
+    delete (globalThis as any)[MARKER]
   })
 })

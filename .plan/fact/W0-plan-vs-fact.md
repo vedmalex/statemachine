@@ -45,8 +45,30 @@ FunctionRegistry), security_rce.test.ts (новый, 3 теста) + 6 тест�
 - critic-приёмка (fable) — в процессе; при REJECT → правочная под-волна до перехода в W1.
 - Задача #26 (sim/define eval) — отложена в W5/W6 обоснованно (вне attacker-surface).
 
-## Вывод
+## W0.1 — доработка по critic-приёмке (ACCEPT С ЗАМЕЧАНИЯМИ)
 
-Критерий закрытия П1 достигнут и подтверждён независимо (оркестратор-прогон + adversarial-verify).
-Scope не сокращён; расширен на V6b и учёт второго eval-пути (§0.6). Переход в W1 — после ACCEPT
-критика приёмки.
+Critic-приёмка (fable) нашла: V6b закрыт в 1 точке из 3. Проверено оркестратором ЗАПУСКОМ до правки:
+`guard='constructor'` голой строкой из forged JSON → машина переходит (обход авторизации). Закрыто:
+
+| id | что | подтверждение |
+|---|---|---|
+| B1 [HIGH] | prototype-обход на call-time резолве строк | `RESERVED_ACTION_NAMES` + `Object.hasOwn` на context (1922/1877), reserved-gate на adaptee (1946); `types.ts:374` не тронут (легит-чтения целы). Verify: 16+ векторов BLOCKED, легит owner-method/context-DI резолв PASS. Red проверен откатом |
+| B2 | тест-театр (`.replace` по несуществующей подстроке) | переписан в честный: строка-тело в onEnter, маркер НЕ установлен + onEnter не function; `b2CanRedden:true` |
+| B3 | нет стража на возврат eval | `security_source_scan.test.ts` (4 теста): 0 `new Function`/`eval` в non-test src кроме whitelist `sim/define.ts`; `b3Present:true` |
+| B4 [учёт] | sim/define — RCE-класс в публичном `./sim` | doc-warning на `toEngineConfig`/`runScenario` + `sim/index.ts`; полное закрытие → #26/W5 |
+| A | лживый JSDoc `fromSecureJSON` «Verifies cryptographic hashes» | исправлен на честный |
+| A-residual | симметричная ложь в `toSecureJSON:2742` (verify поймал, grep implementer пропустил) | исправлен оркестратором |
+
+Итог W0.1: **807 passed / 0 failed; tsc чисто** (оркестратор-прогон). Легит-резолв не сломан.
+
+## Остаётся в W0.2 (до W1, §0.6 — разбито на под-волны, не сокращено)
+
+- **C1 [HIGH]** реестр по `fn.name`: коллизия слотов (проверено запуском — 3 разных onEnter → одно имя) + рекурсия по regions (тихая потеря вложенных callbacks) — задача #28.
+- Полуживой `security.ts` (~250 строк мёртвого blocklist) + nameless-асимметрия — задача #29.
+
+## Вывод W0 (ядро + W0.1)
+
+RCE-путь `fromJSON`/`fromSecureJSON` закрыт полностью и подтверждён независимо (оркестратор-прогон +
+adversarial-verify + critic-приёмка). Обход авторизации строкой закрыт. Scope только расширялся
+(V6b, B1-B4, A-residual, второй eval-путь) — §0.6 соблюдён. Переход в W1 — ПОСЛЕ W0.2 (корректность
+сериализации), чтобы RCE-волна закрылась целиком.

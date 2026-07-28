@@ -99,6 +99,12 @@ export type {
 } from './env'
 
 // --- Step-4 scenario generator (VALUE symbols) ---
+// ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt): `toEngineConfig`
+// and `runScenario` COMPILE each callback `source` string via `new Function`
+// (define.ts `recreateLiteral`). The restricted-scope shadowing is hardening,
+// NOT a sandbox — a crafted `source` is RCE-class. Pass ONLY author-side trusted
+// specs; NEVER a ScenarioSpec/TopologySpec reconstructed from untrusted JSON.
+// Untrusted input belongs on the non-compiling `StateMachine.fromJSON` path.
 export { genConfig } from './topology'
 export type { GeneratedTopology } from './topology'
 export { genOps } from './ops'

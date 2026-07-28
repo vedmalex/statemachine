@@ -36,6 +36,42 @@ import {
 // Removed unused helper functions serializeAction and deserializeAction
 // These functions are available through safeFunctionSerializer directly when needed
 
+/**
+ * Prototype-chain builtin names that must NEVER be call-time-resolved as an
+ * action / guard / error-handler by bare-name lookup (W0 B1).
+ *
+ * A serialized (untrusted-JSON) action whose name is a member of
+ * `Object.prototype` / `Function.prototype` — `constructor`, `toString`,
+ * `valueOf`, `hasOwnProperty`, `__proto__`, … — would otherwise resolve, via a
+ * bare bracket access (`adaptee[name]` inside `MemoryAdapter.get`), to a
+ * prototype builtin. Each such builtin is itself `typeof 'function'`, so it is
+ * invoked as if it were a legitimate guard; the invocation returns a truthy
+ * value and the transition is ALLOWED — an authorization/allow bypass straight
+ * out of untrusted JSON, with no function registry involved. This is the
+ * string-branch sibling of the object-branch V6b fix in `deserializeAction`.
+ *
+ * The gate is applied at the RESOLUTION call-site (before `obj.get(name)`), not
+ * inside `MemoryAdapter.get`, so legitimate *data* reads through `get` keep
+ * their prior behavior, and a legitimate owner method whose name is NOT a
+ * prototype builtin still resolves normally. A name that is neither an own
+ * property nor a member of this set simply reads back `undefined` and fails
+ * closed to the existing "No action found" throw.
+ */
+const RESERVED_ACTION_NAMES: ReadonlySet<string> = new Set<string>([
+  ...Object.getOwnPropertyNames(Object.prototype),
+  ...Object.getOwnPropertyNames(Function.prototype),
+  'prototype',
+  '__proto__',
+])
+
+/**
+ * True when `name` is a prototype-builtin identifier that must not be
+ * call-time-resolved as an action/guard/handler by bare-name lookup (W0 B1).
+ */
+function isReservedActionName(name: unknown): boolean {
+  return typeof name === 'string' && RESERVED_ACTION_NAMES.has(name)
+}
+
 // ✅ НОВОЕ: Default implementation для Lite режима (No-Op или Console)
 const ConsoleLogger: ILogger = {
   debug: () => { }, // По умолчанию выключено для Lite
@@ -813,8 +849,20 @@ export class StateMachine<
   }
 
   /**
-   * Securely deserializes a StateMachine from JSON string (Async).
-   * Verifies cryptographic hashes of serialized functions.
+   * Deserializes a StateMachine from a JSON string (Async).
+   *
+   * Behaviorally IDENTICAL to {@link fromJSON}, differing only in that it awaits
+   * the async deserialization path; it is retained as an async-compatible form.
+   * It does NOT verify cryptographic hashes and does NOT compile serialized
+   * function bodies — since W0 (defect П1) function bodies are never restored to
+   * executable code by any deserialization path; functions are resolved BY NAME
+   * from the caller-supplied `options.actions` registry. There is no
+   * "secure/insecure" distinction: `fromJSON` is equally non-compiling.
+   *
+   * The name is a historical misnomer (an earlier keyed-hash scheme, now
+   * removed). Payload authenticity/integrity is NOT checked here and is the
+   * responsibility of the TRANSPORT (e.g. TLS, a signed envelope) — a forged
+   * payload cannot inject executable code, but it can still forge configuration.
    */
   public static async fromSecureJSON<
     TOwner extends object,
@@ -1822,9 +1870,16 @@ export class StateMachine<
           action
             ? typeof action === 'function'
               ? action
+              // OWN-key on context + prototype-builtin rejection on the adaptee
+              // path: an untrusted onError name like 'constructor' / 'toString'
+              // must not resolve to an Object.prototype builtin and run (W0 B1).
               : (this.context &&
-                ((this.context as Record<string, unknown>)[action as string] as ErrorHandler<TOwner>)) ||
-              (adaptee.get(action) as ErrorHandler<TOwner>)
+                Object.hasOwn(this.context as object, action as string)
+                ? (this.context as Record<string, unknown>)[action as string] as ErrorHandler<TOwner>
+                : undefined) ||
+              (isReservedActionName(action)
+                ? undefined
+                : (adaptee.get(action) as ErrorHandler<TOwner>))
             : undefined,
         )
         .filter(Boolean)
@@ -1856,8 +1911,16 @@ export class StateMachine<
 
     const executeAction = async (): Promise<CallResult | void> => {
       try {
-        // 1. Check in Context (Dependency Injection)
-        if (this.context && (this.context as Record<string, unknown>)[actionName as string]) {
+        // 1. Check in Context (Dependency Injection). OWN-key only: a bare
+        // bracket access walks the prototype chain, so an untrusted name like
+        // 'constructor' / 'toString' would resolve to an Object.prototype
+        // builtin (itself typeof 'function') and be invoked as a guard/action —
+        // an authorization bypass out of untrusted JSON (W0 B1). Object.hasOwn
+        // confines resolution to the context's OWN DI entries.
+        if (
+          this.context &&
+          Object.hasOwn(this.context as object, actionName as string)
+        ) {
           const action = (this.context as Record<string, unknown>)[actionName as string] as EventAction<
             TOwner,
             CallResult
@@ -1875,8 +1938,12 @@ export class StateMachine<
           return result instanceof Promise ? await result : result
         }
 
-        // 3. Check in Object/Adaptee (Data Context)
-        else if (obj.get(actionName as any)) {
+        // 3. Check in Object/Adaptee (Data Context). Reject prototype-builtin
+        // names BEFORE the lookup so the bare bracket read inside the adapter's
+        // get() cannot resolve 'constructor' / 'toString' / … to a callable
+        // builtin and invoke it (W0 B1). Legitimate own/method names whose
+        // identifier is not a prototype builtin are unaffected.
+        else if (!isReservedActionName(actionName) && obj.get(actionName as any)) {
           const action = obj.get(actionName as any)
           /* c8 ignore next */
           if (typeof action === 'function') {
@@ -2671,8 +2738,13 @@ export class StateMachine<
   }
 
   /**
-   * Securely serializes the StateMachine to JSON (Async).
-   * Generates cryptographic hashes for all functions.
+   * Serializes the StateMachine to JSON (Async). Behaviourally the async form
+   * of {@link toJSON}: functions are serialized as NAME references only — no
+   * body, no hashing, no crypto (W0 defect П1: the keyed-hash scheme was
+   * removed). The "secure" name is a historical misnomer kept for API
+   * compatibility. Payload integrity/authenticity is the transport's
+   * responsibility (TLS / a signed envelope); a forged payload cannot inject
+   * code but can still forge configuration.
    */
   public async toSecureJSON(): Promise<string> {
     const serializedStates: Record<string, any> = {}
