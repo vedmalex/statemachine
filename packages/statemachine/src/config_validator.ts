@@ -304,18 +304,6 @@ export class ConfigValidator {
     return part.includes('*')
   }
 
-  /** Nearest ancestor of `id` whose kind is 'region', or null. */
-  private nearestRegionAncestor(id: string): string | null {
-    let cur = this.nodeOf(id)?.parent ?? null
-    while (cur) {
-      const n = this.nodeOf(cur)
-      if (!n) break
-      if (n.kind === 'region') return cur
-      cur = n.parent
-    }
-    return null
-  }
-
   /** True when `a` is a proper ancestor of `b` in the model tree. */
   private isAncestor(a: string, b: string): boolean {
     if (a === b) return false
@@ -325,6 +313,89 @@ export class ConfigValidator {
       cur = this.nodeOf(cur)?.parent ?? null
     }
     return false
+  }
+
+  /** Ancestor chain of `id`, ROOT-first, including `id` itself. */
+  private ancestorsWithSelf(id: string): string[] {
+    const chain: string[] = []
+    let cur: string | null = id
+    while (cur) {
+      chain.push(cur)
+      cur = this.nodeOf(cur)?.parent ?? null
+    }
+    return chain.reverse()
+  }
+
+  /**
+   * M-4 — lowest common ancestor of `a` and `b` in the model tree, or `null`
+   * when they share none (both diverge at the virtual root — different root
+   * states / different root composites).
+   */
+  private lcaOf(a: string, b: string): string | null {
+    const ca = this.ancestorsWithSelf(a)
+    const cb = new Set(this.ancestorsWithSelf(b))
+    let lca: string | null = null
+    for (const node of ca) {
+      if (cb.has(node)) lca = node
+      else break
+    }
+    return lca
+  }
+
+  /**
+   * M-4 — whether two DISTINCT model nodes can never be co-active.
+   *
+   * Mutually exclusive when they diverge inside an XOR context:
+   *   - their LCA is a `region` node (one active leaf per region); or
+   *   - they are both ROOT states (LCA is the virtual root, and only one root
+   *     state is active at a time).
+   * They are NOT exclusive when their LCA is a parallel `composite` (its regions
+   * run concurrently), nor when one is an ancestor of the other (the ancestor is
+   * active whenever the descendant is).
+   */
+  private mutuallyExclusive(a: string, b: string): boolean {
+    if (a === b) return false
+    if (this.isAncestor(a, b) || this.isAncestor(b, a)) return false
+    const lca = this.lcaOf(a, b)
+    if (lca === null) {
+      // No shared ancestor: both live under the root XOR. Only flag simple root
+      // states (depth 0) — descendants of DIFFERENT root composites are left to
+      // the composite-level analysis and stay unflagged here.
+      return this.nodeOf(a)?.parent === null && this.nodeOf(b)?.parent === null
+    }
+    return this.nodeOf(lca)?.kind === 'region'
+  }
+
+  /**
+   * M-4 — flag a `|`-composite `from`/`to` when any pair of its concrete parts is
+   * mutually exclusive. Emits `code` once per offending transition side.
+   */
+  private checkMutualExclusion(
+    value: unknown,
+    code: 'UNSATISFIABLE_FROM' | 'UNSATISFIABLE_TO',
+    path: string,
+    side: 'from' | 'to',
+    consequence: string,
+  ): void {
+    if (typeof value !== 'string' || value.indexOf('|') === -1) return
+    if (!this.model) return
+    const parts = value
+      .split('|')
+      .filter((p) => p && !this.isWildcardPart(p) && this.model!.nodes.has(p))
+    for (let i = 0; i < parts.length; i++) {
+      for (let j = i + 1; j < parts.length; j++) {
+        if (this.mutuallyExclusive(parts[i]!, parts[j]!)) {
+          this.addError(
+            code,
+            `Composite ${side} "${value}" names two mutually-exclusive states ("${parts[i]}", "${parts[j]}") that can never be co-active — ${consequence}`,
+            path,
+            undefined,
+            `A composite \`${side}\` must name at most one state per XOR region; put states from DIFFERENT parallel regions on each side of '|'.`,
+          )
+          return
+        }
+      }
+    }
   }
 
   /** Region entry child id (region.initial || first key), NOT recursively resolved. */
@@ -356,16 +427,51 @@ export class ConfigValidator {
       this.markConfiguration(String(smConfig.initialState))
     }
 
+    // M-2: a transition's `to` is reachable ONLY once its `from` is reachable.
+    // Seeding every `to` unconditionally over-approximated the reachable set and
+    // masked a region whose only path to `final` starts on an unreachable island
+    // (REGION_NO_PATH_TO_FINAL was never raised). Iterate to a fixpoint: on each
+    // pass mark the `to` configuration of every transition whose `from` is now
+    // enabled, until the reachable set stops growing.
+    const transitions: Array<{ from: string; to: string }> = []
     for (const event of Object.values(smConfig.events ?? {})) {
       if (!event || !Array.isArray(event.transitions)) continue
       for (const t of event.transitions) {
         if (typeof t?.to !== 'string') continue
+        transitions.push({ from: typeof t.from === 'string' ? t.from : '', to: t.to })
+      }
+    }
+
+    let changed = true
+    while (changed) {
+      changed = false
+      const before = this.reachableSet.size
+      for (const t of transitions) {
+        if (!this.isFromEnabled(t.from)) continue
         for (const part of t.to.split('|')) {
           if (!part || this.isWildcardPart(part)) continue
           if (this.model.nodes.has(part)) this.markConfiguration(part)
         }
       }
+      if (this.reachableSet.size !== before) changed = true
     }
+  }
+
+  /**
+   * M-2 — whether a transition `from` can fire given the current reachable set.
+   * A `from` is enabled when it is absent (unconditional), any part is a wildcard
+   * (fires from whatever is reachable), or any concrete part is itself reachable
+   * (a `from` part is a configuration member: leaf, region, or composite ancestor,
+   * all of which `markConfiguration` records).
+   */
+  private isFromEnabled(from: string): boolean {
+    if (!from) return true
+    for (const part of from.split('|')) {
+      if (!part) continue
+      if (this.isWildcardPart(part)) return true
+      if (this.reachableSet.has(part)) return true
+    }
+    return false
   }
 
   /** Mark the full active configuration that contains `id` (id + ancestors, and all sibling regions of composite ancestors at their initials). */
@@ -936,43 +1042,48 @@ export class ConfigValidator {
       }
     }
 
-    // UNSATISFIABLE_FROM — a composite `from` names two DISTINCT states of the
-    // SAME region ('P.a.x|P.a.y'); a region can hold only one active leaf.
+    // UNSATISFIABLE_FROM / UNSATISFIABLE_TO — a composite `from`/`to` names two
+    // MUTUALLY EXCLUSIVE states that can never be co-active in one configuration.
+    // M-4: generalise the old "nearest-region-ancestor" comparison (which only
+    // caught two leaves of the SAME region) to LCA-exclusivity — two nodes are
+    // mutually exclusive when they diverge inside an XOR context (a region, or
+    // the root between two simple sibling states), NOT inside a parallel composite
+    // (whose regions run concurrently). A `from` naming both can never be enabled;
+    // a `to` naming both can never be entered (runtime collapses last-wins by
+    // regionKey).
     for (const [eventName, event] of Object.entries(smConfig.events ?? {})) {
       if (!event || !Array.isArray(event.transitions)) continue
       event.transitions.forEach((t, index) => {
-        if (typeof t?.from !== 'string' || t.from.indexOf('|') === -1) return
-        const parts = t.from
-          .split('|')
-          .filter((p) => p && !this.isWildcardPart(p))
-        const byRegion = new Map<string, string>()
-        for (const p of parts) {
-          const region = this.nearestRegionAncestor(p)
-          if (!region) continue
-          const prev = byRegion.get(region)
-          if (prev !== undefined && prev !== p) {
-            this.addError(
-              'UNSATISFIABLE_FROM',
-              `Composite from "${t.from}" names two states ("${prev}", "${p}") of the same region "${region}" — a region can hold only one active leaf, so this transition can never be enabled`,
-              `events.${eventName}.transitions[${index}].from`,
-              undefined,
-              `A composite \`from\` must name at most one leaf per region; put states from DIFFERENT parallel regions on each side of '|'.`,
-            )
-            break
-          }
-          byRegion.set(region, p)
-        }
+        this.checkMutualExclusion(
+          t?.from,
+          'UNSATISFIABLE_FROM',
+          `events.${eventName}.transitions[${index}].from`,
+          'from',
+          'so this transition can never be enabled',
+        )
+        this.checkMutualExclusion(
+          t?.to,
+          'UNSATISFIABLE_TO',
+          `events.${eventName}.transitions[${index}].to`,
+          'to',
+          'so this transition can never enter both (runtime collapses last-wins by region)',
+        )
       })
     }
 
     // DEAD_END_STATE (warning) — a non-root, non-final leaf with no way out: no
     // transition fires from it, from an ancestor of it, or from '*'.
     const fromParts = this.collectFromParts(smConfig)
+    // M-3: a leaf in a parallel region is NOT a dead end when its composite is
+    // left by a transition originating in a SIBLING region — that exit kills the
+    // whole composite (all its regions, including this leaf). Precompute the set
+    // of composites some transition leaves so a watcher-region leaf is credited.
+    const exitableComposites = this.computeExitableComposites(smConfig)
     for (const [id, node] of this.model.nodes) {
       if (node.kind !== 'leaf') continue
       if (node.depth === 0) continue // root terminal — legitimate
       if (node.isFinal) continue
-      if (this.hasExit(id, fromParts)) continue
+      if (this.hasExit(id, fromParts, exitableComposites)) continue
       this.addWarning(
         'DEAD_END_STATE',
         `State "${id}" is a dead end — it has no outgoing transition (and is not a final leaf)`,
@@ -1004,7 +1115,11 @@ export class ConfigValidator {
   }
 
   /** True when some transition can fire from leaf `id` (direct, ancestor, or wildcard). */
-  private hasExit(id: string, fromParts: Set<string>): boolean {
+  private hasExit(
+    id: string,
+    fromParts: Set<string>,
+    exitableComposites?: Set<string>,
+  ): boolean {
     // Collect id + all its ancestors (a transition from any of them exits `id`).
     const ancestry = new Set<string>()
     let cur: string | null = id
@@ -1022,7 +1137,55 @@ export class ConfigValidator {
       }
       if (ancestry.has(fp)) return true
     }
+    // M-3: a composite ANCESTOR of `id` that some transition leaves (via a
+    // sibling-region source) exits `id` too — so `id` is not a dead end.
+    if (exitableComposites && exitableComposites.size > 0) {
+      for (const anc of ancestry) {
+        if (anc === id) continue
+        if (exitableComposites.has(anc)) return true
+      }
+    }
     return false
+  }
+
+  /**
+   * M-3 — the set of composite ids that at least one transition EXITS: a
+   * transition with a `from` part inside composite C (C itself or a descendant)
+   * and a `to` part outside C leaves C entirely (and with it every region of C).
+   */
+  private computeExitableComposites<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): Set<string> {
+    const exitable = new Set<string>()
+    if (!this.model) return exitable
+    const isInside = (id: string, container: string): boolean =>
+      id === container || this.isAncestor(container, id)
+    for (const event of Object.values(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+      for (const t of event.transitions) {
+        if (typeof t?.from !== 'string' || typeof t?.to !== 'string') continue
+        const froms = t.from
+          .split('|')
+          .filter((p) => p && !this.isWildcardPart(p) && this.model!.nodes.has(p))
+        const tos = t.to
+          .split('|')
+          .filter((p) => p && !this.isWildcardPart(p) && this.model!.nodes.has(p))
+        if (froms.length === 0 || tos.length === 0) continue
+        for (const f of froms) {
+          // Composite ancestors of the source (C such that f is inside C).
+          let anc: string | null = this.nodeOf(f)?.parent ?? null
+          while (anc) {
+            const n = this.nodeOf(anc)
+            if (n?.kind === 'composite') {
+              // C is exited iff some `to` lands OUTSIDE C.
+              if (tos.some((to) => !isInside(to, anc!))) exitable.add(anc)
+            }
+            anc = n?.parent ?? null
+          }
+        }
+      }
+    }
+    return exitable
   }
 
   /**
@@ -1245,6 +1408,30 @@ export class ConfigValidator {
     // insertion order. Resolved THROUGH THE MODEL so the F10 dotted/parallel
     // initial ("a.run|b.run") is recognized as pinning and NOT falsely warned.
     if (this.model) {
+      // A BARE composite `initial` (e.g. 'work') can only pin a region if that
+      // key is UNIQUE across the composite's sibling regions — the engine
+      // (parseCompositeInitial) requires matches.length===1 and otherwise falls
+      // back to first-key. Mirror that gate here so validator-pinned ⟺
+      // runtime-enters-there (single source of truth): count bare-key
+      // occurrences per composite; a key seen in ≥2 sibling regions is
+      // ambiguous and must NOT be treated as pinning (W2.1 residual).
+      const bareKeyCountByComposite = new Map<string, Map<string, number>>()
+      for (const [rid, node] of this.model.nodes) {
+        if (node.kind !== 'region') continue
+        const compositeId = node.parent!
+        const rs = this.regionCfgById.get(rid)
+        if (!rs) continue
+        let counts = bareKeyCountByComposite.get(compositeId)
+        if (!counts) {
+          counts = new Map<string, number>()
+          bareKeyCountByComposite.set(compositeId, counts)
+        }
+        for (const k of Object.keys(rs)) {
+          if (k === 'initial') continue
+          counts.set(k, (counts.get(k) ?? 0) + 1)
+        }
+      }
+
       for (const [rid, node] of this.model.nodes) {
         if (node.kind !== 'region') continue
         const compositeId = node.parent!
@@ -1255,8 +1442,19 @@ export class ConfigValidator {
           : []
         if (regionKeys.length === 0) continue
         const compositeInitial = this.stateCfgById.get(compositeId)?.initial
+        const ambiguousBare = new Set<string>()
+        const counts = bareKeyCountByComposite.get(compositeId)
+        if (counts) {
+          for (const [k, c] of counts) if (c >= 2) ambiguousBare.add(k)
+        }
         if (
-          this.isRegionPinned(compositeInitial, regionName, regionKeys, rs)
+          this.isRegionPinned(
+            compositeInitial,
+            regionName,
+            regionKeys,
+            rs,
+            ambiguousBare,
+          )
         ) {
           continue
         }
@@ -1277,6 +1475,7 @@ export class ConfigValidator {
     regionName: string,
     regionKeys: string[],
     regionConfig: any,
+    ambiguousBare: ReadonlySet<string> = new Set(),
   ): boolean {
     // region's own `initial`
     if (
@@ -1289,8 +1488,11 @@ export class ConfigValidator {
     if (typeof compositeInitial !== 'string') return false
     for (const part of compositeInitial.split('|')) {
       if (!part) continue
-      // bare leaf key present in this region (generator / hierarchical form)
-      if (regionKeys.includes(part)) return true
+      // bare leaf key present in this region (generator / hierarchical form).
+      // Pins ONLY when unique across sibling regions — a key declared in ≥2
+      // regions is ambiguous; the engine cannot resolve it and falls back to
+      // first-key, so the validator must NOT claim it pinned (W2.1 residual).
+      if (regionKeys.includes(part) && !ambiguousBare.has(part)) return true
       // region-qualified dotted form ("a.run" pins region "a")
       if (part.startsWith(`${regionName}.`)) return true
     }

@@ -230,34 +230,42 @@ export type NestedStateName<S> = {
   : never
 }[keyof S & string]
 
-// Type for deeply nested state names (parent.region.child.subregion)
-export type DeepNestedStateName<S> = {
-  [K in keyof S & string]: S[K] extends { regions?: infer R }
-  ? R extends Record<string, any>
-  ? {
-    [RegKey in keyof R & string]: R[RegKey] extends Record<string, any>
+// H-1 — Recursively enumerate every ADDRESSABLE state path in a states-map `S`.
+//
+// A path is addressable iff it terminates at a STATE (a leaf OR a composite),
+// NEVER at a region container. From a states-map, the addressable paths are:
+//   - each state key `K` itself (`p`, `p.r.child`, …); and
+//   - when `K` is a composite, `K.<region>.<addressable-within-that-region>`
+//     for every region and every path addressable inside its states-map.
+// The alternation is state → region → state → region → …, so the LAST segment
+// is always a state. Region-container paths (`p.r`, `p.r.child.sub`) — which
+// throw INVALID_STATE_PATH at runtime — are excluded at EVERY depth, and the
+// recursion admits leaves of ARBITRARY depth (the depth ≥ 4 leaves the previous
+// fixed-arity `DeepNestedStateName` wrongly rejected).
+export type StatePathsOf<S> = {
+  [K in keyof S & string]:
+  | K
+  | (S[K] extends { regions?: infer R }
+    ? R extends Record<string, any>
     ? {
-      [ChildKey in keyof R[RegKey] &
-      string]: R[RegKey][ChildKey] extends {
-        regions?: infer CR
-      }
-      ? CR extends Record<string, any>
-      ? `${K}.${RegKey}.${ChildKey}.${StringKey & keyof CR}`
+      [RegKey in keyof R & string]: R[RegKey] extends Record<string, any>
+      ? `${K}.${RegKey}.${StatePathsOf<R[RegKey]>}`
       : never
-      : never
-    }[keyof R[RegKey] & string]
+    }[keyof R & string]
     : never
-  }[keyof R & string]
-  : never
-  : never
+    : never)
 }[keyof S & string]
 
-// Composable StatePaths type - union of all possible path types
-export type StatePaths<S> =
-  | SimpleStateName<S>
-  | RegionStateName<S>
-  | NestedStateName<S>
-  | DeepNestedStateName<S>
+// Retained for backward-compatible export (index.ts re-exports it). Now an alias
+// of the recursive form so "deeply nested state name" honestly denotes an
+// addressable deep LEAF/composite path rather than a region-container path.
+export type DeepNestedStateName<S> = StatePathsOf<S>
+
+// Composable StatePaths type — the complete set of addressable state paths.
+// Built from the recursive `StatePathsOf` so leaves of any depth are accepted
+// and region-container paths are rejected (H-1). `SimpleStateName`/
+// `RegionStateName`/`NestedStateName` remain exported for API stability.
+export type StatePaths<S> = StatePathsOf<S>
 
 // Config callbacks and setContext-resolved string callbacks run against the
 // underlying owner object, not the adapter wrapper.

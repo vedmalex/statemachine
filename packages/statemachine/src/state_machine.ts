@@ -287,11 +287,16 @@ export class StateMachine<
     // на который опирается канонический порядок активной конфигурации.
     this.model = compileModel(config.states as any)
 
-    // SPEC §1а throw policy: MODEL errors (broken paths, unsatisfiable
-    // transitions, a region with no path to final, a region starting final, a
-    // duplicate region id) make the machine UNBUILDABLE — throw at construction
-    // instead of logging "validation failed" and building a broken machine (V6).
-    // Advisory warnings stay non-fatal and remain available via validateConfig.
+    // SPEC §1а throw policy (M-5: comment synced with MODEL_ERROR_CODES). ONLY
+    // the codes in MODEL_ERROR_CODES make the machine UNBUILDABLE and throw at
+    // construction — today that set is exactly {INVALID_STATE_PATH} (a broken
+    // path names a state that cannot exist, so the machine literally cannot be
+    // built). Every OTHER model-level error (REGION_STARTS_FINAL, UNSATISFIABLE_
+    // FROM/TO, REGION_NO_PATH_TO_FINAL, DUPLICATE_REGION_NAME, …) is a
+    // DELIBERATELY-SUPPORTED-but-diagnosed config: `validateConfig` reports it
+    // (isValid:false) yet construction proceeds — e.g. a final-only region (D12
+    // all-final) builds and immediately raises its done.state join. Advisory
+    // warnings likewise stay non-fatal and remain available via validateConfig.
     const modelErrors = validateConfig(config as any).errors.filter((e) =>
       MODEL_ERROR_CODES.has(e.code),
     )
@@ -1834,6 +1839,9 @@ export class StateMachine<
           const initialStatesForRegions = this.getInitialStatesForRegions(
             stateConfig.regions,
             newStatePart,
+            // M-1: entering a composite via a transition uses the same composite
+            // `initial` source of truth as initial construction.
+            stateConfig.initial,
           )
           const regionStates = initialStatesForRegions.split('|')
           for (const regionState of regionStates) {
@@ -1914,9 +1922,12 @@ export class StateMachine<
     const stateConfig = this.states.get(initialState)
     let initialStates: string
     if (stateConfig?.regions) {
+      // M-1: honour the composite `State.initial` so each region enters the leaf
+      // the author pinned, not the region's first insertion-order key.
       initialStates = this.getInitialStatesForRegions(
         stateConfig.regions,
         initialState,
+        stateConfig.initial,
       )
     } else {
       initialStates = initialState
@@ -1968,9 +1979,59 @@ export class StateMachine<
   private getInitialCompositeState(initialState: string): string {
     const stateConfig = this.states.get(initialState)
     if (stateConfig?.regions) {
-      return this.getInitialStatesForRegions(stateConfig.regions, initialState)
+      return this.getInitialStatesForRegions(
+        stateConfig.regions,
+        initialState,
+        stateConfig.initial,
+      )
     }
     return initialState
+  }
+
+  /**
+   * M-1 — resolve a composite `State.initial` into per-region entry-state keys.
+   *
+   * The composite `initial` is the SINGLE SOURCE OF TRUTH for where each region
+   * of the composite starts. It is a `|`-joined list of per-region entries in
+   * one of the documented forms:
+   *   - region-qualified  `'a.work'` / `'a.work|b.run'` — the segment before the
+   *     first dot names the region, the next segment its entry state;
+   *   - bare              `'work'`  — no dot: the state key is matched against the
+   *     regions and pins the (unique) region that declares it.
+   * Returns a map `regionName -> entryStateKey`. Regions absent from the map fall
+   * back to first-key insertion order at the call site (unchanged legacy
+   * behaviour, still flagged REGION_MISSING_INITIAL by the validator).
+   */
+  private parseCompositeInitial(
+    compositeInitial: string | undefined,
+    regions: RegionsConfig<TOwner>,
+  ): Map<string, string> {
+    const perRegion = new Map<string, string>()
+    if (typeof compositeInitial !== 'string' || !compositeInitial) {
+      return perRegion
+    }
+    const regionNames = Object.keys(regions)
+    for (const rawEntry of compositeInitial.split('|')) {
+      const entry = rawEntry.trim()
+      if (!entry) continue
+      const dot = entry.indexOf('.')
+      if (dot >= 0) {
+        const regionName = entry.slice(0, dot)
+        if (Object.prototype.hasOwnProperty.call(regions, regionName)) {
+          // The next segment is the region's direct entry state; any deeper
+          // path is resolved by that state's OWN `initial` during recursion.
+          const entryKey = entry.slice(dot + 1).split('.')[0]
+          if (entryKey) perRegion.set(regionName, entryKey)
+        }
+      } else {
+        // Bare key: pin the unique region whose states-map declares it.
+        const matches = regionNames.filter((rn) =>
+          Object.prototype.hasOwnProperty.call(regions[rn], entry),
+        )
+        if (matches.length === 1) perRegion.set(matches[0]!, entry)
+      }
+    }
+    return perRegion
   }
 
   private getDirectChildren(stateName: string): string[] {
@@ -1990,12 +2051,21 @@ export class StateMachine<
   private getInitialStatesForRegions(
     regions: RegionsConfig<TOwner>,
     parentPath: string,
+    compositeInitial?: string,
   ): string {
+    // M-1: the composite `State.initial` decides each region's entry state; only
+    // regions it does NOT name fall back to first-key insertion order.
+    const perRegionInitial = this.parseCompositeInitial(
+      compositeInitial,
+      regions,
+    )
     const regionStates: string[] = []
     for (const [regionName, regionStatesConfig] of Object.entries(regions)) {
       const regionPath = `${parentPath}.${regionName}`
       const initialState =
-        regionStatesConfig.initial || Object.keys(regionStatesConfig)[0]
+        perRegionInitial.get(regionName) ??
+        regionStatesConfig.initial ??
+        Object.keys(regionStatesConfig)[0]
       const fullPath = `${regionPath}.${initialState}`
 
       const stateConfig = this.states.get(fullPath)
@@ -2003,6 +2073,9 @@ export class StateMachine<
         const nestedInitialStates = this.getInitialStatesForRegions(
           stateConfig.regions,
           fullPath,
+          // A nested composite carries its OWN `initial`; honour it so deep
+          // composite entry is resolved end-to-end (not first-key at depth).
+          stateConfig.initial,
         )
         regionStates.push(...nestedInitialStates.split('|'))
       } else {
@@ -3114,6 +3187,8 @@ export class StateMachine<
     const initialStatesForRegions = this.getInitialStatesForRegions(
       stateConfig.regions!,
       toStatePart,
+      // M-1: composite `initial` is the single source of truth for region entry.
+      stateConfig.initial,
     )
     const regionStates = initialStatesForRegions.split('|')
 
