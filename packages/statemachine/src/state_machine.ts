@@ -2617,12 +2617,51 @@ export class StateMachine<
 
       const guardResult = transition.guard
         ? await this.callAction(obj as any, transition.guard, ...args).catch(
-          this.processError(
-            obj as any,
-            context,
-            transition.onError,
-            this.onError,
-          ),
+          (error: unknown) => {
+            // F7: a guard EXCEPTION must reach the OBSERVABLE monitor.recordError
+            // channel (context phase:'guard'), the same visibility contract W1
+            // gives internal runtime errors (reportRuntimeError). Without it a
+            // guard failure is INVISIBLE to a consumer's monitor and to the
+            // quantitative simulator oracles (A1/W5), and indistinguishable from
+            // an honest guard refusal in the metrics. The transition still stays
+            // DISABLED (fireEvent=false — backward compatible), never a throw;
+            // full guard-error-vs-guard-rejected distinguishability is W3-B.
+            const errObj =
+              error instanceof Error ? error : new Error(String(error))
+            if (this.errorHandler.isEnabled()) {
+              const alreadyReported =
+                typeof errObj === 'object' &&
+                errObj !== null &&
+                (errObj as unknown as Record<symbol, unknown>)[
+                  RUNTIME_ERROR_REPORTED
+                ] === true
+              if (!alreadyReported) {
+                try {
+                  this.monitor.recordError(errObj, context)
+                } catch {
+                  /* a monitor sink must never break selection */
+                }
+              }
+              // П2 dedup (W1 parity): mark so a later surfacing of the SAME
+              // error object does not double-count recordError for the
+              // quantitative oracles (W5).
+              try {
+                ;(errObj as unknown as Record<symbol, unknown>)[
+                  RUNTIME_ERROR_REPORTED
+                ] = true
+              } catch {
+                /* frozen/exotic error object — dedup degrades to prior behavior */
+              }
+            }
+            // Preserve the existing onError + default-rethrow behavior
+            // (channel #2 / the disabled-on-throw fallthrough) unchanged.
+            return this.processError(
+              obj as any,
+              context,
+              transition.onError,
+              this.onError,
+            )(error)
+          },
         )
         : true
       if (!guardResult) {
@@ -2734,22 +2773,15 @@ export class StateMachine<
       enterStates.length > 0 ? enterStates : [transition.to as string]
 
     try {
-      // Phase 1: Guard validation
-      if (transition.guard) {
-        const allow = await this.callAction(obj, transition.guard, ...args).catch(
-          this.processError(
-            obj,
-            { ...context, phase: 'guard' },
-            transition.onError,
-            this.onError,
-          ),
-        )
-        /* c8 ignore next */
-        if (!allow) {
-          /* c8 ignore next */
-          return undefined
-        }
-      }
+      // Phase 1 (guard re-check) REMOVED — F8: the winning transition's guard
+      // is already evaluated EXACTLY ONCE in getAllowedTransitions. Re-running
+      // it here double-invoked the winner's guard per fireEvent (calls===2) and
+      // let a non-deterministic guard (true on selection, false on the re-check)
+      // silently CANCEL an already-selected transition on the second evaluation.
+      // abort/errorState handling lives in Phase 3 (onExit → abortOnExitError)
+      // and Phase 6 (onEnter → errorState), NOT in the removed re-check, so this
+      // removal weakens no abort logic. Transition SELECTION is unchanged
+      // (selection characterization gate stays 10/10).
 
       // Phase 2: Before event action
       if (event.onBefore) {
