@@ -16,6 +16,21 @@
 Итог W4: **915 passed / 14 skipped; оба tsc чисты**; W0-W3 регресс цел. auto-start монитора НЕ включён
 (риск утечки setInterval по сьюту) — health on-demand через getMonitor().getMonitoringReport().
 
+## W4.1 — доработка по critic-приёмке W4 (обратная ложь health) — CLOSED
+
+Критик (без Bash) нашёл: EO-3-фикс закрыл false-healthy в одну сторону, открыл в другую. Проверено запуском:
+
+| id | что | подтверждение |
+|---|---|---|
+| #1 [HIGH для W5] health обратная ложь | guard-rejected (штатный отказ) через recordTransition(false)→recordError красил здоровую машину critical (10 успехов+2 отказа) | разведены REFUSAL (failedTransitions) и ERROR (recordError); здоровая+guard-отказы → **healthy**, сломанная(guard-error) → **critical** |
+| #2 [MEDIUM] invokeRestartCount глобальный | мультиowner обходил livelock-bound W3b.1 (коммит B обнулял A) | WeakMap<owner,Map<leaf>>; чистка только exit-set владельца — bounded независимо |
+| #3 [MEDIUM] errorState detailed vs метрика | fired:true противоречил failed | applyMicrostep {kind:'ok'\|'error-state'}; detailed reason 'error-state' (fired:false) — 3 канала согласованы |
+| #4 [MEDIUM] stale sim-комментарии | утверждали до-W4 «recordTransition только success» — W5-оракулы прочли бы ложь | обновлены под реальный контракт |
+| #5 setDefaultLogLevel холостой | console-шим движка мимо logger.ts | подключён/JSDoc честен |
+
+Итог W4.1: **920 passed / 14 skipped; оба tsc чисты**; W0-W4 регресс цел. verify независимо
+воспроизвёл. successCount больше не смешивает refusal/error домены.
+
 ## Осталось (не блокер)
 
 Перф PERF-03 (Θ(R²) setCurrentState), PERF-02 (checkCompletion безусловен), PERF-05 (монитор 36%) —
