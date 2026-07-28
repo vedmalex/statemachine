@@ -437,6 +437,11 @@ export type Event<T extends object, S extends States<T>> = {
  *  - `guard-rejected` — the ordered candidates' guards all returned falsy;
  *  - `guard-error` — a candidate's guard THREW (now observably distinct from an
  *    honest refusal — closes F4).
+ *  - `aborted` — a candidate WAS selected and the microstep BEGAN, but was
+ *    cancelled before it committed (onExit threw under `abortOnExitError`, or the
+ *    target configuration was contradictory). Observably distinct from
+ *    `no-transition` (no candidate at all) so the W5 sim oracle can tell "nothing
+ *    to do" from "a started microstep was rolled back".
  *
  * `fireEvent` deliberately keeps returning `boolean`: `{ fired: false }` is a
  * truthy object, so any `if (await sm.fireEvent(e))` would silently invert.
@@ -449,7 +454,7 @@ export type FireResult =
     }
   | {
       fired: false
-      reason: 'no-transition' | 'guard-rejected' | 'guard-error'
+      reason: 'no-transition' | 'guard-rejected' | 'guard-error' | 'aborted'
       /** Per-candidate rejection detail, present for the guard-* reasons. */
       rejected?: Array<{
         /** `'from -> to'` label of the rejected transition. */

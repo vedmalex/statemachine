@@ -28,6 +28,7 @@ import {
   type IErrorHandler,
   type ILogger,
   type IMonitor,
+  type MonitorMetricsSnapshot,
   type ITimerScheduler,
   isAdapter,
   type KeysOf,
@@ -196,16 +197,27 @@ export class StateMachine<
   private onError?: ErrorHandlerOrString<TOwner>
   private adaptee?: Adapter<PropertiesOf<TOwner>>
   private context?: MethodsOf<TOwner>
-  private historyMap: Map<StateName, string> = new Map()
+  // П6 (multi-object isolation) — the public contract binds ONE machine to MANY
+  // objects (`fireEvent(event, obj)` / `attachToObject`); the active state lives
+  // in each object, NOT on the machine. So the per-state timers / in-flight
+  // operations / history / entry-times MUST be keyed by the OWNER first, then by
+  // state name — a bare `Map<stateName, …>` collides across owners: a second
+  // object entering the SAME state overwrote the first's record, and either
+  // object's EXIT tore down EVERY owner's timers/operations for that state.
+  // WeakMap<owner> keeps each owner's records isolated (and GC-friendly). The
+  // owner key is the raw adaptee object (see {@link ownerKey}); owner-less
+  // internal / serialization paths fall back to the primary construction adaptee.
+  private historyByOwner: WeakMap<object, Map<StateName, string>> = new WeakMap()
   private initialState: keyof SMConfig['states']
   private persistenceAdapter?: StatePersistenceAdapter
-  private activeTimers: Map<string, any[]> = new Map()
+  private activeTimersByOwner: WeakMap<object, Map<string, any[]>> = new WeakMap()
   // W3b (SPEC §6а) — per-leaf AbortControllers for in-flight `invoke.src`
   // operations, kept ALONGSIDE activeTimers (same lifecycle: armed on entry in
   // armStateInvoke, aborted before onExit in executeExitActions, dropped in
-  // teardownStateTimers). Keyed by the leaf state name, one controller per
-  // running operation of that leaf.
-  private activeInvokes: Map<string, AbortController[]> = new Map()
+  // teardownStateTimers). Keyed (per owner, П6) by the leaf state name, one
+  // controller per running operation of that leaf.
+  private activeInvokesByOwner: WeakMap<object, Map<string, AbortController[]>> =
+    new WeakMap()
   // W3b.1 livelock bound: consecutive invoke-operation restarts after an
   // aborted-without-commit microstep, per source leaf. Reset on a committed
   // exit of the leaf. A deterministically-throwing onExit would otherwise loop
@@ -213,7 +225,8 @@ export class StateMachine<
   // operation is left cancelled and the fact is recorded (observable), not spun.
   private invokeRestartCount: Map<string, number> = new Map()
   private readonly MAX_INVOKE_RESTARTS = 3
-  private stateEntryTimes: Map<string, number> = new Map()
+  private stateEntryTimesByOwner: WeakMap<object, Map<string, number>> =
+    new WeakMap()
   // OTS (SPEC §6.1): per-microstep guard-result memo so a candidate governing
   // several active leaves has its guard evaluated at most once. Set/cleared by
   // computeEnabledSet; undefined outside an OTS selection.
@@ -421,10 +434,103 @@ export class StateMachine<
     this.context = context
   }
 
+  /**
+   * П13/EO-8 — public access to the injected observability monitor. Before this,
+   * the monitor was reachable only via `(sm as any).monitor`, so a consumer could
+   * not read transition/error metrics or drive a health check without reaching
+   * into a private field. Returns the same {@link IMonitor} instance the machine
+   * records into (the injected `options.monitor` or the default monitor).
+   */
+  public getMonitor(): IMonitor {
+    return this.monitor
+  }
+
+  /**
+   * П13/EO-8 — public snapshot of the aggregate observability metrics, or
+   * `undefined` when the injected monitor does not implement `getMetrics`
+   * (the optional {@link IMonitor} extension). The snapshot reflects the
+   * EO-3-honest counters (non-negative `successCount`, truthful `errorCount`).
+   */
+  public getMetrics(): MonitorMetricsSnapshot | undefined {
+    return this.monitor.getMetrics?.()
+  }
+
   private resolveCallbackOwner(value: Adapter<any> | TOwner): TOwner {
     return isAdapter<TOwner>(value)
       ? (value.adaptee as TOwner)
       : (value as TOwner)
+  }
+
+  // ── П6: per-owner map access ────────────────────────────────────────────────
+  /**
+   * П6 — resolve the OWNER key for the per-owner timer/operation/history/entry
+   * maps. The owner is the raw adaptee object whose `stateAttribute` actually
+   * holds the state; keying by it (not by shared state-name) isolates every
+   * object attached to the same machine. Owner-less internal / serialization
+   * paths fall back to the primary construction adaptee, and a machine with no
+   * adaptee at all uses `this` as a stable sentinel so its single logical owner
+   * shares one map.
+   */
+  private ownerKey(obj?: Adapter<any>): object {
+    const raw = (obj?.adaptee ?? this.adaptee?.adaptee) as object | undefined
+    return raw ?? this
+  }
+
+  /** П6 — the current owner's per-state timer map (created on first access). */
+  private timersFor(obj?: Adapter<any>): Map<string, any[]> {
+    const key = this.ownerKey(obj)
+    let m = this.activeTimersByOwner.get(key)
+    if (!m) {
+      m = new Map()
+      this.activeTimersByOwner.set(key, m)
+    }
+    return m
+  }
+
+  /** П6 — the current owner's per-state in-flight operation map. */
+  private invokesFor(obj?: Adapter<any>): Map<string, AbortController[]> {
+    const key = this.ownerKey(obj)
+    let m = this.activeInvokesByOwner.get(key)
+    if (!m) {
+      m = new Map()
+      this.activeInvokesByOwner.set(key, m)
+    }
+    return m
+  }
+
+  /** П6 — the current owner's per-state entry-time map. */
+  private entryTimesFor(obj?: Adapter<any>): Map<string, number> {
+    const key = this.ownerKey(obj)
+    let m = this.stateEntryTimesByOwner.get(key)
+    if (!m) {
+      m = new Map()
+      this.stateEntryTimesByOwner.set(key, m)
+    }
+    return m
+  }
+
+  /** П6 — the current owner's per-state history map. */
+  private historyFor(obj?: Adapter<any>): Map<StateName, string> {
+    const key = this.ownerKey(obj)
+    let m = this.historyByOwner.get(key)
+    if (!m) {
+      m = new Map()
+      this.historyByOwner.set(key, m)
+    }
+    return m
+  }
+
+  /**
+   * П6 — seed the PRIMARY owner's history map wholesale (deserialization /
+   * restore paths that previously assigned `this.historyMap = new Map(…)`).
+   */
+  private seedHistory(map: Map<StateName, string>): void {
+    this.historyByOwner.set(this.ownerKey(this.adaptee), map)
+  }
+
+  /** П6 — seed the PRIMARY owner's entry-time map wholesale (restore paths). */
+  private seedEntryTimes(map: Map<string, number>): void {
+    this.stateEntryTimesByOwner.set(this.ownerKey(this.adaptee), map)
   }
 
   private enqueueEvent(
@@ -911,6 +1017,22 @@ export class StateMachine<
     })
 
     if (enabled.length === 0) {
+      // П9/EO-3: a guard REJECTION is an observable FAILURE path, not a no-op —
+      // record it as an unsuccessful transition so the W5 sim oracle and the
+      // health metrics see the refusal. A pure no-candidate case
+      // (rejected.length === 0) is genuinely "nothing to do" and is NOT recorded.
+      // A guard-ERROR is EXCLUDED here: it was already surfaced via
+      // monitor.recordError in selectTransition (F7); recording it again as a
+      // failed transition double-counts it in the default monitor (errorCount=2,
+      // errorRate>100%). Only a clean guard-rejected (no error) is recorded here.
+      const hadGuardError = rejected.some((r) => r.reason === 'guard-error')
+      if (rejected.length > 0 && !hadGuardError) {
+        this.monitor.recordTransition(0, false, {
+          fromState: currentState,
+          toState: currentState,
+          eventName: String(eventName),
+        })
+      }
       // SPEC §7: distinguish guard-error from an honest guard-rejected (F4).
       if (queuedEvent.detailed) {
         const hadError = rejected.some((r) => r.reason === 'guard-error')
@@ -979,8 +1101,19 @@ export class StateMachine<
     })
 
     if (!committed) {
+      // abort-observability (W3-C.1 / EO-5 residual): a candidate WAS selected and
+      // the microstep BEGAN, but did not commit (onExit threw under
+      // abortOnExitError, or the target configuration was contradictory). This is
+      // observably DISTINCT from "no candidate matched": report reason 'aborted'
+      // (§7 union) and record an unsuccessful transition so the W5 oracle and the
+      // health metrics see the cancelled microstep — not a silent no-transition.
+      this.monitor.recordTransition(0, false, {
+        fromState: currentState,
+        toState: currentState,
+        eventName: String(eventName),
+      })
       if (queuedEvent.detailed) {
-        queuedEvent.detailResult = { fired: false, reason: 'no-transition' }
+        queuedEvent.detailResult = { fired: false, reason: 'aborted' }
       }
       return false
     }
@@ -1385,27 +1518,31 @@ export class StateMachine<
       throw new StateMachineError('no adaptee', _s2 !== undefined ? { state: _s2 } : {})
     }
 
-    this.historyMap.clear()
+    // П6: reset only the target owner's records — resetting one attached object
+    // must not tear down another object's live timers/operations.
+    this.historyFor(targetAdaptee).clear()
 
-    // Clear all active timers
-    for (const timers of this.activeTimers.values()) {
+    // Clear all active timers for this owner
+    const ownerTimers = this.timersFor(targetAdaptee)
+    for (const timers of ownerTimers.values()) {
       for (const id of timers) {
         this.clearTimer(id)
       }
     }
-    this.activeTimers.clear()
-    // W3b: abort + drop all in-flight invoke operations on reset.
-    for (const controllers of this.activeInvokes.values()) {
+    ownerTimers.clear()
+    // W3b: abort + drop this owner's in-flight invoke operations on reset.
+    const ownerInvokes = this.invokesFor(targetAdaptee)
+    for (const controllers of ownerInvokes.values()) {
       for (const controller of controllers) controller.abort()
     }
-    this.activeInvokes.clear()
-    this.stateEntryTimes.clear()
+    ownerInvokes.clear()
+    this.entryTimesFor(targetAdaptee).clear()
 
     this.setInitialState(this.initialState as string, targetAdaptee)
   }
 
   public getStateHistory(): Record<string, string> {
-    return Object.fromEntries(this.historyMap)
+    return Object.fromEntries(this.historyFor(this.adaptee))
   }
 
   public getCurrentStateInfo(): StateInfo | undefined {
@@ -1537,11 +1674,11 @@ export class StateMachine<
     }
 
     const currentState = this.getCurrentState() ?? ''
-    const history = Object.fromEntries(this.historyMap)
+    const history = Object.fromEntries(this.historyFor(this.adaptee))
     const stateData = {
       currentState,
       history,
-      stateEntryTimes: Object.fromEntries(this.stateEntryTimes),
+      stateEntryTimes: Object.fromEntries(this.entryTimesFor(this.adaptee)),
     }
 
     await targetAdapter.save(stateData)
@@ -1555,9 +1692,9 @@ export class StateMachine<
 
     const result = await targetAdapter.restore()
     this.validateCompositeState(result.currentState)
-    this.historyMap = new Map(Object.entries(result.history))
+    this.seedHistory(new Map(Object.entries(result.history)))
     if (result.stateEntryTimes) {
-      this.stateEntryTimes = new Map(Object.entries(result.stateEntryTimes))
+      this.seedEntryTimes(new Map(Object.entries(result.stateEntryTimes)))
     }
     this.setCurrentState(result.currentState)
     this.resumeTimers()
@@ -1625,9 +1762,9 @@ export class StateMachine<
       options,
     )
 
-    sm.historyMap = new Map(historyMap)
+    sm.seedHistory(new Map(historyMap))
     if (stateEntryTimes) {
-      sm.stateEntryTimes = new Map(stateEntryTimes)
+      sm.seedEntryTimes(new Map(stateEntryTimes))
     }
     if (sm.adaptee && currentState) {
       sm.setCurrentState(currentState)
@@ -1699,9 +1836,9 @@ export class StateMachine<
       options,
     )
 
-    sm.historyMap = new Map(historyMap)
+    sm.seedHistory(new Map(historyMap))
     if (stateEntryTimes) {
-      sm.stateEntryTimes = new Map(stateEntryTimes)
+      sm.seedEntryTimes(new Map(stateEntryTimes))
     }
     if (sm.adaptee && currentState) {
       sm.setCurrentState(currentState)
@@ -2312,7 +2449,7 @@ export class StateMachine<
       stateConfig.history !== 'deep' &&
       stateConfig.regions
     ) {
-      const historyState = this.historyMap.get(state)
+      const historyState = this.historyFor(adaptee).get(state)
       if (historyState && adaptee) {
         const currentState = this.getCurrentState(adaptee) ?? ''
         const newCompositeState = this.updatePartialState(
@@ -2328,7 +2465,7 @@ export class StateMachine<
       }
     }
     if (stateConfig?.history === 'deep' && stateConfig.regions) {
-      const historyState = this.historyMap.get(state)
+      const historyState = this.historyFor(adaptee).get(state)
       if (historyState && adaptee) {
         // W2a: канонизируем восстановленную deep-history конфигурацию тем же
         // documentIndex-порядком, что и прямой путь персистенции.
@@ -2453,6 +2590,10 @@ export class StateMachine<
   private previewCommitState(
     currentStateStr: string,
     state: StateName,
+    // П6 — the owner whose history is consulted for restoration. Threaded from
+    // the microstep's `obj` so history restore is per-owner; owner-less preview
+    // callers (e.g. exit-set queries) fall back to the primary adaptee.
+    obj?: Adapter<any>,
   ): string {
     // Compute the default (non-history) expansion FIRST — mirroring the historic
     // two-step write (updateState default-expansion → setCurrentState history
@@ -2466,13 +2607,13 @@ export class StateMachine<
       stateConfig.history !== 'deep' &&
       stateConfig.regions
     ) {
-      const historyState = this.historyMap.get(state)
+      const historyState = this.historyFor(obj).get(state)
       if (historyState) {
         return this.updatePartialState(base, state, historyState)
       }
     }
     if (stateConfig?.history === 'deep' && stateConfig.regions) {
-      const historyState = this.historyMap.get(state)
+      const historyState = this.historyFor(obj).get(state)
       if (historyState) {
         return this.orderComposite(historyState)
       }
@@ -3604,7 +3745,7 @@ export class StateMachine<
         // no state change, onEnter is not lost (nothing to enter/exit), only the
         // transition action runs. (Never the old broken `enterFireOrder:['*']`.)
         if (raw === '*') continue
-        working = this.previewCommitState(working, raw as StateName)
+        working = this.previewCommitState(working, raw as StateName, obj)
       }
       finalConfig = this.orderComposite(working)
       const sets = this.computeEnterExitSets(currentState, finalConfig)
@@ -3765,16 +3906,29 @@ export class StateMachine<
         const errorConfig = this.previewCommitState(
           currentState,
           this.errorState as StateName,
+          obj,
         )
         const errSets = this.computeEnterExitSets(currentState, errorConfig)
         this.logger.error(
           `Failed to enter target '${finalConfig}'. Fallback to error state '${this.errorState}'`,
         )
-        // The errorState fallback intentionally BYPASSES recordTransition (parity
-        // with the historic zombie-prevention path — it is a recovery write, not
-        // a successful transition).
+        // W4 (EO-3): the errorState recovery is a FAILED transition and MUST be
+        // observable — a machine repeatedly swallowing onEnter errors into
+        // errorState otherwise reports health 'healthy' (the exact false-healthy
+        // class EO-3 targets). recordTransition(false) once here (no double-count:
+        // this branch never called recordError — errorCount goes 0→1). The commit
+        // to errorConfig is a recovery, not a success, so success is NOT recorded.
+        try {
+          this.monitor.recordTransition(0, false, {
+            fromState: currentState,
+            toState: errorConfig,
+            eventName: String(eventName),
+          })
+        } catch {
+          /* a monitor sink must never break the drain */
+        }
         this.commitConfiguration(obj, errorConfig)
-        for (const s of errSets.exitStates) this.teardownStateTimers(s)
+        for (const s of errSets.exitStates) this.teardownStateTimers(s, obj)
         for (const s of errSets.enterStates) this.armStateInvoke(obj, s)
         return errorConfig
       }
@@ -3788,7 +3942,7 @@ export class StateMachine<
       // П5: teardown the timers of leaves that ACTUALLY left the configuration,
       // then arm invoke timers for the entered leaves — from the ACTUALLY-written
       // configuration (never the regional default — T3 deep/shallow history).
-      for (const s of exitStates) this.teardownStateTimers(s)
+      for (const s of exitStates) this.teardownStateTimers(s, obj)
       for (const s of enterStates) this.armStateInvoke(obj, s)
 
       // done.state.<C> innermost-first for composites that just became all-final.
@@ -3837,7 +3991,7 @@ export class StateMachine<
     // `signal.aborted`. Synchronous and non-blocking; the post-commit
     // teardownStateTimers drops the (already-aborted) controllers. Done even
     // when there is no fromState config, harmless if there are no operations.
-    const controllers = this.activeInvokes.get(fromStateName)
+    const controllers = this.invokesFor(obj).get(fromStateName)
     if (controllers) {
       for (const controller of controllers) controller.abort()
     }
@@ -3980,23 +4134,28 @@ export class StateMachine<
     const toState = this.states.get(toStateName)
     if (!toState || !toState.invoke || toState.invoke.length === 0) return
 
+    // П6: all timer/operation/entry-time bookkeeping is scoped to THIS owner.
+    const ownerTimers = this.timersFor(obj)
+    const ownerInvokes = this.invokesFor(obj)
+    const ownerEntryTimes = this.entryTimesFor(obj)
+
     // Clear any stale handles for this state before re-arming (EO-4).
-    const existing = this.activeTimers.get(toStateName)
+    const existing = ownerTimers.get(toStateName)
     if (existing) {
       for (const timerId of existing) this.clearTimer(timerId)
-      this.activeTimers.delete(toStateName)
+      ownerTimers.delete(toStateName)
     }
     // W3b: abort + drop any stale invoke operations for this state before
     // re-arming (parity with the timer stale-clear above).
-    const staleOps = this.activeInvokes.get(toStateName)
+    const staleOps = ownerInvokes.get(toStateName)
     if (staleOps) {
       for (const controller of staleOps) controller.abort()
-      this.activeInvokes.delete(toStateName)
+      ownerInvokes.delete(toStateName)
     }
 
     // Record entry time if not already recorded (e.g. from resumeTimers)
-    if (!this.stateEntryTimes.has(toStateName)) {
-      this.stateEntryTimes.set(toStateName, this.clock())
+    if (!ownerEntryTimes.has(toStateName)) {
+      ownerEntryTimes.set(toStateName, this.clock())
     }
 
     const timers: any[] = []
@@ -4071,9 +4230,9 @@ export class StateMachine<
       const timerId = this.setTimer(callback, timer.delay)
       timers.push(timerId)
     }
-    this.activeTimers.set(toStateName, timers)
+    ownerTimers.set(toStateName, timers)
     if (controllers.length > 0) {
-      this.activeInvokes.set(toStateName, controllers)
+      ownerInvokes.set(toStateName, controllers)
     }
   }
 
@@ -4165,10 +4324,12 @@ export class StateMachine<
 
     // The already-aborted controllers are useless — discard the refs; the launch
     // timers stay tracked in activeTimers (the fired one-shot startOp is inert).
-    this.activeInvokes.delete(stateName)
+    const ownerInvokes = this.invokesFor(obj)
+    const ownerTimers = this.timersFor(obj)
+    ownerInvokes.delete(stateName)
 
     const controllers: AbortController[] = []
-    const timers = this.activeTimers.get(stateName) ?? []
+    const timers = ownerTimers.get(stateName) ?? []
     for (const invocation of toState.invoke) {
       if (!this.isInvokeOperation(invocation)) continue
       if (invocation.cond) {
@@ -4192,8 +4353,8 @@ export class StateMachine<
       timers.push(timerId)
     }
     if (controllers.length > 0) {
-      this.activeInvokes.set(stateName, controllers)
-      this.activeTimers.set(stateName, timers)
+      ownerInvokes.set(stateName, controllers)
+      ownerTimers.set(stateName, timers)
     }
   }
 
@@ -4288,22 +4449,26 @@ export class StateMachine<
    * committed configuration (the microstep's exit set), so an aborted transition
    * never destroys a source state's still-live timers.
    */
-  private teardownStateTimers(stateName: string): void {
-    const timers = this.activeTimers.get(stateName)
+  private teardownStateTimers(stateName: string, obj?: Adapter<TOwner>): void {
+    // П6: tear down only THIS owner's records for the leaf — another object still
+    // in the same state keeps its own live timers/operations.
+    const ownerTimers = this.timersFor(obj)
+    const timers = ownerTimers.get(stateName)
     if (timers) {
       for (const timerId of timers) this.clearTimer(timerId)
-      this.activeTimers.delete(stateName)
+      ownerTimers.delete(stateName)
     }
     // W3b: abort + drop any in-flight invoke operations of this leaf. The abort
     // is idempotent — executeExitActions already aborted it BEFORE onExit; this
     // is the post-commit cleanup (and the safety net for teardown paths that do
     // not run executeExitActions, e.g. the errorState fallback).
-    const controllers = this.activeInvokes.get(stateName)
+    const ownerInvokes = this.invokesFor(obj)
+    const controllers = ownerInvokes.get(stateName)
     if (controllers) {
       for (const controller of controllers) controller.abort()
-      this.activeInvokes.delete(stateName)
+      ownerInvokes.delete(stateName)
     }
-    this.stateEntryTimes.delete(stateName)
+    this.entryTimesFor(obj).delete(stateName)
   }
 
   /**
@@ -4360,20 +4525,22 @@ export class StateMachine<
     obj: Adapter<TOwner>,
   ): void {
     const fromState = this.states.get(fromStateName)
+    // П6: record history against THIS owner's map.
+    const ownerHistory = this.historyFor(obj)
 
     // Handle state history
     if (fromState?.history) {
       if (fromState.history === 'deep') {
-        this.historyMap.set(fromState.name, currentState)
+        ownerHistory.set(fromState.name, currentState)
       } else if (fromState.history === 'shallow' && fromState.regions) {
-        this.historyMap.set(fromState.name, this.getCurrentState(obj as any) ?? '')
+        ownerHistory.set(fromState.name, this.getCurrentState(obj as any) ?? '')
       }
     }
 
     // Handle parent state history
     const fromStateParent = this.findParentStateWithHistory(fromStateName)
     if (fromStateParent?.history) {
-      this.historyMap.set(fromStateParent.name, currentState)
+      ownerHistory.set(fromStateParent.name, currentState)
     }
   }
 
@@ -4497,18 +4664,24 @@ export class StateMachine<
   }
 
   private resumeTimers() {
+    // П6: resume operates on the PRIMARY construction owner (the (de)serialized
+    // machine has one adaptee); bind the per-owner maps once.
+    const ownerTimers = this.timersFor(this.adaptee)
+    const ownerInvokes = this.invokesFor(this.adaptee)
+    const ownerEntryTimes = this.entryTimesFor(this.adaptee)
+
     // Clear any existing active timers first
-    for (const timers of this.activeTimers.values()) {
+    for (const timers of ownerTimers.values()) {
       for (const id of timers) {
         this.clearTimer(id)
       }
     }
-    this.activeTimers.clear()
+    ownerTimers.clear()
     // W3b: abort + drop any in-flight invoke operations before re-arming.
-    for (const controllers of this.activeInvokes.values()) {
+    for (const controllers of ownerInvokes.values()) {
       for (const controller of controllers) controller.abort()
     }
-    this.activeInvokes.clear()
+    ownerInvokes.clear()
 
     const currentState = this.getCurrentState()
     if (!currentState) return
@@ -4517,9 +4690,9 @@ export class StateMachine<
     const activeStatesSet = new Set(activeStates)
 
     // GC: Remove times for inactive states to prevent memory leaks in stateEntryTimes
-    for (const stateName of this.stateEntryTimes.keys()) {
+    for (const stateName of ownerEntryTimes.keys()) {
       if (!activeStatesSet.has(stateName)) {
-        this.stateEntryTimes.delete(stateName)
+        ownerEntryTimes.delete(stateName)
       }
     }
 
@@ -4529,7 +4702,7 @@ export class StateMachine<
       const state = this.states.get(stateName)
       if (!state || !state.invoke || state.invoke.length === 0) continue
 
-      const entryTime = this.stateEntryTimes.get(stateName)
+      const entryTime = ownerEntryTimes.get(stateName)
       // If no entry time recorded, assume just entered (fallback for old data).
       // Use ?? / === undefined (not ||) so a legitimate entry time of 0 — valid
       // under an injected virtual clock that starts at t=0 — is preserved
@@ -4537,7 +4710,7 @@ export class StateMachine<
       // an entry time is never 0, so the default path stays byte-identical.
       const startTime = entryTime ?? now
       if (entryTime === undefined) {
-        this.stateEntryTimes.set(stateName, startTime)
+        ownerEntryTimes.set(stateName, startTime)
       }
 
       const elapsed = now - startTime
@@ -4599,7 +4772,7 @@ export class StateMachine<
         const timerId = this.setTimer(callback, remaining)
         timers.push(timerId)
       }
-      this.activeTimers.set(stateName, timers)
+      ownerTimers.set(stateName, timers)
     }
   }
 
@@ -4631,8 +4804,8 @@ export class StateMachine<
     return JSON.stringify({
       config,
       currentState: this.getCurrentState(),
-      historyMap: Array.from(this.historyMap.entries()),
-      stateEntryTimes: Array.from(this.stateEntryTimes.entries()),
+      historyMap: Array.from(this.historyFor(this.adaptee).entries()),
+      stateEntryTimes: Array.from(this.entryTimesFor(this.adaptee).entries()),
     })
   }
 
@@ -4669,8 +4842,8 @@ export class StateMachine<
     return JSON.stringify({
       config,
       currentState: this.getCurrentState(),
-      historyMap: Array.from(this.historyMap.entries()),
-      stateEntryTimes: Array.from(this.stateEntryTimes.entries()),
+      historyMap: Array.from(this.historyFor(this.adaptee).entries()),
+      stateEntryTimes: Array.from(this.entryTimesFor(this.adaptee).entries()),
     })
   }
 

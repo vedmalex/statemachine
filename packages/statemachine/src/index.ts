@@ -96,6 +96,35 @@ export type { ValidationConfig } from './config_validator'
  */
 export type { MonitoringConfig } from './monitoring'
 
+// === П13/EO-8 — observability RUNTIME surface ===
+// Previously only the TYPE (IMonitor / MonitoringConfig) reached consumers; the
+// monitor CLASS and its default factory were unreachable, so metrics could only
+// be scraped via `(sm as any).monitor`. Exported ONLY AFTER EO-3 fixed the lying
+// errorRate/health/successCount — the public surface must not carry the lie.
+
+/**
+ * @category Unstable
+ * @unstable — comprehensive monitor implementation (metrics + health). Read the
+ * machine's live instance via `StateMachine#getMonitor()`, or construct one to
+ * inject through `StateMachineOptions.monitor`.
+ */
+export { StateMachineMonitor, createDefaultMonitor, HealthStatus } from './monitoring'
+
+// === П13/EO-8 — logger RUNTIME surface ===
+
+/**
+ * @category Unstable
+ * @unstable — the machine's default logger and the level control. Import
+ * `setDefaultLogLevel` to raise/lower verbosity of the built-in logging.
+ */
+export {
+  stateMachineLogger,
+  setDefaultLogLevel,
+  getLogger,
+  Logger,
+  LogLevel,
+} from './logger'
+
 // === Public adapter classes (live in types.ts) ===
 
 export {

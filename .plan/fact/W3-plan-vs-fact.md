@@ -118,7 +118,27 @@ pre-existing на baseline, не регресс W3-C.
 дефект): `preempted = NOT(reached-final)` — промежуточный лист сообщает preempted:true; соответствует
 буквальному SPEC.
 
-## Вывод W3 (A + B + B.1 + C + C.1 + b)
+## W3b.1 — доработка по critic-приёмке W3b (2 MEDIUM) + adversarial residual — CLOSED
+
+Критик (без Bash) нашёл 2 MEDIUM; verify (с Bash) — residual в моём фиксе. Всё проверено запуском:
+
+| id | что | подтверждение |
+|---|---|---|
+| П.1д [MEDIUM-HIGH] | abort операции необратим при сорванном микрошаге → тихий stall | перезапуск операций исходных листьев на abort-exit **И throw-ветке** (residual: onEnter-throw без errorState тоже stall-ил); операция оживает свежим signal |
+| livelock (введён фиксом) | детерминированно-бросающий onExit крутил перезапуск бесконечно (166) | bound MAX_INVOKE_RESTARTS=3, сброс при commit, сверх → recordError; проверено: src=4 вместо 166 |
+| П.7 [MEDIUM] | serialize операции терял src молча → NaN-delay → raiseEvent(undefined) | маркер body-free `{type:'operation',slot,...}` (симметрично W0.2); гард `isResumableTimerInvocation` отсекает src-less от NaN-таймера |
+| LOW | INVOKE_UNKNOWN_EVENT (кросс-чек имён vs events); preempted-конвенция | задокументированы |
+
+Нормальный (закоммиченный) выход по-прежнему отменяет операцию (регресс-проверка). Итог W3b.1:
+**903 passed / 14 skipped; оба tsc чисты**; W0-W3b регресс цел.
+
+## Вывод W3 (A + B + B.1 + C + C.1 + b + b.1)
+
+Вся семантика ядра переписана и закалена: правило выбора SCXML/UML, optimal transition set, живые
+таймеры, наблюдаемые ленивые гарды, invoke-операции с отменой (ответ на вопрос про лэйны). 7 под-волн,
+каждая через red→fix→adversarial-verify→оркестратор→critic-приёмку. Критик находил дефект в КАЖДОЙ
+(over-fill, over-scope, двойной источник, доминирование-фильтр, NUL, abort-stall) — статический разбор
+краёв контракта ловит то, что green-прогон пропускает.
 
 Семантика ядра переписана: правило выбора перехода SCXML/UML, optimal transition set (несколько
 переходов за микрошаг), корректный порядок фаз с живыми таймерами. Гарды наблюдаемы и ленивы.

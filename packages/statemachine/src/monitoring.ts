@@ -129,10 +129,18 @@ export class MetricsCollector {
         recentMetrics.length
         : 0
 
+    // EO-3 (honesty): errorRate must NOT collapse to 0 on a machine that only
+    // ever recorded errors and no successful transitions. The old `: 0` fallback
+    // reported a fully-broken machine (errors, zero transitions) as 0% → health
+    // 'healthy', hiding the failure from the W5 sim oracle. With no transitions
+    // but recorded errors the error rate is effectively 100%; with neither it is
+    // an honest 0%.
     const errorRate =
       this.transitionCount > 0
         ? (this.errorCount / this.transitionCount) * 100
-        : 0
+        : this.errorCount > 0
+          ? 100
+          : 0
 
     return {
       totalTransitions: this.transitionCount,
@@ -509,7 +517,11 @@ export class StateMachineMonitor {
     const summary = this.metricsCollector.getMetricsSummary()
     return {
       totalTransitions: summary.totalTransitions,
-      successCount: summary.totalTransitions - summary.totalErrors,
+      // EO-3 (honesty): successCount is a COUNT and can never be negative. When
+      // more errors than transitions were recorded (a broken machine records
+      // errors without a matching successful transition), the naive subtraction
+      // went negative (e.g. 1 − 3 = −2) — a nonsensical public metric. Clamp to 0.
+      successCount: Math.max(0, summary.totalTransitions - summary.totalErrors),
       errorCount: summary.totalErrors,
       averageDuration: summary.averageTransitionTime,
     }
