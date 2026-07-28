@@ -19,7 +19,10 @@ import {
   type Event,
   type EventAction,
   type Events,
+  type ExitContext,
   type FireResult,
+  type InvokeOperation,
+  type StateInvocation,
   type FunctionRegistry,
   type IErrorHandler,
   type ILogger,
@@ -196,6 +199,12 @@ export class StateMachine<
   private initialState: keyof SMConfig['states']
   private persistenceAdapter?: StatePersistenceAdapter
   private activeTimers: Map<string, any[]> = new Map()
+  // W3b (SPEC §6а) — per-leaf AbortControllers for in-flight `invoke.src`
+  // operations, kept ALONGSIDE activeTimers (same lifecycle: armed on entry in
+  // armStateInvoke, aborted before onExit in executeExitActions, dropped in
+  // teardownStateTimers). Keyed by the leaf state name, one controller per
+  // running operation of that leaf.
+  private activeInvokes: Map<string, AbortController[]> = new Map()
   private stateEntryTimes: Map<string, number> = new Map()
   // OTS (SPEC §6.1): per-microstep guard-result memo so a candidate governing
   // several active leaves has its guard evaluated at most once. Set/cleared by
@@ -1371,6 +1380,11 @@ export class StateMachine<
       }
     }
     this.activeTimers.clear()
+    // W3b: abort + drop all in-flight invoke operations on reset.
+    for (const controllers of this.activeInvokes.values()) {
+      for (const controller of controllers) controller.abort()
+    }
+    this.activeInvokes.clear()
     this.stateEntryTimes.clear()
 
     this.setInitialState(this.initialState as string, targetAdaptee)
@@ -3565,10 +3579,19 @@ export class StateMachine<
       }
 
       // Phase 3: exit ACTIONS — descendant-first over the combined exit set. NO
-      // timer teardown here (П5); timers are torn down post-commit only.
+      // timer teardown here (П5); timers are torn down post-commit only. W3b:
+      // each exiting leaf's onExit receives an ExitContext (SPEC §6а «б»), built
+      // from the SOURCE configuration (`currentState`) and the resolved target.
+      const sourceLeaves = currentState.split('|').filter(Boolean)
       try {
         for (const exitStateName of exitStates) {
-          await this.executeExitActions(obj, exitStateName, args, context)
+          const exitCtx = this.buildExitContext(
+            exitStateName,
+            sourceLeaves,
+            finalConfig,
+            String(eventName),
+          )
+          await this.executeExitActions(obj, exitStateName, args, context, exitCtx)
         }
       } catch (error) {
         if (this.abortOnExitError) return { kind: 'abort-exit' }
@@ -3720,7 +3743,20 @@ export class StateMachine<
     fromStateName: string,
     args: any[],
     context: ErrorContext,
+    // W3b (SPEC §6а, decision «б») — supplemental context appended as the LAST
+    // argument to `onExit` (never replacing the event payload).
+    exitCtx: ExitContext,
   ): Promise<void> {
+    // W3b (SPEC §6а, decision «а») — abort any in-flight invoke operations of
+    // this leaf BEFORE its onExit runs, so the exit handler observes
+    // `signal.aborted`. Synchronous and non-blocking; the post-commit
+    // teardownStateTimers drops the (already-aborted) controllers. Done even
+    // when there is no fromState config, harmless if there are no operations.
+    const controllers = this.activeInvokes.get(fromStateName)
+    if (controllers) {
+      for (const controller of controllers) controller.abort()
+    }
+
     const fromState = this.states.get(fromStateName)
 
     // П5 (SPEC §6.3): exit ACTIONS only — the per-leaf invoke-timer teardown and
@@ -3732,22 +3768,77 @@ export class StateMachine<
     // left the committed configuration.
     if (!fromState) return
 
-    const exitContext = { ...context, phase: 'exit' as const }
+    const exitErrorContext = { ...context, phase: 'exit' as const }
 
-    // Execute exit actions in sequence
-    const exitActions = [
-      fromState.onBeforeExit,
-      fromState.onExit,
-      fromState.onAfterExit,
-    ]
+    // Execute exit actions in sequence. Only `onExit` receives the ExitContext
+    // as a trailing argument (SPEC §6а): onExit(adaptee, ...payload, exitCtx).
+    await this.runExitAction(obj, fromState, fromState.onBeforeExit, args, exitErrorContext)
+    await this.runExitAction(obj, fromState, fromState.onExit, [...args, exitCtx], exitErrorContext)
+    await this.runExitAction(obj, fromState, fromState.onAfterExit, args, exitErrorContext)
+  }
 
-    for (const action of exitActions) {
-      if (action) {
-        await this.callAction(obj, action, ...args).catch(
-          this.processError(obj, exitContext, fromState.onError, this.onError),
-        )
-      }
+  /** W3b helper — run one exit hook with its error routing (or skip if absent). */
+  private async runExitAction(
+    obj: Adapter<TOwner>,
+    fromState: State<TOwner>,
+    action: ActionOrString<TOwner> | undefined,
+    callArgs: any[],
+    exitErrorContext: ErrorContext,
+  ): Promise<void> {
+    if (!action) return
+    await this.callAction(obj, action, ...callArgs).catch(
+      this.processError(obj, exitErrorContext, fromState.onError, this.onError),
+    )
+  }
+
+  /**
+   * W3b (SPEC §6а, decision «б») — assemble the {@link ExitContext} for a node
+   * leaving the configuration.
+   *
+   * - `wasFinal` — the node itself is `final` at exit.
+   * - `preempted` — the node was swept from OUTSIDE before completing (`true`)
+   *   vs its region/composite reached its final ("done") configuration
+   *   (`false`). Completion is judged on the SOURCE leaves: the nearest
+   *   enclosing composite is `done` (a region-leaf that reached final), or a
+   *   composite node is itself `done`, or a flat leaf is itself `final`.
+   *   A node swept while its composite is NOT done (e.g. a parallel-exit, or a
+   *   final leaf killed while its sibling region is still running) is preempted.
+   */
+  private buildExitContext(
+    fromStateName: string,
+    sourceLeaves: string[],
+    target: string,
+    event: string,
+  ): ExitContext {
+    const wasFinal = this.isStateFinal(fromStateName)
+    const node = this.states.get(fromStateName)
+    let completed: boolean
+    if (node?.regions) {
+      // A composite node: it completed iff it is all-regions-final at source.
+      completed = this.isCompositeDone(fromStateName, sourceLeaves)
+    } else {
+      const enclosing = this.enclosingComposite(fromStateName)
+      completed = enclosing
+        ? this.isCompositeDone(enclosing, sourceLeaves)
+        : wasFinal
     }
+    return { event, preempted: !completed, wasFinal, target }
+  }
+
+  /**
+   * W3b — the NEAREST (deepest) registered composite ancestor of `leaf`,
+   * excluding `leaf` itself, or `undefined` when `leaf` has no enclosing
+   * composite (a top-level state). ancestorChain is root-to-leaf, so the last
+   * regions-bearing entry before the leaf is the closest enclosing composite.
+   */
+  private enclosingComposite(leaf: string): string | undefined {
+    const chain = this.ancestorChain(leaf)
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const id = chain[i]!
+      if (id === leaf) continue
+      if (this.states.get(id)?.regions) return id
+    }
+    return undefined
   }
 
   /**
@@ -3810,6 +3901,13 @@ export class StateMachine<
       for (const timerId of existing) this.clearTimer(timerId)
       this.activeTimers.delete(toStateName)
     }
+    // W3b: abort + drop any stale invoke operations for this state before
+    // re-arming (parity with the timer stale-clear above).
+    const staleOps = this.activeInvokes.get(toStateName)
+    if (staleOps) {
+      for (const controller of staleOps) controller.abort()
+      this.activeInvokes.delete(toStateName)
+    }
 
     // Record entry time if not already recorded (e.g. from resumeTimers)
     if (!this.stateEntryTimes.has(toStateName)) {
@@ -3817,8 +3915,9 @@ export class StateMachine<
     }
 
     const timers: any[] = []
+    const controllers: AbortController[] = []
     for (const invocation of toState.invoke) {
-      // Check condition (cond) before starting the timer
+      // Check condition (cond) before starting the timer / operation.
       if (invocation.cond) {
         try {
           const shouldInvoke = invocation.cond(obj.adaptee)
@@ -3833,29 +3932,114 @@ export class StateMachine<
         }
       }
 
+      // W3b (SPEC §6а, decision «а») — the long-running operation form. The
+      // operation is STARTED via the scheduler (setTimer delay 0) so, under an
+      // injected scheduler, its launch is deterministic just like a timer; its
+      // AbortController lives here alongside the timers and is aborted before
+      // onExit (executeExitActions). onDone/onError are raised as INTERNAL
+      // events; the event of an already-aborted operation is dropped.
+      if (this.isInvokeOperation(invocation)) {
+        const op = invocation
+        const controller = new AbortController()
+        controllers.push(controller)
+        const startOp = () => {
+          // Still in the leaf, and not already aborted by an exit that raced the
+          // scheduled start.
+          const currentState = this.getCurrentState(obj as any)
+          if (!currentState?.split('|').includes(toStateName)) return
+          if (controller.signal.aborted) return
+          let result: Promise<unknown>
+          try {
+            result = op.src(obj.adaptee, controller.signal)
+          } catch (err) {
+            this.handleInvokeRejection(obj, op, controller, err, toStateName)
+            return
+          }
+          Promise.resolve(result).then(
+            (value) => {
+              // Cancelled (leaf left before settle) → drop the completion event.
+              if (controller.signal.aborted) return
+              if (op.onDone) {
+                this.raiseEvent(op.onDone as string, obj as any, value)
+                this.scheduleProcessing()
+              }
+            },
+            (err) => {
+              this.handleInvokeRejection(obj, op, controller, err, toStateName)
+            },
+          )
+        }
+        const timerId = this.setTimer(startOp, 0)
+        timers.push(timerId)
+        continue
+      }
+
+      // Timer form (PRESERVED): raise `event` after `delay` ms.
+      const timer = invocation
       const callback = async () => {
         const currentState = this.getCurrentState(obj as any)
         if (currentState?.split('|').includes(toStateName)) {
           try {
-            if (invocation.action) {
-              await this.callAction(obj, invocation.action)
+            if (timer.action) {
+              await this.callAction(obj, timer.action)
             }
-            this.raiseEvent(invocation.event as string, obj as any)
+            this.raiseEvent(timer.event as string, obj as any)
             this.scheduleProcessing()
           } catch (err) {
             this.logger.error(
               'Invocation error',
-              { state: toStateName, event: invocation.event },
+              { state: toStateName, event: timer.event },
               err as Error,
             )
           }
         }
       }
 
-      const timerId = this.setTimer(callback, invocation.delay)
+      const timerId = this.setTimer(callback, timer.delay)
       timers.push(timerId)
     }
     this.activeTimers.set(toStateName, timers)
+    if (controllers.length > 0) {
+      this.activeInvokes.set(toStateName, controllers)
+    }
+  }
+
+  /**
+   * W3b (SPEC §6а) — discriminate the {@link StateInvocation} union: the
+   * long-running operation arm carries a `src` FUNCTION; the timer arm does not.
+   */
+  private isInvokeOperation(
+    invocation: StateInvocation<TOwner>,
+  ): invocation is InvokeOperation<TOwner> {
+    return typeof (invocation as InvokeOperation<TOwner>).src === 'function'
+  }
+
+  /**
+   * W3b (SPEC §6а) — route an `invoke.src` REJECTION. A cancelled (aborted)
+   * operation is silent (the leaf was left). Otherwise: with `onError`, raise it
+   * as an internal event carrying the error payload; with NO `onError`, surface
+   * the failure through `monitor.recordError` — the SAME observable policy as a
+   * throwing guard (F7).
+   */
+  private handleInvokeRejection(
+    obj: Adapter<TOwner>,
+    op: InvokeOperation<TOwner>,
+    controller: AbortController,
+    err: unknown,
+    stateName: string,
+  ): void {
+    if (controller.signal.aborted) return
+    const errObj = err instanceof Error ? err : new Error(String(err))
+    if (op.onError) {
+      this.raiseEvent(op.onError as string, obj as any, errObj)
+      this.scheduleProcessing()
+      return
+    }
+    this.reportRuntimeError(
+      errObj,
+      { state: stateName, action: op.id ?? 'invoke', phase: 'action' },
+      obj as unknown as Adapter<PropertiesOf<TOwner>>,
+    )
   }
 
   /**
@@ -3869,6 +4053,15 @@ export class StateMachine<
     if (timers) {
       for (const timerId of timers) this.clearTimer(timerId)
       this.activeTimers.delete(stateName)
+    }
+    // W3b: abort + drop any in-flight invoke operations of this leaf. The abort
+    // is idempotent — executeExitActions already aborted it BEFORE onExit; this
+    // is the post-commit cleanup (and the safety net for teardown paths that do
+    // not run executeExitActions, e.g. the errorState fallback).
+    const controllers = this.activeInvokes.get(stateName)
+    if (controllers) {
+      for (const controller of controllers) controller.abort()
+      this.activeInvokes.delete(stateName)
     }
     this.stateEntryTimes.delete(stateName)
   }
@@ -4071,6 +4264,11 @@ export class StateMachine<
       }
     }
     this.activeTimers.clear()
+    // W3b: abort + drop any in-flight invoke operations before re-arming.
+    for (const controllers of this.activeInvokes.values()) {
+      for (const controller of controllers) controller.abort()
+    }
+    this.activeInvokes.clear()
 
     const currentState = this.getCurrentState()
     if (!currentState) return
@@ -4106,6 +4304,10 @@ export class StateMachine<
       const timers: any[] = []
 
       for (const invocation of state.invoke) {
+        // W3b: a long-running `invoke.src` operation cannot be resumed from a
+        // serialized snapshot (its promise/AbortSignal do not survive) — skip it
+        // here; a fresh entry re-launches it via armStateInvoke.
+        if (this.isInvokeOperation(invocation)) continue
         const remaining = Math.max(0, invocation.delay - elapsed)
 
         // If time already passed, fire immediately (in next tick)

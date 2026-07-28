@@ -311,7 +311,13 @@ export type State<T extends object> = {
   invoke?: StateInvocation<T>[] // Поручения (выполняются при входе в состояние)
 }
 
-export interface StateInvocation<T extends object> {
+/**
+ * SPEC §6а — the ORIGINAL timer form of an invocation: after `delay` ms (armed
+ * on leaf entry, torn down on leaf exit) the engine raises `event` internally.
+ * PRESERVED verbatim so existing configs keep working; it is one arm of the
+ * {@link StateInvocation} union.
+ */
+export interface InvokeTimer<T extends object> {
   /** Время задержки в миллисекундах */
   delay: number
   /** Событие, которое будет вызвано после задержки */
@@ -320,6 +326,63 @@ export interface StateInvocation<T extends object> {
   cond?: (adaptee: T) => boolean
   /** Действие, выполняемое перед событием */
   action?: ActionOrString<T>
+}
+
+/**
+ * SPEC §6а (decision «а») — a LONG-RUNNING invoked operation with cancellation.
+ * `src` is started on leaf entry (after `onEnter`) and receives an
+ * {@link AbortSignal} that is `abort()`-ed when the leaf is exited (BEFORE its
+ * `onExit`, so the exit handler observes `signal.aborted`).
+ *
+ * - `onDone` — internal event raised on fulfilment; the resolved value is the
+ *   event payload.
+ * - `onError` — internal event raised on rejection; the error is the payload.
+ *   With NO `onError`, a rejection is routed to `monitor.recordError` (the same
+ *   observable policy as a throwing guard, F7).
+ * - An event produced by an operation that was already cancelled
+ *   (`signal.aborted` at settle time) is DROPPED — the leaf has been left.
+ */
+export interface InvokeOperation<T extends object> {
+  /** The operation. Started on entry; receives an AbortSignal cancelled on exit. */
+  src: (adaptee: T, signal: AbortSignal, ...args: any[]) => Promise<unknown>
+  /** Internal event raised on success; the resolved value is the payload. */
+  onDone?: EventName
+  /** Internal event raised on failure; the error is the payload. */
+  onError?: EventName
+  /** Условие запуска операции (checked on entry). */
+  cond?: (adaptee: T) => boolean
+  /** Optional stable identity for diagnostics / recordError context. */
+  id?: string
+}
+
+/**
+ * SPEC §6а — a state invocation is EITHER the timer form ({@link InvokeTimer})
+ * or the long-running operation form ({@link InvokeOperation}). The union is
+ * discriminated at runtime by the presence of a `src` function.
+ */
+export type StateInvocation<T extends object> =
+  | InvokeTimer<T>
+  | InvokeOperation<T>
+
+/**
+ * SPEC §6а (decision «б») — supplemental context passed as the LAST argument to
+ * a leaf's `onExit` (in addition to, never replacing, the event payload):
+ * `onExit(adaptee, ...eventPayload, exitContext)`. Lets a region/lane tell
+ * "I was swept" from "I reached final".
+ */
+export interface ExitContext {
+  /** Name of the event that drove this exit. */
+  event: string
+  /**
+   * `true` — the node was swept from OUTSIDE before its region completed
+   * (parallel-exit / abort); `false` — the region reached its final
+   * configuration (natural completion).
+   */
+  preempted: boolean
+  /** Whether the node being exited was itself `final` at the moment of exit. */
+  wasFinal: boolean
+  /** The target configuration being entered. */
+  target: string
 }
 
 // Wildcard `from` forms are a documented (README) and validator-supported (V2)

@@ -98,7 +98,27 @@ pre-existing на baseline, не регресс W3-C.
 
 Итог W3-C.1: **892 passed / 14 skipped; оба tsc чисты**; W0-W3 регресс 58/58.
 
-## Вывод W3 (A + B + B.1 + C + C.1)
+## W3b — invoke-операции с AbortSignal + ExitContext (новая фича, SPEC §6а) — verdict CLOSED
+
+Прямой ответ на вопрос владельца из начала сессии (как лэйны узнают про abort и сворачивают работу):
+
+| часть | факт | подтверждение (оркестратор-прогон) |
+|---|---|---|
+| invoke union | `StateInvocation = InvokeTimer \| InvokeOperation`; таймерная форма сохранена дословно | таймерная форма зелёная (advanced_features) |
+| операция + AbortSignal | `src:(adaptee,signal)=>Promise` в `activeInvokes` рядом с per-leaf таймерами; запуск через инжектированный scheduler | операция стартует при входе |
+| abort при выходе | `abort()` в `executeExitActions` ДО onExit, синхронно | `signal.aborted` виден в onExit (лэйн узнал) |
+| onDone/onError | через raiseEvent (результат/ошибка в payload) | ✓ |
+| отменённая игнорируется | `signal.aborted` к моменту settle → событие НЕ в очередь | состояние `aborted`, onDone НЕ увёл в okState (нет призрака) |
+| отказ без onError | → reportRuntimeError → monitor.recordError (политика F7) | наблюдаемо |
+| ExitContext | `{event,preempted,wasFinal,target}` доп. аргументом в onExit (payload не заменён) | preempted:true при parallel-exit, false при final; argc+1 |
+| DST | запуск/отмена через scheduler | детерминизм |
+| валидатор | INVOKE_NO_HANDLER активирован для src без onDone/onError (заготовка W2b) | ✓ |
+
+Итог W3b: **899 passed / 14 skipped; оба tsc чисты**; W0-W3 не тронуты. Residual (contract note, не
+дефект): `preempted = NOT(reached-final)` — промежуточный лист сообщает preempted:true; соответствует
+буквальному SPEC.
+
+## Вывод W3 (A + B + B.1 + C + C.1 + b)
 
 Семантика ядра переписана: правило выбора перехода SCXML/UML, optimal transition set (несколько
 переходов за микрошаг), корректный порядок фаз с живыми таймерами. Гарды наблюдаемы и ленивы.

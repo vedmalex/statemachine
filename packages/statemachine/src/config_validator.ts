@@ -680,8 +680,43 @@ export class ConfigValidator {
           `${path}.invoke`,
         )
       } else {
-        state.invoke.forEach((inv, index) => {
+        state.invoke.forEach((inv: any, index) => {
           const invPath = `${path}.invoke[${index}]`
+          // W3b (SPEC §6а) — StateInvocation is a union: the operation form
+          // carries `src`; the timer form carries `delay`/`event`. Discriminate
+          // on the presence of a `src` key so the operation form is NOT wrongly
+          // flagged as a timer missing its delay/event.
+          if ('src' in inv && inv.src !== undefined) {
+            if (typeof inv.src !== 'function') {
+              this.addError(
+                'INVALID_INVOKE',
+                'invoke "src" must be a function (adaptee, signal) => Promise',
+                `${invPath}.src`,
+              )
+            }
+            if (inv.onDone !== undefined && typeof inv.onDone !== 'string') {
+              this.addError(
+                'INVALID_EVENT_NAME',
+                'invoke "onDone" must be an event name string',
+                `${invPath}.onDone`,
+              )
+            }
+            if (inv.onError !== undefined && typeof inv.onError !== 'string') {
+              this.addError(
+                'INVALID_EVENT_NAME',
+                'invoke "onError" must be an event name string',
+                `${invPath}.onError`,
+              )
+            }
+            if (inv.cond && typeof inv.cond !== 'function') {
+              this.addError(
+                'INVALID_COND',
+                'Condition must be a function',
+                `${invPath}.cond`,
+              )
+            }
+            return
+          }
           if (typeof inv.delay !== 'number' || inv.delay < 0) {
             this.addError(
               'INVALID_DELAY',
@@ -1189,15 +1224,32 @@ export class ConfigValidator {
   }
 
   /**
-   * W3b PLACEHOLDER (inactive in W2b). Will warn `INVOKE_NO_HANDLER` for the new
-   * `invoke` form carrying a `src` with neither `onDone` nor `onError`. Kept as a
-   * declared method (not wired into validate()) so the W3b activation is a
-   * one-line call, avoiding a second-wave dead-code block. Активируется в W3b.
+   * W3b (SPEC §6а) — warn `INVOKE_NO_HANDLER` for an `invoke.src` operation that
+   * declares NEITHER `onDone` NOR `onError`: its success value is dropped and its
+   * failure only reaches `monitor.recordError` (never a state transition), which
+   * is almost always an authoring oversight. Advisory (warning) — the machine
+   * still builds and runs the operation.
    */
   private validateInvokeHandlers<T extends object>(
-    _smConfig: StateMachineConfig<T>,
+    smConfig: StateMachineConfig<T>,
   ): void {
-    // Активируется в W3b (форма invoke.src ещё не существует в W2b).
+    const entries: Array<{ path: string; state: Omit<State<T>, 'name'> }> = []
+    this.collectStateEntries(smConfig.states, '', entries)
+    for (const { path, state } of entries) {
+      if (!Array.isArray(state.invoke)) continue
+      state.invoke.forEach((inv: any, index) => {
+        const isOperation = 'src' in inv && typeof inv.src === 'function'
+        if (isOperation && inv.onDone === undefined && inv.onError === undefined) {
+          this.addWarning(
+            'INVOKE_NO_HANDLER',
+            `invoke operation at "${path}.invoke[${index}]" declares a "src" but neither "onDone" nor "onError" — its result is discarded and a failure only reaches monitor.recordError`,
+            `${path}.invoke[${index}]`,
+            undefined,
+            'Add an `onDone` and/or `onError` event so the operation outcome drives a transition.',
+          )
+        }
+      })
+    }
   }
 
   // ── selection warnings (help W3 migration) ──────────────────────────────────
