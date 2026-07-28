@@ -141,6 +141,105 @@ export interface CheckerContext {
     readonly maxQueueDepth?: number;
 }
 
+// @public (undocumented)
+export interface CheckEventSpec<T extends object> {
+    // (undocumented)
+    readonly name: string;
+    readonly payload?: (rng: CheckRng, snapshot: MachineSnapshot<T>) => readonly unknown[];
+    readonly weight?: number;
+}
+
+// @public
+export function checkMachine<T extends object>(config: StateMachineConfig<T>, owner: OwnerSource<T>, options?: CheckOptions<T>): Promise<CheckReport>;
+
+// @public (undocumented)
+export interface CheckOptions<T extends object> {
+    readonly degradationExcept?: readonly WarningKind[];
+    // (undocumented)
+    readonly events?: readonly CheckEventSpec<T>[];
+    readonly failOn?: readonly FailCause[];
+    // (undocumented)
+    readonly invariants?: readonly MachineInvariant<T>[];
+    // (undocumented)
+    readonly mode?: 'safety' | 'liveness' | 'both';
+    // (undocumented)
+    readonly onRealTimerEscape?: 'warn' | 'fail' | 'ignore';
+    // (undocumented)
+    readonly runs?: number;
+    // (undocumented)
+    readonly seed?: string | bigint;
+    // (undocumented)
+    readonly steps?: number;
+}
+
+// @public (undocumented)
+export interface CheckReport {
+    // (undocumented)
+    readonly deadEvents: readonly string[];
+    // (undocumented)
+    readonly deadlocks: ReadonlyArray<{
+        state: string;
+    }>;
+    readonly failedOn: readonly FailCause[];
+    // (undocumented)
+    readonly livelocks: ReadonlyArray<{
+        reason: string;
+    }>;
+    // (undocumented)
+    readonly ok: boolean;
+    readonly oraclesRun: number;
+    // (undocumented)
+    readonly reachableStates: readonly string[];
+    // (undocumented)
+    readonly runs: number;
+    readonly saturation: {
+        readonly plateauedAtRun: number | null;
+        readonly newCoveragePerRun: readonly number[];
+    };
+    // (undocumented)
+    readonly seed: string;
+    // (undocumented)
+    readonly steps: number;
+    readonly transitionsFired: number;
+    // (undocumented)
+    readonly uncoveredTransitions: ReadonlyArray<{
+        event: string;
+        from: string;
+        to: string;
+    }>;
+    // (undocumented)
+    readonly unreachableStates: readonly string[];
+    // (undocumented)
+    readonly violations: readonly CheckViolation[];
+    // (undocumented)
+    readonly warnings: readonly CheckWarning[];
+}
+
+// @public
+export interface CheckRng {
+    float(): number;
+    int(max: number): number;
+    pick<A>(xs: readonly A[]): A;
+}
+
+// @public (undocumented)
+export interface CheckViolation {
+    // (undocumented)
+    readonly invariant: string;
+    readonly kind: 'engine' | 'builtin' | 'user';
+    readonly reproCode: string;
+    // (undocumented)
+    readonly witness: string;
+}
+
+// @public (undocumented)
+export interface CheckWarning {
+    // (undocumented)
+    readonly detail: string;
+    // (undocumented)
+    readonly kind: WarningKind;
+}
+
 // @public
 export function classifyCorruptState(probe: CorruptStateProbe): ErrorClass;
 
@@ -374,6 +473,9 @@ export interface EventSpec {
     // (undocumented)
     readonly transitions: readonly TransitionSpec[];
 }
+
+// @public
+export type FailCause = 'violation' | 'deadlock' | 'non-converging' | 'no-progress' | 'livelock' | 'escape' | 'degradation';
 
 // @public
 export interface FaultCursor {
@@ -742,6 +844,22 @@ export type LivenessVerdict = 'PROGRESSED' | 'STUCK' | 'TIMEOUT_BUDGET_EXCEEDED'
 // @public
 export function loadPerfBaseline(path: string): PerfBaselineFile;
 
+// @public (undocumented)
+export interface MachineInvariant<T extends object> {
+    readonly check: (snapshot: MachineSnapshot<T>) => boolean;
+    // (undocumented)
+    readonly name: string;
+}
+
+// @public
+export interface MachineSnapshot<T extends object> {
+    readonly config: string;
+    readonly data: Readonly<T>;
+    // (undocumented)
+    readonly queueDepth: number;
+    readonly state: string;
+}
+
 // @public
 export function makeAsyncCounter(): AsyncCounter;
 
@@ -913,6 +1031,9 @@ export interface OpDriverView {
 
 // @public
 export const overflowScenario: CoverageScenario;
+
+// @public
+export type OwnerSource<T extends object> = T | Adapter<T> | (() => T | Adapter<T>);
 
 // @public
 export const PERF_BASELINE_PATH: string;
@@ -1299,8 +1420,8 @@ export interface SimOptions {
     readonly faults?: FaultPlan;
     // (undocumented)
     readonly invariants?: readonly Invariant[];
-    // (undocumented)
-    readonly mode?: 'safety' | 'liveness';
+    readonly maxQueueDepth?: number;
+    readonly mode?: 'safety' | 'liveness' | 'both';
     // (undocumented)
     readonly onTrace?: (frame: TraceFrame) => void;
     // (undocumented)
@@ -1311,10 +1432,13 @@ export interface SimOptions {
 
 // @public (undocumented)
 export interface SimResult {
+    readonly livelocks?: readonly LivenessResult[];
+    readonly liveness?: LivenessResult;
     // (undocumented)
     readonly metrics: PerfSample;
     // (undocumented)
     readonly ok: boolean;
+    readonly oraclesRun: number;
     // (undocumented)
     readonly seed: string;
     // (undocumented)
@@ -1324,7 +1448,8 @@ export interface SimResult {
     // (undocumented)
     readonly traceHash: string;
     // (undocumented)
-    readonly violation?: Violation;
+    readonly violation?: SimViolation;
+    readonly warnings?: readonly SimWarning[];
 }
 
 // @public (undocumented)
@@ -1365,6 +1490,21 @@ export class Simulator<T extends object = object> {
     step(): Promise<StepOutcome>;
 }
 
+// @public (undocumented)
+export type SimViolation = Violation & {
+    readonly kind?: 'engine' | 'liveness';
+};
+
+// @public (undocumented)
+export interface SimWarning {
+    // (undocumented)
+    readonly count?: number;
+    // (undocumented)
+    readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles';
+    // (undocumented)
+    readonly message: string;
+}
+
 // @public
 export const SPLITMIX64_INCREMENT = 11400714819323198485n;
 
@@ -1388,6 +1528,8 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     // (undocumented)
     get currentState(): string;
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
+    // Warning: (ae-forgotten-export) The symbol "FireResult_2" needs to be exported by the entry point index.d.ts
+    fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult_2>;
     // (undocumented)
     static fromData<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(config: SMConfig, initialState?: string, context?: TOwner, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     // (undocumented)
@@ -1397,12 +1539,18 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     static fromSecureJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): Promise<StateMachine<TOwner, SMConfig>>;
     // (undocumented)
     getAvailableEvents(adaptee?: Adapter<PropertiesOf<TOwner>>): string[];
+    // Warning: (ae-forgotten-export) The symbol "CompiledModel" needs to be exported by the entry point index.d.ts
+    //
+    // @internal
+    getCompiledModel(): CompiledModel;
     // (undocumented)
     getCurrentState(adaptee?: Adapter<PropertiesOf<TOwner>>): string | undefined;
     // Warning: (ae-forgotten-export) The symbol "StateInfo" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
     getCurrentStateInfo(): StateInfo | undefined;
+    getMetrics(): MonitorMetricsSnapshot | undefined;
+    getMonitor(): IMonitor;
     // (undocumented)
     getQueueDepth(): {
         internal: number;
@@ -1470,6 +1618,8 @@ export interface StateMachineConfig<T extends object = object> {
 // @public (undocumented)
 export interface StateMachineOptions {
     abortOnExitError?: boolean;
+    // Warning: (ae-forgotten-export) The symbol "FunctionRegistry" needs to be exported by the entry point index.d.ts
+    actions?: FunctionRegistry;
     clock?: () => number;
     // (undocumented)
     errorHandler?: IErrorHandler;
@@ -1477,10 +1627,12 @@ export interface StateMachineOptions {
     // (undocumented)
     logger?: ILogger;
     maxQueueDepth?: number;
+    maxTransitionDepth?: number;
     // (undocumented)
     monitor?: IMonitor;
     // (undocumented)
     scheduler?: ITimerScheduler;
+    strictActions?: boolean;
     transitionTimeout?: number;
 }
 
@@ -1588,6 +1740,7 @@ export interface TraceFrame {
     };
     // (undocumented)
     readonly quiescent: boolean;
+    readonly settleReason?: SettleReason;
     // (undocumented)
     readonly step: number;
     // (undocumented)
@@ -1651,6 +1804,9 @@ export interface Violation {
 
 // @public
 export type ViolationFingerprint = Violation['fingerprint'];
+
+// @public (undocumented)
+export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-plateau' | 'uncovered-at-plateau' | 'residual-rejection';
 
 // @public
 export function wire<T extends object>(env: SimEnv, config: StateMachineConfig<T>, owner: T | Adapter<T>): StateMachine<T, StateMachineConfig<T>>;

@@ -323,3 +323,19 @@ export type {
   ErrorClass,
   FaultKind,
 } from './trace'
+
+// --- checkMachine: the consumer-facing dynamic config check (W6 / #17) ---
+export { checkMachine } from './check-machine'
+export type {
+  CheckReport,
+  CheckOptions,
+  CheckViolation,
+  CheckWarning,
+  CheckEventSpec,
+  MachineInvariant,
+  MachineSnapshot,
+  OwnerSource,
+  FailCause,
+  WarningKind,
+  Rng as CheckRng,
+} from './check-machine'

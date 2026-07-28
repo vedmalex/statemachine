@@ -266,6 +266,23 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 | `StateMachineOptions.clock?` | option | Inject a virtual clock (default `Date.now`). |
 | `ITimerScheduler.process?(now?)` | method | Optional manual drain; implemented by `createVirtualScheduler`. |
 
+### Dynamic config check — `checkMachine`
+
+`checkMachine(config, ownerFactory, options?)` (from `@vedmalex/statemachine/sim`)
+is the **dynamic** complement to the static `validateConfig`: it fuzzes your
+machine over N deterministic runs through the simulator's oracle suite and returns
+a structured `CheckReport` of unreachable states, deadlocks, livelocks, invariant
+violations, and coverage gaps. The report's `ok` cannot lie — `ok === true` implies
+`oraclesRun > 0 ∧ transitionsFired > 0`. **It is fuzzing, not model-checking:** the
+absence of a finding is not a proof of correctness. Full guide, contract, and the
+list of what it does NOT check: [`docs/dynamic-check.md`](./docs/dynamic-check.md).
+
+```ts
+import { checkMachine } from '@vedmalex/statemachine/sim'
+const report = await checkMachine(myConfig, () => ({ state: 'idle' }), { seed: 'ci-1', runs: 32 })
+if (!report.ok) throw new Error(`checkMachine failed: ${report.failedOn.join(', ')}`)
+```
+
 ## Stability policy
 
 5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. The all-regions-final join API lives on these stable symbols — `State.final?: boolean`, `StateMachine.isDone(compositeId)`, and the engine-raised `done.state.<id>` event (all reflected in `etc/statemachine.api.md`). Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
