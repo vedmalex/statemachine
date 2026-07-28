@@ -30,40 +30,60 @@ npm install @vedmalex/statemachine
 ```ts
 import { createMachine } from '@vedmalex/statemachine'
 
-const sm = createMachine({
-  name: 'door',
-  initialState: 'closed',
-  states: { closed: {}, open: {} },
-  events: { open: { transitions: [{ from: 'closed', to: 'open' }] } },
-})
+// The owner object holds the current state under `stateAttribute` ('state').
+const door = { state: 'closed' }
+
+const sm = createMachine(
+  {
+    name: 'door',
+    stateAttribute: 'state',
+    initialState: 'closed',
+    states: { closed: {}, open: {} },
+    events: { open: { transitions: [{ from: 'closed', to: 'open' }] } },
+  },
+  door,
+)
+
+await sm.fireEvent('open')
+console.log(sm.currentState) // 'open'
 ```
+
+`initialState` and every transition `from` / `to` are typed against the state
+keys you declare: a typo such as `initialState: 'closd'` or `to: 'opn'` is a
+compile-time error. See [`types/`](./types) for the emitted declarations.
 
 ## Hierarchical regions, parallel states & join
 
 A state may declare `regions` to run several orthogonal sub-machines at once. Entry/exit follow SCXML/UML ordering, and a region may complete via a `final` state that raises a `done.state.<id>` join event.
 
 ```ts
-const sm = createMachine({
-  name: 'proc',
-  initialState: 'proc',
-  states: {
-    proc: {
-      initial: 'a.run|b.run',          // both regions active in parallel
-      onEnter: () => {/* parent runs BEFORE region children (ancestor-first) */},
-      regions: {
-        a: { run: {}, done: { final: true } },
-        b: { run: {}, done: { final: true } },
+const proc = { state: 'proc' }
+
+const sm = createMachine(
+  {
+    name: 'proc',
+    stateAttribute: 'state',
+    initialState: 'proc',
+    states: {
+      proc: {
+        initial: 'a.run|b.run',          // both regions active in parallel
+        onEnter: () => {/* parent runs BEFORE region children (ancestor-first) */},
+        regions: {
+          a: { run: {}, done: { final: true } },
+          b: { run: {}, done: { final: true } },
+        },
       },
+      complete: {},
     },
-    complete: {},
+    events: {
+      finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
+      finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
+      // Join: raised automatically once EVERY region reached a `final` state.
+      'done.state.proc': { transitions: [{ from: 'proc', to: 'complete' }] },
+    },
   },
-  events: {
-    finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
-    finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
-    // Join: raised automatically once EVERY region reached a `final` state.
-    'done.state.proc': { transitions: [{ from: 'proc', to: 'complete' }] },
-  },
-})
+  proc,
+)
 ```
 
 - **Expansion** — entering `proc` (as initial state *or* via a transition) expands to the parallel configuration `proc.a.run|proc.b.run`.

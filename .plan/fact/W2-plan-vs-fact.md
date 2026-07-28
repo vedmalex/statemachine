@@ -45,4 +45,23 @@ DUPLICATE_REGION_NAME остаются репорт-ошибками (isValid:fa
 Причина (verify независимо подтвердил REQUIRED): рантайм сознательно исполняет вырожденные final-only
 регионы, которые строят замороженные тесты; бросок реоткрыл бы гейты. SPEC §1а обновлён под это.
 
-## W2c — типы путей + README (#16) — ОЖИДАЕТ
+## W2c — типы путей + README (#16) — verdict CLOSED (после residual-фикса)
+
+| дефект | факт | подтверждение |
+|---|---|---|
+| V8 [HIGH] StatePaths инертен | `createMachine` выводит ЛИТЕРАЛЬНЫЕ ключи states (`const S extends States<T>` + `TypedMachineConfig`); `from`/`to`/`initialState` типизируются как `StatePaths<S>`, не string | опечатка через inference-форму → tsc-ошибка (TS2820 «Did you mean…»); проверено |
+| V7 [HIGH] README падает | оба примера: + owner-аргумент, + stateAttribute, + await; регионный `initial:'a.run\|b.run'` работает (W2b валидатор + рантайм) | Quick start дословно → печатает `open`; tsc-strict чист |
+| типгейт (критик W1) | `tsconfig.typecheck.json` + `typecheck:types`: type-тесты `*.test-d.ts` проверяются tsc (исключён avalanche `*.test.ts`) | зубы: удаление `@ts-expect-error` → TS2578 |
+| **residual (verify): wildcard ложно отвергнут** | литеральный `StatePaths<S>` отвергал валидный `from:'*'`/`'proc.*'` (документирован, V2). **Закрыто оркестратором**: `WildcardFrom = '*'\|` ${string}.* ``на`from`, `'*'` на `to` | inference-форма: wildcard принят, опечатка ловится; wildcard-контроль в типгейте |
+
+Итог W2c: **846 passed; основной tsc чист; типгейт чист** (оркестратор-прогон). Дельта (§0.6):
+residual с wildcard закрыт довеском (literal-narrowing V8 ломал легит wildcard) + постоянный
+wildcard-контроль в типгейте против повторного сужения.
+
+## Вывод W2 (W2a + W2b + W2c)
+
+Фундамент семантики заложен: нормализованная модель (детерминированный documentIndex для OTS в W3),
+валидатор говорит правду (9 настоящих warning на корпусе MB3 вместо 28), типы ловят опечатки путей,
+README работает. Гейт характеризации держит через все три под-волны — селекция НЕ сдвинута, готова к
+смене правила в W3. Каждая под-волна прошла red→fix→verify + оркестратор-прогон; residuals (сужение
+политики бросков, wildcard-типы) закрыты по §0.6.

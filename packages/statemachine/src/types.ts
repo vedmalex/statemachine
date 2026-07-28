@@ -314,10 +314,19 @@ export interface StateInvocation<T extends object> {
   action?: ActionOrString<T>
 }
 
+// Wildcard `from` forms are a documented (README) and validator-supported (V2)
+// feature: `from: '*'` (any state) and `from: 'prefix.*'` (any state under a
+// prefix / a parallel region). With a literal `S`, `StatePaths<S>` is a finite
+// union that excludes these, so authoring a legit wildcard would be a FALSE type
+// error (W2c regression from the V8 literal-key narrowing). Allow them on `from`
+// only. `to` additionally permits '*' (the runtime self-transition target), but
+// NOT a `prefix.*` set — a transition target must be a concrete state.
+export type WildcardFrom = '*' | `${string}.*`
+
 // Использовать для полей from, to в Transition
 export type Transition<T extends object, S extends States<T>> = {
-  from: StatePaths<S>
-  to: StatePaths<S>
+  from: StatePaths<S> | WildcardFrom
+  to: StatePaths<S> | '*'
   priority?: number
   guard?: ActionOrString<T, boolean>
   /**
@@ -370,6 +379,34 @@ export interface StateMachineConfig<T extends object = object> {
   >
   states: States<T> // Корневые состояния машины
   // states: Record<StateName, Omit<State<T>, 'name'>>
+  onError?: ErrorHandlerOrString<T>
+}
+
+/**
+ * Author-facing config shape that PRESERVES the literal state keys so that
+ * `initialState`, and every transition `from` / `to`, are checked against the
+ * ACTUAL declared states rather than degrading to `string`.
+ *
+ * {@link StateMachineConfig} declares `states: States<T>` where
+ * `States<T> = Record<StateName /* = string *\/, …>` — that `Record<string, …>`
+ * collapses the state keys to `string`, so `initialState: keyof states` and
+ * `from`/`to: StatePaths<states>` become `string` and typos slip through the
+ * compiler. `TypedMachineConfig<T, S>` keeps `S` (the exact `states` object)
+ * as its own type parameter; the {@link createMachine} factory infers `S` with
+ * a `const` type parameter so `S` retains the literal keys, making
+ * `StatePaths<S>` a finite union and turning a typo into a compile error.
+ *
+ * A `TypedMachineConfig<T, S>` is structurally assignable to
+ * `StateMachineConfig<T>` (since `S extends States<T>` and
+ * `StatePaths<S> ⊆ string`), so it flows into the runtime constructor unchanged.
+ */
+export interface TypedMachineConfig<T extends object, S extends States<T>> {
+  name: string
+  description?: string
+  stateAttribute: KeysOf<PropertiesOf<T>, string>
+  initialState: StatePaths<S>
+  events: Record<EventName, Omit<Event<T, S>, 'name'>>
+  states: S
   onError?: ErrorHandlerOrString<T>
 }
 

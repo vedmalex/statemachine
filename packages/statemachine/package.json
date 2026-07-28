@@ -52,6 +52,7 @@
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
     "lint": "biome check .",
     "typecheck": "tsc --noEmit",
+    "typecheck:types": "tsc -p tsconfig.typecheck.json",
     "check": "biome check . && tsc --noEmit && knip --no-progress",
     "test": "vitest run",
     "test:watch": "vitest",
