@@ -2,7 +2,7 @@
   "$schema": "https://unpkg.com/knip@latest/schema.json",
   "project": ["src/**/*.ts"],
   "entry": ["src/sim/coverage.ts!", "src/sim/cli/sim-coverage.ts!", "src/sim/cli/sim-pr.ts!", "src/sim/cli/sim-sweep.ts!"],
-  "ignore": ["src/tests/**", "src/presets.ts", "src/security.ts"],
+  "ignore": ["src/tests/**", "src/presets.ts"],
   "ignoreDependencies": ["typedoc", "@changesets/cli"],
   "rules": {
     "types": "warn"

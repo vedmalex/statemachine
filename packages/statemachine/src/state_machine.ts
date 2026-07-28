@@ -1,6 +1,10 @@
 import { securityLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
-import { type SafeSerializedAction, safeFunctionSerializer } from './security'
+import {
+  type SafeSerializedAction,
+  serializeActionRef,
+  serializeActionRefAsync,
+} from './serialize-actions'
 import { createDefaultMonitor } from './monitoring'
 import { createDefaultErrorHandler } from './error_handling'
 import {
@@ -32,9 +36,6 @@ import {
   type States,
   type Transition,
 } from './types'
-
-// Removed unused helper functions serializeAction and deserializeAction
-// These functions are available through safeFunctionSerializer directly when needed
 
 /**
  * Prototype-chain builtin names that must NEVER be call-time-resolved as an
@@ -809,13 +810,16 @@ export class StateMachine<
     const { config, currentState, historyMap, stateEntryTimes } = parsedData
 
     const registry = options?.actions
+    const strict = options?.strictActions ?? false
     const deserializedStates = StateMachine.deserializeStates<TOwner>(
       config.states,
       registry,
+      strict,
     )
     const deserializedEvents = StateMachine.deserializeEvents<TOwner>(
       config.events,
       registry,
+      strict,
     )
 
     const smConfig: StateMachineConfig<TOwner> = {
@@ -827,6 +831,7 @@ export class StateMachine<
       onError: StateMachine.deserializeAction(
         config.onError,
         registry,
+        strict,
       ) as KeysOf<TOwner, ErrorHandler<TOwner>>,
     }
 
@@ -876,11 +881,20 @@ export class StateMachine<
     const { config, currentState, historyMap, stateEntryTimes } = parsedData
 
     const registry = options?.actions
+    const strict = options?.strictActions ?? false
     // Async deserialization of states and events
     const deserializedStates =
-      await StateMachine.deserializeStatesAsync<TOwner>(config.states, registry)
+      await StateMachine.deserializeStatesAsync<TOwner>(
+        config.states,
+        registry,
+        strict,
+      )
     const deserializedEvents =
-      await StateMachine.deserializeEventsAsync<TOwner>(config.events, registry)
+      await StateMachine.deserializeEventsAsync<TOwner>(
+        config.events,
+        registry,
+        strict,
+      )
 
     const smConfig: StateMachineConfig<TOwner> = {
       name: 'DeserializedStateMachine',
@@ -891,6 +905,7 @@ export class StateMachine<
       onError: (await StateMachine.deserializeActionAsync(
         config.onError,
         registry,
+        strict,
       )) as KeysOf<TOwner, ErrorHandler<TOwner>>,
     }
 
@@ -918,41 +933,55 @@ export class StateMachine<
   private static async deserializeStatesAsync<TOwner extends object>(
     statesConfig: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): Promise<States<TOwner>> {
     const result: States<TOwner> = {}
     for (const [name, stateData] of Object.entries(statesConfig) as [
       string,
       any,
     ][]) {
+      // The `initial` marker inside a nested states-config is a plain string,
+      // not a state — pass it through verbatim (W0.2 regions recursion).
+      if (name === 'initial') {
+        result[name] = stateData
+        continue
+      }
       const deserializedState = {
         ...stateData,
         onBeforeEnter: await StateMachine.deserializeActionAsync(
           stateData.onBeforeEnter,
           registry,
+          strict,
         ),
         onEnter: await StateMachine.deserializeActionAsync(
           stateData.onEnter,
           registry,
+          strict,
         ),
         onAfterEnter: await StateMachine.deserializeActionAsync(
           stateData.onAfterEnter,
           registry,
+          strict,
         ),
         onBeforeExit: await StateMachine.deserializeActionAsync(
           stateData.onBeforeExit,
           registry,
+          strict,
         ),
         onExit: await StateMachine.deserializeActionAsync(
           stateData.onExit,
           registry,
+          strict,
         ),
         onAfterExit: await StateMachine.deserializeActionAsync(
           stateData.onAfterExit,
           registry,
+          strict,
         ),
         onError: await StateMachine.deserializeActionAsync(
           stateData.onError,
           registry,
+          strict,
         ),
       }
 
@@ -960,16 +989,51 @@ export class StateMachine<
         deserializedState.invoke = await Promise.all(
           stateData.invoke.map(async (inv: any) => ({
             ...inv,
-            cond: await StateMachine.deserializeActionAsync(inv.cond, registry),
+            cond: await StateMachine.deserializeActionAsync(
+              inv.cond,
+              registry,
+              strict,
+            ),
             action: await StateMachine.deserializeActionAsync(
               inv.action,
               registry,
+              strict,
             ),
           })),
         )
       }
 
+      // W0.2 regions recursion: nested region states run through the SAME
+      // registry resolver rather than being spread verbatim (a spread lets
+      // JSON.stringify silently drop their callbacks on the serialize side).
+      if (stateData.regions && typeof stateData.regions === 'object') {
+        deserializedState.regions = await StateMachine.deserializeRegionsAsync<
+          TOwner
+        >(stateData.regions, registry, strict)
+      }
+
       result[name] = deserializedState
+    }
+    return result
+  }
+
+  /**
+   * Deserialize a `regions` map (Async): each region is a nested states-config
+   * resolved through {@link deserializeStatesAsync}. Symmetric to
+   * {@link serializeRegions} on the serialize side (W0.2 §0.6 completeness).
+   */
+  private static async deserializeRegionsAsync<TOwner extends object>(
+    regionsConfig: any,
+    registry?: FunctionRegistry,
+    strict = false,
+  ): Promise<any> {
+    const result: any = {}
+    for (const [regionName, regionStates] of Object.entries(regionsConfig)) {
+      result[regionName] = await StateMachine.deserializeStatesAsync<TOwner>(
+        regionStates,
+        registry,
+        strict,
+      )
     }
     return result
   }
@@ -980,38 +1044,72 @@ export class StateMachine<
   private static deserializeStates<TOwner extends object>(
     statesConfig: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): States<TOwner> {
     return Object.entries(statesConfig).reduce(
       (acc, [name, stateData]: [string, any]) => {
+        // The `initial` marker inside a nested states-config is a plain string,
+        // not a state — pass it through verbatim (W0.2 regions recursion).
+        if (name === 'initial') {
+          acc[name] = stateData as any
+          return acc
+        }
         const deserializedState = {
           ...stateData,
           onBeforeEnter: StateMachine.deserializeAction(
             stateData.onBeforeEnter,
             registry,
+            strict,
           ),
-          onEnter: StateMachine.deserializeAction(stateData.onEnter, registry),
+          onEnter: StateMachine.deserializeAction(
+            stateData.onEnter,
+            registry,
+            strict,
+          ),
           onAfterEnter: StateMachine.deserializeAction(
             stateData.onAfterEnter,
             registry,
+            strict,
           ),
           onBeforeExit: StateMachine.deserializeAction(
             stateData.onBeforeExit,
             registry,
+            strict,
           ),
-          onExit: StateMachine.deserializeAction(stateData.onExit, registry),
+          onExit: StateMachine.deserializeAction(
+            stateData.onExit,
+            registry,
+            strict,
+          ),
           onAfterExit: StateMachine.deserializeAction(
             stateData.onAfterExit,
             registry,
+            strict,
           ),
-          onError: StateMachine.deserializeAction(stateData.onError, registry),
+          onError: StateMachine.deserializeAction(
+            stateData.onError,
+            registry,
+            strict,
+          ),
         }
 
         if (stateData.invoke && Array.isArray(stateData.invoke)) {
           deserializedState.invoke = stateData.invoke.map((inv: any) => ({
             ...inv,
-            cond: StateMachine.deserializeAction(inv.cond, registry),
-            action: StateMachine.deserializeAction(inv.action, registry),
+            cond: StateMachine.deserializeAction(inv.cond, registry, strict),
+            action: StateMachine.deserializeAction(inv.action, registry, strict),
           }))
+        }
+
+        // W0.2 regions recursion: nested region states run through the SAME
+        // registry resolver rather than being spread verbatim (a spread lets
+        // JSON.stringify silently drop their callbacks on the serialize side).
+        if (stateData.regions && typeof stateData.regions === 'object') {
+          deserializedState.regions = StateMachine.deserializeRegions<TOwner>(
+            stateData.regions,
+            registry,
+            strict,
+          )
         }
 
         acc[name] = deserializedState
@@ -1022,11 +1120,33 @@ export class StateMachine<
   }
 
   /**
+   * Deserialize a `regions` map: each region is a nested states-config resolved
+   * through {@link deserializeStates}. Symmetric to {@link serializeRegions} on
+   * the serialize side (W0.2 §0.6 completeness).
+   */
+  private static deserializeRegions<TOwner extends object>(
+    regionsConfig: any,
+    registry?: FunctionRegistry,
+    strict = false,
+  ): any {
+    const result: any = {}
+    for (const [regionName, regionStates] of Object.entries(regionsConfig)) {
+      result[regionName] = StateMachine.deserializeStates<TOwner>(
+        regionStates,
+        registry,
+        strict,
+      )
+    }
+    return result
+  }
+
+  /**
    * Deserialize events configuration (Async)
    */
   private static async deserializeEventsAsync<TOwner extends object>(
     eventsConfig: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): Promise<Events<TOwner, States<TOwner>>> {
     const result: Events<TOwner, States<TOwner>> = {}
     for (const [name, eventData] of Object.entries(eventsConfig) as [
@@ -1038,22 +1158,30 @@ export class StateMachine<
         onBefore: await StateMachine.deserializeActionAsync(
           eventData.onBefore,
           registry,
+          strict,
         ),
         onAfter: await StateMachine.deserializeActionAsync(
           eventData.onAfter,
           registry,
+          strict,
         ),
         onSuccess: await StateMachine.deserializeActionAsync(
           eventData.onSuccess,
           registry,
+          strict,
         ),
         onError: await StateMachine.deserializeActionAsync(
           eventData.onError,
           registry,
+          strict,
         ),
         transitions: await Promise.all(
           eventData.transitions.map((transitionData: any) =>
-            StateMachine.deserializeTransitionAsync(transitionData, registry),
+            StateMachine.deserializeTransitionAsync(
+              transitionData,
+              registry,
+              strict,
+            ),
           ),
         ),
       }
@@ -1067,20 +1195,34 @@ export class StateMachine<
   private static deserializeEvents<TOwner extends object>(
     eventsConfig: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): Events<TOwner, States<TOwner>> {
     return Object.entries(eventsConfig).reduce(
       (acc, [name, eventData]: [string, any]) => {
         acc[name] = {
           ...eventData,
-          onBefore: StateMachine.deserializeAction(eventData.onBefore, registry),
-          onAfter: StateMachine.deserializeAction(eventData.onAfter, registry),
+          onBefore: StateMachine.deserializeAction(
+            eventData.onBefore,
+            registry,
+            strict,
+          ),
+          onAfter: StateMachine.deserializeAction(
+            eventData.onAfter,
+            registry,
+            strict,
+          ),
           onSuccess: StateMachine.deserializeAction(
             eventData.onSuccess,
             registry,
+            strict,
           ),
-          onError: StateMachine.deserializeAction(eventData.onError, registry),
+          onError: StateMachine.deserializeAction(
+            eventData.onError,
+            registry,
+            strict,
+          ),
           transitions: eventData.transitions.map((transitionData: any) =>
-            StateMachine.deserializeTransition(transitionData, registry),
+            StateMachine.deserializeTransition(transitionData, registry, strict),
           ),
         }
         return acc
@@ -1095,21 +1237,25 @@ export class StateMachine<
   private static async deserializeTransitionAsync(
     transitionData: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): Promise<any> {
     return {
       ...transitionData,
       guard: await StateMachine.deserializeActionAsync(
         transitionData.guard,
         registry,
+        strict,
       ),
       // Support 'action' alias for 'onTransition'
       onTransition: await StateMachine.deserializeActionAsync(
         transitionData.onTransition || transitionData.action,
         registry,
+        strict,
       ),
       onError: await StateMachine.deserializeActionAsync(
         transitionData.onError,
         registry,
+        strict,
       ),
     }
   }
@@ -1120,16 +1266,26 @@ export class StateMachine<
   private static deserializeTransition(
     transitionData: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): any {
     return {
       ...transitionData,
-      guard: StateMachine.deserializeAction(transitionData.guard, registry),
+      guard: StateMachine.deserializeAction(
+        transitionData.guard,
+        registry,
+        strict,
+      ),
       // Support 'action' alias for 'onTransition' for compatibility
       onTransition: StateMachine.deserializeAction(
         transitionData.onTransition || transitionData.action,
         registry,
+        strict,
       ),
-      onError: StateMachine.deserializeAction(transitionData.onError, registry),
+      onError: StateMachine.deserializeAction(
+        transitionData.onError,
+        registry,
+        strict,
+      ),
     }
   }
 
@@ -1143,8 +1299,9 @@ export class StateMachine<
   private static async deserializeActionAsync(
     action: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): Promise<any> {
-    return StateMachine.deserializeAction(action, registry)
+    return StateMachine.deserializeAction(action, registry, strict)
   }
 
   /**
@@ -1153,13 +1310,18 @@ export class StateMachine<
    * W0 security invariant (defect П1): no deserialization path turns an
    * attacker-controlled string into executable code.
    *
-   *  - `{ type: 'function', name }` — a function reference. Resolved by NAME
-   *    against the consumer-supplied registry (`options.actions`). An unknown
-   *    (present but unregistered) name THROWS {@link StateMachineError} — never
-   *    a silent no-op, never a compile. A nameless entry (an anonymous function
-   *    that could not be given a stable identity, or a poisoned legacy
-   *    body-carrying form) cannot be resolved: its body is IGNORED, it is
-   *    loudly logged, and it restores to `undefined` — it is never compiled.
+   *  - `{ type: 'function', name, slot? }` — a function reference. Resolved
+   *    SLOT-FIRST against the consumer-supplied registry (`options.actions`):
+   *    the composite `slot` path (and its `states.`-prefixed form) is a STABLE
+   *    per-slot identity and is tried before the bare `name`, which is only a
+   *    shared slot LABEL (W0.2 C1: three distinct `onEnter` callbacks all report
+   *    `.name === 'onEnter'`). An unknown reference (no slot key AND no name
+   *    key) THROWS {@link StateMachineError} — never a silent no-op, never a
+   *    compile. Resolving a slot only by its shared bare name is a
+   *    silent-collision risk: it `warn`s (or, under `strictActions`, THROWS). A
+   *    nameless entry (an anonymous function, or a poisoned legacy body-carrying
+   *    form) with no slot match restores to `undefined` and is loudly logged
+   *    (or, under `strictActions`, THROWS) — its body is NEVER compiled.
    *  - `{ type: 'string', name }` — a method-name reference; returned as the
    *    bare name and resolved lazily at call time against the owner/context.
    *  - a bare string — a method-name reference; returned verbatim. A
@@ -1169,6 +1331,7 @@ export class StateMachine<
   private static deserializeAction(
     action: any,
     registry?: FunctionRegistry,
+    strict = false,
   ): any {
     if (!action) return action
 
@@ -1179,44 +1342,92 @@ export class StateMachine<
 
       if (action.type === 'function') {
         const name = typeof action.name === 'string' ? action.name : ''
+        const slot =
+          typeof action.slot === 'string' && action.slot.length > 0
+            ? action.slot
+            : undefined
 
-        if (name.length === 0) {
-          // Nameless reference: an anonymous function (no stable identity to
-          // key a registry on) or a poisoned legacy `{ body, hash }` form.
-          // The body — if any — is NEVER compiled. Fail closed to undefined,
-          // but do so loudly rather than silently.
-          if (
-            Object.prototype.hasOwnProperty.call(action, 'body') ||
-            Object.prototype.hasOwnProperty.call(action, 'hash')
-          ) {
-            securityLogger.warn(
-              'Refused to restore a body-carrying serialized function; function bodies are never compiled (W0). Restoring as undefined.',
-              { keys: Object.keys(action) },
-            )
-          } else {
-            securityLogger.warn(
-              'Serialized function reference has no name and cannot be resolved from the registry; restoring as undefined.',
-              {},
-            )
+        // (W0.2 nameless-asymmetry) A body/hash-carrying payload is a poisoned
+        // legacy form whose body is NEVER compiled. Log it REGARDLESS of whether
+        // a valid name/slot accompanies it — a `{ name:'onEnter', body:'...' }`
+        // (valid label + poisoned body) must be flagged too, not only the
+        // nameless case. This warn precedes any name/slot check.
+        if (
+          Object.prototype.hasOwnProperty.call(action, 'body') ||
+          Object.prototype.hasOwnProperty.call(action, 'hash')
+        ) {
+          securityLogger.warn(
+            'Serialized function carries a body/hash payload; function bodies are never compiled (W0). Ignoring the body and resolving by slot/name only.',
+            { keys: Object.keys(action) },
+          )
+        }
+
+        // OWN-key lookup only (`Object.hasOwn`). A bracket index
+        // (`registry[key]`) walks the prototype chain, so a serialized key of
+        // 'constructor' / 'toString' / 'valueOf' / 'hasOwnProperty' would
+        // resolve to an Object.prototype builtin (the Object constructor is
+        // itself `typeof 'function'`) and slip past the unknown-name throw.
+        // Object.hasOwn confines resolution to the registry's OWN entries, so
+        // any inherited key fails closed (W0 defense-in-depth; not RCE — a
+        // leaked builtin cannot compile code — but the 'unknown → throw'
+        // contract must hold).
+        const resolveOwn = (key: string): ((...a: any[]) => any) | undefined => {
+          if (registry && Object.hasOwn(registry, key)) {
+            const candidate = registry[key]
+            if (typeof candidate === 'function') return candidate
           }
           return undefined
         }
 
-        // OWN-key lookup only. A bracket index (`registry[name]`) walks the
-        // prototype chain, so a serialized name of 'constructor' / 'toString' /
-        // 'valueOf' / 'hasOwnProperty' would resolve to an Object.prototype
-        // builtin (the Object constructor is itself `typeof 'function'`) and
-        // slip past the unknown-name throw. Object.hasOwn confines resolution to
-        // the registry's OWN entries, so any inherited name fails closed to the
-        // throw below (W0 defense-in-depth; not RCE — a leaked builtin cannot
-        // compile code — but the 'unknown name → throw' contract must hold).
-        const fn =
-          registry && Object.hasOwn(registry, name) ? registry[name] : undefined
-        if (typeof fn !== 'function') {
+        // Slot-first: an exact per-slot key is a stable identity. Accept both
+        // the bare slot path ('green.onEnter') and its 'states.'-prefixed form
+        // ('states.green.onEnter') so a consumer may key the registry either way.
+        if (slot) {
+          const slotFn = resolveOwn(slot) ?? resolveOwn(`states.${slot}`)
+          if (slotFn) return slotFn
+        }
+
+        if (name.length === 0) {
+          // Nameless AND no slot match: no stable identity to resolve.
+          if (strict) {
+            throw new StateMachineError(
+              `Cannot restore a nameless serialized function${
+                slot ? ` for slot '${slot}'` : ''
+              } under strictActions: no per-slot registry key and no name to fall back to.`,
+              slot ? { slot } : {},
+            )
+          }
+          securityLogger.warn(
+            'Serialized function reference has no name (and no slot match) and cannot be resolved from the registry; restoring as undefined.',
+            slot ? { slot } : {},
+          )
+          return undefined
+        }
+
+        // Bare-name fallback: the name is a shared slot LABEL, not a stable
+        // identity. If a slot identity was present but only the shared name
+        // resolves, a same-named sibling's function may be silently substituted
+        // (W0.2 C1 collision) — refuse under strictActions, warn otherwise.
+        const fn = resolveOwn(name)
+        if (!fn) {
           throw new StateMachineError(
-            `Cannot restore function '${name}': it is not present in the provided function registry (options.actions). ` +
-              'Serialized state machines restore functions by name from a consumer-supplied registry; function bodies are never compiled.',
-            { action: name },
+            `Cannot restore function '${name}'${
+              slot ? ` (slot '${slot}')` : ''
+            }: it is not present in the provided function registry (options.actions). ` +
+              'Serialized state machines restore functions by slot/name from a consumer-supplied registry; function bodies are never compiled.',
+            slot ? { action: name, slot } : { action: name },
+          )
+        }
+        if (slot) {
+          if (strict) {
+            throw new StateMachineError(
+              `Refusing to restore slot '${slot}' by its shared bare name '${name}' under strictActions: provide a per-slot registry key ('${slot}' or 'states.${slot}') to disambiguate. Bare-name resolution risks serving a same-named sibling's function.`,
+              { slot, action: name },
+            )
+          }
+          securityLogger.warn(
+            `Serialized function for slot '${slot}' resolved only by its shared bare name '${name}' (no per-slot registry key). If several slots share this name, a sibling's function may be substituted; add a '${slot}' or 'states.${slot}' registry key to disambiguate.`,
+            { slot, name },
           )
         }
         return fn
@@ -2726,7 +2937,8 @@ export class StateMachine<
       stateAttribute: this.stateAttribute,
       states: serializedStates,
       events: serializedEvents,
-      onError: this.serializeAction(this.onError, 'config_onError'),
+      // Config-level onError has no state-slot identity → name-only reference.
+      onError: this.serializeAction(this.onError),
     }
 
     return JSON.stringify({
@@ -2763,7 +2975,8 @@ export class StateMachine<
       stateAttribute: this.stateAttribute,
       states: serializedStates,
       events: serializedEvents,
-      onError: await this.serializeActionAsync(this.onError, 'config_onError'),
+      // Config-level onError has no state-slot identity → name-only reference.
+      onError: await this.serializeActionAsync(this.onError),
     }
 
     return JSON.stringify({
@@ -2775,87 +2988,205 @@ export class StateMachine<
   }
 
   /**
-   * Serialize state with optimized performance (Async)
+   * Serialize state with optimized performance (Async). Async form of
+   * {@link serializeState} — slot-aware, recursing into `regions`.
    */
   private async serializeStateAsync(state: State<TOwner>): Promise<any> {
-    const { name: _name, ...stateWithoutName } = state
+    return this.serializeStateNodeAsync(state, state.name as string)
+  }
+
+  /** Async form of {@link serializeStateNode}. */
+  private async serializeStateNodeAsync(
+    node: any,
+    slotBase: string,
+  ): Promise<any> {
+    const { name: _name, ...rest } = node
 
     const serializedState: any = {
-      ...stateWithoutName,
+      ...rest,
       onBeforeEnter: await this.serializeActionAsync(
-        state.onBeforeEnter,
-        'onBeforeEnter',
+        node.onBeforeEnter,
+        `${slotBase}.onBeforeEnter`,
       ),
-      onEnter: await this.serializeActionAsync(state.onEnter, 'onEnter'),
+      onEnter: await this.serializeActionAsync(
+        node.onEnter,
+        `${slotBase}.onEnter`,
+      ),
       onAfterEnter: await this.serializeActionAsync(
-        state.onAfterEnter,
-        'onAfterEnter',
+        node.onAfterEnter,
+        `${slotBase}.onAfterEnter`,
       ),
       onBeforeExit: await this.serializeActionAsync(
-        state.onBeforeExit,
-        'onBeforeExit',
+        node.onBeforeExit,
+        `${slotBase}.onBeforeExit`,
       ),
-      onExit: await this.serializeActionAsync(state.onExit, 'onExit'),
+      onExit: await this.serializeActionAsync(node.onExit, `${slotBase}.onExit`),
       onAfterExit: await this.serializeActionAsync(
-        state.onAfterExit,
-        'onAfterExit',
+        node.onAfterExit,
+        `${slotBase}.onAfterExit`,
       ),
-      onError: await this.serializeActionAsync(state.onError, 'state_onError'),
+      onError: await this.serializeActionAsync(
+        node.onError,
+        `${slotBase}.onError`,
+      ),
     }
 
-    if (state.invoke) {
+    if (node.invoke) {
       serializedState.invoke = await Promise.all(
-        state.invoke.map(async (inv) => ({
+        node.invoke.map(async (inv: any) => ({
           ...inv,
           cond: inv.cond != null
-            ? await safeFunctionSerializer.serializeActionAsync(
-              inv.cond,
-              'invoke_cond',
-            )
+            ? await serializeActionRefAsync(inv.cond, `${slotBase}.invoke.cond`)
             : undefined,
           action: inv.action != null
-            ? await safeFunctionSerializer.serializeActionAsync(
+            ? await serializeActionRefAsync(
               inv.action,
-              'invoke_action',
+              `${slotBase}.invoke.action`,
             )
             : undefined,
         })),
       )
     }
 
+    if (node.regions && typeof node.regions === 'object') {
+      serializedState.regions = await this.serializeRegionsAsync(
+        node.regions,
+        slotBase,
+      )
+    }
+
     return serializedState
   }
 
+  /** Async form of {@link serializeRegions}. */
+  private async serializeRegionsAsync(
+    regionsConfig: any,
+    parentSlot: string,
+  ): Promise<any> {
+    const result: any = {}
+    for (const [regionName, regionStates] of Object.entries(regionsConfig)) {
+      result[regionName] = await this.serializeRegionStatesAsync(
+        regionStates,
+        `${parentSlot}.${regionName}`,
+      )
+    }
+    return result
+  }
+
+  /** Async form of {@link serializeRegionStates}. */
+  private async serializeRegionStatesAsync(
+    statesConfig: any,
+    pathPrefix: string,
+  ): Promise<any> {
+    const result: any = {}
+    for (const [name, stateCfg] of Object.entries(
+      statesConfig as Record<string, any>,
+    )) {
+      if (name === 'initial') {
+        result[name] = stateCfg
+        continue
+      }
+      result[name] = await this.serializeStateNodeAsync(
+        stateCfg,
+        `${pathPrefix}.${name}`,
+      )
+    }
+    return result
+  }
+
   /**
-   * Serialize state with optimized performance
+   * Serialize state with optimized performance.
+   *
+   * The flat map key is the state's dotted path (`state.name`), used as the
+   * slot base so each hook serializes with a composite `<stateName>.<hook>`
+   * identity (W0.2 C1). Nested `regions` are serialized RECURSIVELY through the
+   * same slot-aware path — not spread verbatim, which would let JSON.stringify
+   * silently drop their callbacks (W0.2 §0.6 completeness).
    */
   private serializeState(state: State<TOwner>): any {
-    const { name: _name, ...stateWithoutName } = state
+    return this.serializeStateNode(state, state.name as string)
+  }
+
+  /**
+   * Serialize one state node (a flat top-level state or a nested region leaf)
+   * at slot base `slotBase`. The `name` field (only present on flat states) is
+   * stripped — reconstruction re-derives it from the map key / region path.
+   */
+  private serializeStateNode(node: any, slotBase: string): any {
+    const { name: _name, ...rest } = node
 
     const serializedState: any = {
-      ...stateWithoutName,
-      onBeforeEnter: this.serializeAction(state.onBeforeEnter, 'onBeforeEnter'),
-      onEnter: this.serializeAction(state.onEnter, 'onEnter'),
-      onAfterEnter: this.serializeAction(state.onAfterEnter, 'onAfterEnter'),
-      onBeforeExit: this.serializeAction(state.onBeforeExit, 'onBeforeExit'),
-      onExit: this.serializeAction(state.onExit, 'onExit'),
-      onAfterExit: this.serializeAction(state.onAfterExit, 'onAfterExit'),
-      onError: this.serializeAction(state.onError, 'state_onError'),
+      ...rest,
+      onBeforeEnter: this.serializeAction(
+        node.onBeforeEnter,
+        `${slotBase}.onBeforeEnter`,
+      ),
+      onEnter: this.serializeAction(node.onEnter, `${slotBase}.onEnter`),
+      onAfterEnter: this.serializeAction(
+        node.onAfterEnter,
+        `${slotBase}.onAfterEnter`,
+      ),
+      onBeforeExit: this.serializeAction(
+        node.onBeforeExit,
+        `${slotBase}.onBeforeExit`,
+      ),
+      onExit: this.serializeAction(node.onExit, `${slotBase}.onExit`),
+      onAfterExit: this.serializeAction(
+        node.onAfterExit,
+        `${slotBase}.onAfterExit`,
+      ),
+      onError: this.serializeAction(node.onError, `${slotBase}.onError`),
     }
 
-    if (state.invoke) {
-      serializedState.invoke = state.invoke.map((inv) => ({
+    if (node.invoke) {
+      serializedState.invoke = node.invoke.map((inv: any) => ({
         ...inv,
         cond: inv.cond != null
-          ? safeFunctionSerializer.serializeAction(inv.cond, 'invoke_cond')
+          ? serializeActionRef(inv.cond, `${slotBase}.invoke.cond`)
           : undefined,
         action: inv.action != null
-          ? safeFunctionSerializer.serializeAction(inv.action, 'invoke_action')
+          ? serializeActionRef(inv.action, `${slotBase}.invoke.action`)
           : undefined,
       }))
     }
 
+    if (node.regions && typeof node.regions === 'object') {
+      serializedState.regions = this.serializeRegions(node.regions, slotBase)
+    }
+
     return serializedState
+  }
+
+  /**
+   * Serialize a `regions` map: each region is a nested states-config whose
+   * states are serialized through {@link serializeStateNode} under the
+   * `<parentSlot>.<regionName>.<stateName>` slot path.
+   */
+  private serializeRegions(regionsConfig: any, parentSlot: string): any {
+    const result: any = {}
+    for (const [regionName, regionStates] of Object.entries(regionsConfig)) {
+      result[regionName] = this.serializeRegionStates(
+        regionStates,
+        `${parentSlot}.${regionName}`,
+      )
+    }
+    return result
+  }
+
+  /** Serialize the states-config of a single region. */
+  private serializeRegionStates(statesConfig: any, pathPrefix: string): any {
+    const result: any = {}
+    for (const [name, stateCfg] of Object.entries(
+      statesConfig as Record<string, any>,
+    )) {
+      // The `initial` marker is a plain string, not a state — keep it verbatim.
+      if (name === 'initial') {
+        result[name] = stateCfg
+        continue
+      }
+      result[name] = this.serializeStateNode(stateCfg, `${pathPrefix}.${name}`)
+    }
+    return result
   }
 
   /**
@@ -2864,18 +3195,14 @@ export class StateMachine<
   private async serializeEventAsync(event: Event<TOwner, any>): Promise<any> {
     const { name: _name, ...eventWithoutName } = event
 
+    // Event/transition hooks have no state-slot identity → name-only references
+    // (consumers key the registry by function name, as fromJSON tests do).
     return {
       ...eventWithoutName,
-      onBefore: await this.serializeActionAsync(
-        event.onBefore,
-        'event_onBefore',
-      ),
-      onAfter: await this.serializeActionAsync(event.onAfter, 'event_onAfter'),
-      onSuccess: await this.serializeActionAsync(
-        event.onSuccess,
-        'event_onSuccess',
-      ),
-      onError: await this.serializeActionAsync(event.onError, 'event_onError'),
+      onBefore: await this.serializeActionAsync(event.onBefore),
+      onAfter: await this.serializeActionAsync(event.onAfter),
+      onSuccess: await this.serializeActionAsync(event.onSuccess),
+      onError: await this.serializeActionAsync(event.onError),
       transitions: await Promise.all(
         event.transitions.map((t) => this.serializeTransitionAsync(t)),
       ),
@@ -2890,18 +3217,9 @@ export class StateMachine<
   ): Promise<any> {
     return {
       ...transition,
-      guard: await this.serializeActionAsync(
-        transition.guard,
-        'transition_guard',
-      ),
-      onTransition: await this.serializeActionAsync(
-        transition.onTransition,
-        'transition_onTransition',
-      ),
-      onError: await this.serializeActionAsync(
-        transition.onError,
-        'transition_onError',
-      ),
+      guard: await this.serializeActionAsync(transition.guard),
+      onTransition: await this.serializeActionAsync(transition.onTransition),
+      onError: await this.serializeActionAsync(transition.onError),
     }
   }
 
@@ -2911,38 +3229,48 @@ export class StateMachine<
   private serializeEvent(event: Event<TOwner, any>): any {
     const { name: _name, ...eventWithoutName } = event
 
+    // Event/transition hooks have no state-slot identity → name-only references
+    // (consumers key the registry by function name, as fromJSON tests do).
     return {
       ...eventWithoutName,
-      onBefore: this.serializeAction(event.onBefore, 'event_onBefore'),
-      onAfter: this.serializeAction(event.onAfter, 'event_onAfter'),
-      onSuccess: this.serializeAction(event.onSuccess, 'event_onSuccess'),
-      onError: this.serializeAction(event.onError, 'event_onError'),
+      onBefore: this.serializeAction(event.onBefore),
+      onAfter: this.serializeAction(event.onAfter),
+      onSuccess: this.serializeAction(event.onSuccess),
+      onError: this.serializeAction(event.onError),
       transitions: event.transitions.map((transition) => ({
         ...transition,
-        guard: this.serializeAction(transition.guard, 'transition_guard'),
-        onTransition: this.serializeAction(
-          transition.onTransition,
-          'transition_onTransition',
-        ),
-        onError: this.serializeAction(transition.onError, 'transition_onError'),
+        guard: this.serializeAction(transition.guard),
+        onTransition: this.serializeAction(transition.onTransition),
+        onError: this.serializeAction(transition.onError),
       })),
     }
   }
 
+  /**
+   * Serialize a single action to a body-free reference (Async).
+   *
+   * `slot` (when supplied) is the composite state-path identity
+   * (`<stateName>.<hook>`) emitted for per-slot disambiguation (W0.2 C1);
+   * event/transition/config hooks have no state-path identity and pass none.
+   */
   private async serializeActionAsync(
     action: any,
-    name: string,
+    slot?: string,
   ): Promise<SafeSerializedAction | undefined> {
     if (!action) return undefined
-    return safeFunctionSerializer.serializeActionAsync(action, name)
+    return serializeActionRefAsync(action, slot)
   }
 
   /**
-   * Optimized action serialization using safe serializer
+   * Serialize a single action to a body-free reference.
+   *
+   * A function is stored by NAME (plus an optional composite `slot` path for
+   * per-slot disambiguation — W0.2 C1); a non-function (e.g. a bare string
+   * method-name) is returned verbatim.
    */
-  private serializeAction(action: any, functionName?: string): any {
+  private serializeAction(action: any, slot?: string): any {
     if (typeof action === 'function') {
-      return safeFunctionSerializer.serializeAction(action, functionName)
+      return serializeActionRef(action, slot)
     }
     return action
   }

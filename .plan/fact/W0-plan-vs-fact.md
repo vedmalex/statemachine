@@ -66,7 +66,20 @@ Critic-приёмка (fable) нашла: V6b закрыт в 1 точке из 
 - **C1 [HIGH]** реестр по `fn.name`: коллизия слотов (проверено запуском — 3 разных onEnter → одно имя) + рекурсия по regions (тихая потеря вложенных callbacks) — задача #28.
 - Полуживой `security.ts` (~250 строк мёртвого blocklist) + nameless-асимметрия — задача #29.
 
-## Вывод W0 (ядро + W0.1)
+## W0.2 — корректность сериализации (verdict CLOSED)
+
+| id | что | подтверждение (оркестратор-прогон) |
+|---|---|---|
+| C1 [HIGH] | коллизия реестра по `fn.name` | составной ключ слота (`serialize-actions.ts`, `slot:'green.onEnter'`); резолв slot-first через `Object.hasOwn`, name-fallback → warn/strict-throw. Red проверен: 3 разных onEnter → `['G','R']` вместо `['G','G']` |
+| C1-regions | вложенные callbacks терялись | serialize/deserialize РЕКУРСЯТ по `regions` (были спред); вложенный onEnter восстанавливается |
+| dead-code | полуживой `security.ts` | **удалён целиком**; живой `serializeAction` вынесен в `serialize-actions.ts`; `security.test.ts` (тестировал только мёртвый `FunctionValidator` — 4 вхождения, 0 живого) удалён; живое покрыто `serialization*.test.ts` |
+| nameless | warn о body не на том случае | warn о body/hash поднят ВЫШЕ проверки имени; `strictActions` → nameless throw (симметрия) |
+| **регресс-контроль** | W0/W0.1 bypass не реоткрыт | оркестратор-проба 5 векторов + НОВЫЙ `slot:'constructor'` → все закрыто (throw/no-exec); `security_rce`+`security_source_scan` зелёные |
+
+Итог W0.2: **805 passed / 0 failed; tsc чисто** (805 vs 807: −`security.test.ts` мёртвого кода,
++`serialization_registry.test.ts`). `new Function` в non-test src: только whitelisted `sim/define.ts`.
+
+## Вывод W0 (ядро + W0.1 + W0.2)
 
 RCE-путь `fromJSON`/`fromSecureJSON` закрыт полностью и подтверждён независимо (оркестратор-прогон +
 adversarial-verify + critic-приёмка). Обход авторизации строкой закрыт. Scope только расширялся

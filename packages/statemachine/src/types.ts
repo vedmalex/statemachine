@@ -23,6 +23,11 @@ export type ErrorContext = {
   action?: string
   transition?: string
   phase?: 'guard' | 'action' | 'transition' | 'enter' | 'exit'
+  /**
+   * Composite per-slot function-registry path (`<stateName>.<hook>`) implicated
+   * in a restore failure (W0.2 C1). Present only on registry-resolution errors.
+   */
+  slot?: string
 }
 
 export class StateMachineError extends Error {
@@ -154,11 +159,26 @@ export interface StateMachineOptions {
    * name against THIS registry. A serialized function reference whose name is
    * not present here throws {@link StateMachineError}; a body is never compiled.
    *
-   * Keys are function identities (a function's own `.name`, i.e. what
-   * `serializeAction` recorded); values are the actual functions supplied by
+   * Keys are function identities: either a composite per-slot path
+   * (`<stateName>.<hook>` — e.g. `'green.onEnter'`, `'parent.r1.child.onEnter'`,
+   * or its `states.`-prefixed form), which is the STABLE identity restoration
+   * prefers, OR a bare function `.name` (a slot LABEL shared across slots) used
+   * only as a last-resort fallback. Values are the actual functions supplied by
    * the consumer.
    */
   actions?: FunctionRegistry
+  /**
+   * Strict function-registry resolution (W0.2 C1). When `true`, restoration
+   * refuses the ambiguous fallbacks that can silently substitute the wrong
+   * function:
+   *  - a serialized slot that resolves only by its shared bare `.name` (no
+   *    per-slot registry key) THROWS instead of risking a same-named sibling's
+   *    function;
+   *  - a nameless serialized function reference THROWS instead of restoring to
+   *    `undefined` (symmetry with the named unknown-name throw).
+   * Default: `false` (fallback with a `warn`).
+   */
+  strictActions?: boolean
 }
 
 /**

@@ -10,15 +10,16 @@ import { MemoryAdapter } from '../types'
  * whose guard/action is a string function body must NEVER be compiled and run.
  *
  * The forged guard assembles the identifier "process" from char codes and
- * reaches the real object via `globalThis[name]`, sidestepping both the naive
- * `/process\./` blocklist pattern (security.ts BUILTIN_PATTERNS) and the
- * `var process = undefined` shadow inside createSafeFunction. If the legacy
- * `new Function` path is live, the payload runs when the guard is evaluated
- * during fireEvent and stamps a marker onto globalThis.
+ * reaches the real object via `globalThis[name]`, sidestepping any naive
+ * `/process\./` blocklist pattern and the `var process = undefined` shadow a
+ * legacy `createSafeFunction` sandbox would use. If a legacy `new Function`
+ * compile path were live, the payload would run when the guard is evaluated
+ * during fireEvent and stamp a marker onto globalThis.
  *
- * On the CURRENT HEAD these tests are RED: fromJSON / fromSecureJSON compile
- * the string via deserializeLegacyString/createSafeFunction, the guard runs,
- * the marker is set, and the "marker is undefined" assertion fails.
+ * The invariant holds by CONSTRUCTION post-W0: there is no compile path at all
+ * — deserialization resolves functions by name/slot from a consumer registry
+ * and never compiles a body, so the forged guard is never turned into code and
+ * the "marker is undefined" assertion holds.
  */
 
 const MARKER = '__w0_rce_marker__'
