@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createMachine } from '/Users/vedmalex/work/statemachine/packages/statemachine/src/index'
+import { createMachine } from '../index'
 
 /**
  * ФИКСИРУЕТ ТЕКУЩЕЕ (НЕВЕРНОЕ) поведение селекции переходов:

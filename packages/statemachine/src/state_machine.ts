@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { securityLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
 import {
@@ -36,6 +37,14 @@ import {
   type States,
   type Transition,
 } from './types'
+
+/**
+ * П2 (dedup): marks an error whose `monitor.recordError` was ALREADY emitted at
+ * the point it was caught (in `executeQueuedTransition`), so a downstream
+ * `reportRuntimeError` on the SAME object does not record it a SECOND time.
+ * Doubled error counters are fatal for the quantitative simulator oracles (W5).
+ */
+const RUNTIME_ERROR_REPORTED = Symbol('mb3.runtimeErrorReported')
 
 /**
  * Prototype-chain builtin names that must NEVER be call-time-resolved as an
@@ -142,7 +151,27 @@ export class StateMachine<
   private isProcessing = false
   private eventIdCounter = 0
   private transitionDepth = 0
-  private readonly MAX_TRANSITION_DEPTH = 100
+  // П8: run-away bound is now configurable via StateMachineOptions.maxTransitionDepth
+  // (default 100). A legitimate FINITE internal cascade longer than the old
+  // hard-coded 100 (e.g. a long auto-advance gated-pipeline through `done.state`)
+  // was falsely killed; raising the bound lets it complete while STILL catching a
+  // genuinely self-sustaining loop. Default matches the historical constant.
+  private maxTransitionDepth = 100
+
+  // П3: precise reentrancy detection. Each drain tags the actions/guards it runs
+  // with its own epoch via AsyncLocalStorage. A `fireEvent` whose async context
+  // carries the CURRENTLY-active drain epoch is a TRUE reentrant call (issued from
+  // WITHIN an onEnter/onExit/onTransition/guard on the drain's logical stack). An
+  // external `fireEvent` from an INDEPENDENT async callback (a timer/IO macrotask
+  // scheduled outside the drain, or a caller woken by `resolve()` before the drain
+  // finished) carries NO drain epoch (getStore() === undefined) and is a legitimate
+  // queue — exactly what the external queue exists for. The epoch (not a mere
+  // boolean) guards against a context that leaked into a timer set INSIDE an action
+  // but fires AFTER the drain has ended: its stale epoch no longer matches the
+  // active one, so it is not misread as reentrant.
+  private readonly drainContext = new AsyncLocalStorage<number>()
+  private drainEpoch = 0
+  private activeDrainEpoch: number | null = null
 
   // Optional configuration
   private transitionTimeout?: number
@@ -218,6 +247,9 @@ export class StateMachine<
     if (options?.maxQueueDepth !== undefined) {
       this.maxQueueDepth = options.maxQueueDepth
     }
+    if (options?.maxTransitionDepth !== undefined) {
+      this.maxTransitionDepth = options.maxTransitionDepth
+    }
     if (config.onError !== undefined) {
       this.onError = config.onError
     }
@@ -267,22 +299,36 @@ export class StateMachine<
     // П3: a reentrant external `fireEvent` issued from WITHIN the processing
     // stack (an onEnter/onExit/onTransition/guard that does `await
     // sm.fireEvent(...)`) can never be drained — the single-threaded drain is
-    // already suspended on that very action, so `isProcessing` stays true, the
-    // reentrant event sits behind it forever, the outer promise never settles,
-    // and the public API (canFireEvent/getAvailableEvents) lies. Reject it
-    // immediately with a clear error. `isProcessing === true` at an EXTERNAL
-    // enqueue can ONLY happen from inside the drain (external code runs while
-    // the drain is idle, i.e. isProcessing === false), so this never rejects a
-    // legitimate outside-the-drain queue of consecutive external fireEvents.
-    // The internal `raiseEvent` path (used by invoke timers and `done.state.*`
+    // already suspended on that very action, the reentrant event sits behind it
+    // forever, the outer promise never settles, and the public API
+    // (canFireEvent/getAvailableEvents) lies. Reject it immediately with a clear
+    // error.
+    //
+    // Detection is PRECISE via AsyncLocalStorage, NOT the coarse `isProcessing`
+    // flag. `isProcessing` stays true through EVERY `await` of the drain
+    // (including an `await` inside an async onEnter), so it falsely flagged
+    // LEGITIMATE external events that merely landed in that window — an
+    // independent timer/IO callback, an `onError`-issued fireEvent, or a caller
+    // woken by `resolve()` before the internal cascade finished draining. The
+    // external queue exists PRECISELY to accept events "while busy". Instead, the
+    // drain tags the actions/guards it runs with its epoch; a TRUE reentrant call
+    // runs on that logical stack and its async context carries the currently
+    // active epoch, whereas an independent async callback carries none. The
+    // internal `raiseEvent` path (used by invoke timers and `done.state.*`
     // completion) bypasses enqueueEvent entirely and stays the legal way to
     // post an event from within an action.
-    if (type === 'external' && this.isProcessing) {
-      const _sr = this.getCurrentState(obj)
+    if (
+      type === 'external' &&
+      this.activeDrainEpoch !== null &&
+      this.drainContext.getStore() === this.activeDrainEpoch
+    ) {
+      const _sr = this.safeGetCurrentState(obj)
       return Promise.reject(
         new StateMachineError(
           'Reentrant fireEvent from within an action/guard is not supported; ' +
-            'raise an internal event instead',
+            'model the follow-up as an internal transition (an `invoke` timer or a ' +
+            '`done.state.*` completion event), or dispatch it from an independent ' +
+            'async callback (e.g. a timer/IO continuation) rather than inline',
           {
             ...(_sr !== undefined ? { state: _sr } : {}),
             event: eventName,
@@ -358,18 +404,23 @@ export class StateMachine<
     /* c8 ignore next */
     if (this.isProcessing) return
     this.isProcessing = true
+    // П3: stamp this drain with a fresh epoch so the actions/guards it runs (all
+    // wrapped in `drainContext.run(epoch, …)` below) can be distinguished, via
+    // AsyncLocalStorage, from independent async callbacks — see `enqueueEvent`.
+    const epoch = ++this.drainEpoch
+    this.activeDrainEpoch = epoch
     // П8: run-away bound is counted PER DRAIN — the number of transitions this
     // single continuous drain has processed — NOT the recursion depth around one
     // `await`. The old `transitionDepth++/--` around a single await could only
-    // ever reach {0,1}, so MAX_TRANSITION_DEPTH was unreachable by construction
+    // ever reach {0,1}, so maxTransitionDepth was unreachable by construction
     // and a self-sustaining internal loop (queue held at 0-1) starved the
     // macrotask queue forever. A flat per-drain iteration counter closes that.
     this.transitionDepth = 0
 
     try {
       while (this.internalQueue.length > 0 || this.externalQueue.length > 0) {
-        if (this.transitionDepth >= this.MAX_TRANSITION_DEPTH) {
-          const _s1 = this.getCurrentState()
+        if (this.transitionDepth >= this.maxTransitionDepth) {
+          const _s1 = this.safeGetCurrentState()
           const runawayCtx: ErrorContext = {
             ...(_s1 !== undefined ? { state: _s1 } : {}),
             event: 'processQueues',
@@ -402,7 +453,9 @@ export class StateMachine<
           this.transitionDepth++
           const evt = this.internalQueue.shift()!
           try {
-            await this.executeQueuedTransition(evt)
+            await this.drainContext.run(epoch, () =>
+              this.executeQueuedTransition(evt),
+            )
           } catch (error) {
             // П2: a throw in the INTERNAL branch (e.g. an invoke timer that
             // raised an unknown event, or a `done.state.*` completion event with
@@ -411,7 +464,7 @@ export class StateMachine<
             // `unhandledRejection`. Report it through the OBSERVABLE channel and
             // keep draining the remaining queued events.
             const err = error instanceof Error ? error : new Error(String(error))
-            const _s = this.getCurrentState(evt.obj)
+            const _s = this.safeGetCurrentState(evt.obj)
             this.reportRuntimeError(
               err,
               {
@@ -424,19 +477,34 @@ export class StateMachine<
         } else {
           // An external event begins a fresh RTC macrostep — reset the run-away
           // counter so a long batch/stream of external events never accumulates
-          // toward MAX_TRANSITION_DEPTH (that bound is for internal self-loops).
+          // toward maxTransitionDepth (that bound is for internal self-loops).
           this.transitionDepth = 0
           const evt = this.externalQueue.shift()!
+          // П3: settle the caller OUTSIDE `drainContext.run` — the run wraps only
+          // the transition's actions/guards, so a reentrant `fireEvent` from
+          // within them is detected, while the caller's woken continuation stays
+          // free of this drain's epoch.
+          let result: boolean | undefined
+          let threw = false
+          let thrownError: unknown
           try {
-            const result = await this.executeQueuedTransition(evt)
-            evt.resolve?.(result)
+            result = await this.drainContext.run(epoch, () =>
+              this.executeQueuedTransition(evt),
+            )
           } catch (error) {
-            evt.reject?.(error)
+            threw = true
+            thrownError = error
+          }
+          if (threw) {
+            evt.reject?.(thrownError)
+          } else {
+            evt.resolve?.(result as boolean)
           }
         }
       }
     } finally {
       this.isProcessing = false
+      this.activeDrainEpoch = null
       this.transitionDepth = 0
     }
   }
@@ -453,14 +521,49 @@ export class StateMachine<
     context: ErrorContext,
     obj?: Adapter<PropertiesOf<TOwner>>,
   ): void {
+    // Error reporting runs OUTSIDE the drain's AsyncLocalStorage context. This
+    // method is invoked synchronously from within the drain (activeDrainEpoch is
+    // set, getStore() carries the epoch), and an `onError` handler is a
+    // legitimate error-recovery point that may issue a fresh external
+    // `fireEvent`. Without exiting the context that fire would inherit the drain
+    // epoch and be FALSELY rejected as reentrant (П3 case б) — yet the drain
+    // does NOT await onError, so a queued recovery event would in fact be
+    // drained. exit() clears getStore() so such a fire queues normally, while a
+    // TRUE reentrant (await fireEvent directly inside onEnter/guard) still runs
+    // under the epoch and is still rejected.
+    this.drainContext.exit(() =>
+      this.reportRuntimeErrorInContextFree(error, context, obj),
+    )
+  }
+
+  private reportRuntimeErrorInContextFree(
+    error: Error,
+    context: ErrorContext,
+    obj?: Adapter<PropertiesOf<TOwner>>,
+  ): void {
+    // Tracks whether the error reached ANY observable channel, so the П2 floor
+    // below only fires when it would otherwise vanish silently.
+    let surfaced = false
     // Channel #1 — monitor.recordError, gated by the error handler exactly like
-    // the external-branch path in applyTransition.
+    // the external-branch path in applyTransition. П2 dedup: if the error was
+    // ALREADY recorded where it was caught (executeQueuedTransition), do NOT
+    // record it a SECOND time — doubled counters are fatal for the quantitative
+    // simulator oracles (W5). It was still surfaced, so the floor stays off.
     if (this.errorHandler.isEnabled()) {
-      try {
-        this.monitor.recordError(error, context)
-      } catch {
-        /* a monitor sink must never break the drain */
+      const alreadyReported =
+        typeof error === 'object' &&
+        error !== null &&
+        (error as unknown as Record<symbol, unknown>)[
+          RUNTIME_ERROR_REPORTED
+        ] === true
+      if (!alreadyReported) {
+        try {
+          this.monitor.recordError(error, context)
+        } catch {
+          /* a monitor sink must never break the drain */
+        }
       }
+      surfaced = true
     }
     // Channel #2 — config-level onError (best-effort). A rejecting/throwing
     // handler is logged, never re-thrown into the drain.
@@ -469,6 +572,7 @@ export class StateMachine<
         | Adapter<TOwner>
         | undefined
       if (target) {
+        surfaced = true
         try {
           const handler = this.processError(target, context, this.onError)
           const r = handler(target, error) as unknown
@@ -489,6 +593,18 @@ export class StateMachine<
           )
         }
       }
+    }
+    // П2 (silent-hole floor): with the error handler disabled AND no config-level
+    // `onError`, both channels above are inert, so a drain error would vanish with
+    // NO trace at all — a REGRESSION from the loud `unhandledRejection` this code
+    // replaced. Guarantee at least a `logger.error` so a runtime failure is never
+    // completely silent.
+    if (!surfaced) {
+      this.logger.error(
+        'Unhandled state machine runtime error (no monitor/onError sink)',
+        context,
+        error,
+      )
     }
   }
 
@@ -579,6 +695,20 @@ export class StateMachine<
           error instanceof Error ? error : new Error(String(error)),
           { state: currentState, event: eventName },
         )
+        // П2 dedup: mark this error as ALREADY recorded so that when it is
+        // rethrown into the INTERNAL-branch catch of processQueues,
+        // `reportRuntimeError` does NOT emit a SECOND `monitor.recordError` for
+        // the same failure. External events settle via `evt.reject` (no second
+        // report), so this only affects the internal-drain path — exactly the
+        // double-count the simulator oracles (W5) must not see. Marking the
+        // ORIGINAL rethrown object keeps the flag visible downstream.
+        if (typeof error === 'object' && error !== null) {
+          try {
+            ;(error as Record<symbol, unknown>)[RUNTIME_ERROR_REPORTED] = true
+          } catch {
+            /* frozen/exotic error object — dedup simply degrades to prior behavior */
+          }
+        }
       }
       throw error // Propagate error to caller (e.g. fireEvent rejection)
     })
@@ -1695,6 +1825,26 @@ export class StateMachine<
     )
   }
 
+  /**
+   * П2: `getCurrentState` can THROW ('Invalid state path…') when an adaptee's
+   * persisted state string is corrupted. In the drain's error-reporting paths
+   * (run-away context, internal-catch context) that throw would escape the
+   * floating `queueMicrotask(processQueues)` as a real process
+   * `unhandledRejection` — resurrecting the very failure mode the observable
+   * error channel was built to prevent. This never-throwing variant returns
+   * `undefined` instead, so error contexts degrade gracefully on a corrupted
+   * adaptee rather than crashing the drain.
+   */
+  private safeGetCurrentState(
+    adaptee?: Adapter<PropertiesOf<TOwner>>,
+  ): string | undefined {
+    try {
+      return this.getCurrentState(adaptee)
+    } catch {
+      return undefined
+    }
+  }
+
   public getCurrentState(adaptee?: Adapter<PropertiesOf<TOwner>>) {
     const targetAdaptee = adaptee || this.adaptee
     if (!targetAdaptee) return
@@ -2214,7 +2364,19 @@ export class StateMachine<
     return (...args: any[]) => {
       const targetAdaptee = args.length >= 2 ? args[0] : adaptee
       const error = args.length >= 2 ? args[1] : args[0]
-      return handler(this.resolveCallbackOwner(targetAdaptee), error)
+      // Run the (possibly user-supplied) error handler OUTSIDE the drain's
+      // AsyncLocalStorage context. An `onError` handler is a legitimate
+      // error-recovery point that may issue a fresh external `fireEvent`; under
+      // the drain epoch that fire is FALSELY rejected as reentrant (П3 case б),
+      // yet the drain does not await it, so a queued recovery event would be
+      // drained. exit() clears getStore() so recovery fires queue normally,
+      // while a TRUE reentrant (await fireEvent directly inside onEnter/guard,
+      // which runs under the epoch, not via processError) still rejects. The
+      // default rethrow handler above propagates its throw through exit()
+      // unchanged (exit only swaps the ALS context, it does not catch).
+      return this.drainContext.exit(() =>
+        handler(this.resolveCallbackOwner(targetAdaptee), error),
+      )
     }
   }
 

@@ -150,6 +150,20 @@ export interface StateMachineOptions {
    */
   maxQueueDepth?: number
   /**
+   * Maximum number of INTERNAL (raised) transitions a single continuous drain
+   * may process before the run-away guard trips (`StateMachineError`, reported
+   * through the observable monitor/onError channel). Guards against a
+   * self-sustaining internal loop (e.g. `done.state` ping-pong) starving the
+   * macrotask queue. Raise it to admit a legitimate FINITE cascade longer than
+   * the default (e.g. a long auto-advance gated-pipeline). Default: 100.
+   *
+   * Note: this bounds STARVATION (internal self-loops within one drain), NOT
+   * every conceivable non-termination — a timer-driven ping-pong (`invoke`
+   * with `delay:0`) yields to the macrotask queue each hop, so it is outside
+   * this bound by construction (and does not starve).
+   */
+  maxTransitionDepth?: number
+  /**
    * Named-function registry consulted by `fromJSON` / `fromSecureJSON` to
    * restore serialized function references (guards / actions / onError / …).
    *

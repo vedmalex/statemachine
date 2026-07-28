@@ -41,7 +41,26 @@ fireEvent (нормальный RTC-паттерн: replay лога, поток 
 source_scan + serialization_registry) зелёный — не реоткрыт. Легит цепочки (15 внутренних, внешний
 батч) работают.
 
-## Осталось к critic-приёмке W1
+## W1.1 — доработка по critic-приёмке (ACCEPT С ЗАМЕЧАНИЯМИ) + finalize
 
-- verify отметил legitChainsWork:false из-за over-fix — ЗАКРЫТО оркестратором (регресс-тест зелёный).
-- Связь П2↔A1: ошибка внутреннего события теперь в monitor — sim сможет увидеть её как violation в W5.
+Critic-приёмка (статическая, критик без Bash) нашла блокер W2 — П3-детектор реентрантности ШИРЕ
+дефекта. Проверено оркестратором ЗАПУСКОМ, закрыто:
+
+| id | что | подтверждение |
+|---|---|---|
+| П3-точность [HIGH, блокер] | детектор ловил ложно легит внешние события | `AsyncLocalStorage` drainContext + epoch: reject только из логического стека дренажа. **Все 4 случая проверены запуском**: (а) внешний-в-async-окно RESOLVED, (в) chained RESOLVED, (б) fireEvent из onError RESOLVED, (г) 2й adaptee RESOLVED; истинный реентрант всё ещё reject |
+| П3(б) residual | verdict RESIDUAL: onError бежал под drain-контекстом | `processError` возвращаемый handler обёрнут в `drainContext.exit` — любой user error-handler вне контекста; default-rethrow пропагируется сквозь. Red проверен откатом |
+| П3-сообщение | советовал private raiseEvent | переформулировано без несуществующего API |
+| П2 закалка | getCurrentState мог воскресить unhandledRejection; двойной recordError; тихая дыра | `safeGetCurrentState`; `RUNTIME_ERROR_REPORTED` symbol-дедуп (recordError=1, критично для sim W5); logger.error floor при disabled+no-onError |
+| П8 конфиг | MAX=100 захардкожен | `maxTransitionDepth` в StateMachineOptions (дефолт 100); тест ужесточён n<K→n≲MAX |
+| тесты (б)(г) | verify: отсутствовали | добавлены, (б) проверен откатом |
+
+Итог W1.1: **828 passed / 14 skipped; tsc чисто; W0+W1 регресс 34/34** (оркестратор-прогон).
+
+## Вывод W1 (prep + #12 + W1.1)
+
+Устойчивость рантайма закрыта целиком. Три слоя проверки поймали три класса дефектов: adversarial-
+verify — over-fix счётчика (внешний батч), critic-приёмка — over-scope детектора (легит события),
+второй verify — residual (onError под контекстом). Связь П2↔A1 подтверждена критиком: ошибка
+внутреннего события в monitor (recordError=1, без задвоения) — sim прочитает как violation в W5.
+Blast radius смены правила измерен: 9 клеток. Фундамент под W2 (компилятор конфига) устойчив.
