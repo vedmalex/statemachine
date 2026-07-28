@@ -47,8 +47,18 @@ import { type SimClock, makeSimClock } from './clock'
 import { type Env, type SchedulerView, makeObservableScheduler } from './env'
 import type { FaultPlan } from './faults'
 import { buildPlanJitter, makeObservableSchedulerWithJitter } from './observable-scheduler'
-import { type CheckerContext, type ConfigGraph, type Invariant, type Violation, buildConfigGraph } from './invariants'
+import {
+  type CheckerContext,
+  type ConfigGraph,
+  type Invariant,
+  type Violation,
+  INVARIANTS,
+  buildConfigGraph,
+  makeViolation,
+} from './invariants'
 import { runSafety } from './invariants.runner'
+import { type LivenessResult, type LivenessSample, analyzeLiveness } from './liveness'
+import { type RunGuardHandle, type RunGuardReport, installRunGuard } from './run-guard'
 import { latencyStatsOf } from './metrics'
 import type { PerfSample } from './metrics'
 import { NoopLogger } from './noop-logger'
@@ -105,7 +115,12 @@ export interface SimOptions {
   readonly steps?: number
   readonly faults?: FaultPlan
   readonly invariants?: readonly Invariant[]
-  readonly mode?: 'safety' | 'liveness'
+  /**
+   * Verdict planes to run. `'safety'` (default) runs the invariant registry only;
+   * `'liveness'` ALSO wires {@link analyzeLiveness} into the verdict (A4) and lets
+   * the settle jump the clock; `'both'` runs safety AND liveness.
+   */
+  readonly mode?: 'safety' | 'liveness' | 'both'
   readonly onTrace?: (frame: TraceFrame) => void
 }
 
@@ -127,6 +142,30 @@ export interface StepOutcome {
 }
 
 // ============================================================================
+// SimViolation — a {@link Violation} plus the harness-origin `kind` discriminator
+// (A1/A4 verdict plumbing). `kind` is ABSENT on an ordinary safety-invariant
+// violation (backward-compatible: every SimViolation is a valid Violation) and
+// present only on a SYNTHETIC verdict the harness itself raises:
+//  - 'engine'   : an engine runtime error surfaced via monitor.recordError or a
+//                 residual unhandledRejection (A1) — the run threw internally.
+//  - 'liveness' : a livelock/timeout the liveness oracle caught (A4).
+// ============================================================================
+/** @unstable */
+export type SimViolation = Violation & { readonly kind?: 'engine' | 'liveness' }
+
+// ============================================================================
+// SimWarning — a NON-fatal observability finding surfaced on the SimResult. It
+// does NOT by itself flip `ok`; it tells the consumer the run left the sanctioned
+// deterministic envelope (a real-timer escape) or is under-checked (no oracles).
+// ============================================================================
+/** @unstable */
+export interface SimWarning {
+  readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles'
+  readonly message: string
+  readonly count?: number
+}
+
+// ============================================================================
 // SimResult — the one-shot run summary. seed is canonical string form.
 // ============================================================================
 /** @unstable */
@@ -136,9 +175,60 @@ export interface SimResult {
   readonly steps: number
   readonly traceHash: string
   readonly trace: readonly TraceFrame[]
-  readonly violation?: Violation
+  readonly violation?: SimViolation
   readonly metrics: PerfSample
+  /**
+   * How many ORACLES actually ran (A2 fail-open guard): the effective safety
+   * invariants + the always-on engine-error channel + the liveness oracle when
+   * enabled. A naive `runSimulation` with no invariants no longer executes ZERO
+   * oracles — the default builtin registry is attached — so a structural
+   * `ok:true` can never masquerade as "verified". Always `>= 1`.
+   */
+  readonly oraclesRun: number
+  /**
+   * The liveness verdict (A4) — present only when the run enabled the liveness
+   * plane (`mode:'liveness'` or `'both'`).
+   */
+  readonly liveness?: LivenessResult
+  /**
+   * The livelock headline (A4): populated (non-empty) iff the liveness oracle
+   * reached a non-`PROGRESSED` verdict (STUCK / TIMEOUT_BUDGET_EXCEEDED). Its
+   * presence forces `ok:false`.
+   */
+  readonly livelocks?: readonly LivenessResult[]
+  /** Non-fatal observability findings (A5 real-timer escape, residual rejection). */
+  readonly warnings?: readonly SimWarning[]
 }
+
+/**
+ * The DEFAULT builtin oracle set attached when a `runSimulation`/`Simulator` caller
+ * supplies NO `invariants` (A2 fail-open fix). Restricted to the invariants that
+ * are sound on a legitimate machine in W5a (the W5b content fixes — I-3/I-5/I-9 —
+ * are intentionally EXCLUDED so the default set never false-positives before those
+ * land). The always-on engine-error channel (A1) supplements this set.
+ */
+const DEFAULT_BUILTIN_INVARIANT_IDS: ReadonlySet<string> = new Set([
+  'I-2',
+  'I-6',
+  'I-7',
+  'I-10',
+  'I-11',
+  'I-12',
+])
+
+/** The resolved default builtin registry (filtered {@link INVARIANTS}). */
+const DEFAULT_INVARIANTS: readonly Invariant[] = INVARIANTS.filter((i) =>
+  DEFAULT_BUILTIN_INVARIANT_IDS.has(i.id),
+)
+
+/**
+ * Virtual-time budget handed to {@link analyzeLiveness}. Generous and finite: the
+ * verdict plane leans on the configuration-cycle / self-loop detectors (A4), not a
+ * tight timeout, so the budget only needs to dominate any legitimate armed-timer
+ * chain a simulated run reaches. Kept well below Number.MAX_SAFE_INTEGER so a
+ * genuine runaway virtual-time chain still trips TIMEOUT_BUDGET_EXCEEDED.
+ */
+const LIVENESS_VIRTUAL_BUDGET_MS = 1_000_000_000
 
 // ============================================================================
 // SimSnapshot — serializable mid-run checkpoint. Engine state via StateMachine
@@ -310,6 +400,10 @@ export class Simulator<T extends object = object> {
   private readonly _env: SimEnv
   private readonly stepBudget: number
   private readonly policy: 'safety' | 'liveness'
+  /** True iff the liveness plane is wired into the verdict (mode 'liveness'|'both'). */
+  private readonly livenessEnabled: boolean
+  /** Number of declared config states — the {@link analyzeLiveness} cycle window K = stateCount + 1. */
+  private stateCount = 1
   private readonly onTrace?: (frame: TraceFrame) => void
   /**
    * The consumer-supplied SAFETY invariants (opts.invariants). Threaded into the
@@ -357,8 +451,13 @@ export class Simulator<T extends object = object> {
     this.schedulerView = view
     this.scheduler = scheduler
     this.stepBudget = opts.steps ?? 16
-    this.policy = opts.mode ?? 'safety'
-    this.invariants = opts.invariants ?? []
+    // mode 'both' and 'liveness' both wire the liveness plane; only 'liveness'/'both'
+    // let the settle jump the clock (SettlePolicy has no 'both' — map it to 'liveness').
+    this.livenessEnabled = opts.mode === 'liveness' || opts.mode === 'both'
+    this.policy = this.livenessEnabled ? 'liveness' : 'safety'
+    // A2 fail-open fix: a caller that supplies NO invariants gets the DEFAULT builtin
+    // registry, so a run always executes real oracles (never a rubber structural ok).
+    this.invariants = opts.invariants ?? DEFAULT_INVARIANTS
     if (opts.onTrace) {
       this.onTrace = opts.onTrace
     }
@@ -408,8 +507,11 @@ export class Simulator<T extends object = object> {
     // driver's canonical trace header (same seed/runtime the hash uses). Empty
     // invariants ⇒ no context (runSafety is never called), so a clean run keeps
     // ok:true / violation:undefined.
+    // The config graph is built once: it supplies both the safety CheckerContext
+    // (when invariants run) and the liveness cycle-window K = stateCount + 1 (A4).
+    const graph: ConfigGraph = buildConfigGraph(resolved.config)
+    this.stateCount = Math.max(1, graph.states.size)
     if (this.invariants.length > 0) {
-      const graph: ConfigGraph = buildConfigGraph(resolved.config)
       this.checkerCtx = { graph, header: driver.trace().header }
     }
 
@@ -473,27 +575,131 @@ export class Simulator<T extends object = object> {
    * Always `await init()` first if not already initialized.
    */
   async run(): Promise<SimResult> {
-    if (!this.initialized) {
-      await this.init()
+    // Install the run-window guard BEFORE init(): a consumer onEnter can arm a real
+    // timer (A5 escape) or throw an internal event (A1) DURING the post-construction
+    // drain, which init() runs. runSimulation delegates here so init() is inside the
+    // window. The guard is torn down in `finally` regardless of outcome.
+    const guard: RunGuardHandle = installRunGuard()
+    let guardReport: RunGuardReport
+    try {
+      if (!this.initialized) {
+        await this.init()
+      }
+      for (let i = 0; i < this.stepBudget; i++) {
+        await this.step()
+      }
+    } finally {
+      guardReport = guard.stop()
     }
-    for (let i = 0; i < this.stepBudget; i++) {
-      await this.step()
-    }
+
     const trace: CanonicalTrace = this.driver?.trace() ?? { header: emptyHeader(this.seedString), frames: [] }
     // Final SAFETY sweep so a checkFinal-scoped violation is caught even at a zero
     // step budget (where the per-step loop never ran).
     this.evaluateSafety(trace)
-    // SAFETY semantics: ok iff no violation was ever observed; violation is the
-    // first/lowest-step Violation seen across the run (using the EXISTING
-    // Violation/runSafety types — no new shapes, frozen public signature intact).
+    return this.assembleResult(trace, guardReport)
+  }
+
+  /**
+   * Fold the SAFETY sweep result together with the A1 engine-error channel, the A4
+   * liveness verdict, and the A5 escape warnings into the {@link SimResult}. This is
+   * where the run stops giving a FALSE ok: a recorded engine error, a residual
+   * unhandled rejection, or a livelock all force `ok:false`, and `oraclesRun`
+   * records that real oracles ran (never a rubber structural ok).
+   */
+  private assembleResult(trace: CanonicalTrace, guardReport: RunGuardReport): SimResult {
+    const noFaults = this.faults.faults.length === 0
+
+    // ── A1: engine-error channel. After W1 the engine routes an internal invalid/
+    // throwing event to monitor.recordError (no process rejection remains); a
+    // RESIDUAL genuine unhandledRejection is captured by the run guard. Either — on
+    // a NON-fault run (a fault run carries its OWN oracles for EXPECTED errors) — is
+    // a synthetic 'engine' violation the verdict must see.
+    const errorCount = (this._env.monitor as SimMonitor).getErrorCount()
+    const unhandled = guardReport.unhandledRejections
+    let engineViolation: SimViolation | undefined
+    if (noFaults && (errorCount > 0 || unhandled.length > 0)) {
+      const reason =
+        errorCount > 0
+          ? `engine recorded ${errorCount} runtime error(s) via monitor.recordError`
+          : `${unhandled.length} unhandled rejection(s) escaped the run`
+      const base = makeViolation({
+        invariantId: 'engine-error',
+        step: 0,
+        witness: this.safeCurrentConfig(),
+        errorClass: 'invalid-event',
+        message: `engine runtime error during simulation: ${reason}`,
+        observed: reason,
+        expected: 'no engine runtime error / unhandled rejection',
+      })
+      engineViolation = { ...base, kind: 'engine' }
+    }
+
+    // ── A4/C2: liveness plane wired into the verdict when enabled (mode
+    // 'liveness'|'both'). A non-PROGRESSED verdict (STUCK / TIMEOUT_BUDGET_EXCEEDED)
+    // becomes a livelocks[] headline and forces ok:false. C2 (progress-aware
+    // self-loop) must precede this so a legitimate progressing self-loop is not a
+    // false STUCK once analyzeLiveness is authoritative for the verdict.
+    let liveness: LivenessResult | undefined
+    let livelocks: readonly LivenessResult[] | undefined
+    if (this.livenessEnabled) {
+      const samples = buildLivenessSamples(trace.frames)
+      liveness = analyzeLiveness(samples, {
+        stateCount: this.stateCount,
+        budgetVirtualMs: LIVENESS_VIRTUAL_BUDGET_MS,
+      })
+      if (liveness.verdict !== 'PROGRESSED') {
+        livelocks = [liveness]
+      }
+    }
+
+    // ── A5: real-timer escape warning + residual-rejection observability.
+    const warnings: SimWarning[] = []
+    if (guardReport.timerEscapes > 0) {
+      warnings.push({
+        kind: 'timer-escape',
+        message: `${guardReport.timerEscapes} real timer(s) armed outside the virtual scheduler (escaped env.scheduler); quiescence cannot see them`,
+        count: guardReport.timerEscapes,
+      })
+    }
+    if (unhandled.length > 0) {
+      warnings.push({
+        kind: 'unhandled-rejection',
+        message: `${unhandled.length} unhandled rejection(s) observed during the run window`,
+        count: unhandled.length,
+      })
+    }
+
+    // ── A2: oracle count. Always >= 1 — the engine-error channel is always on —
+    // so a structural ok:true can never masquerade as "verified".
+    const oraclesRun = this.invariants.length + 1 + (this.livenessEnabled ? 1 : 0)
+
+    // The engine error dominates a safety-invariant violation for the REPORTED
+    // `violation` (it is the more fundamental fault); either it, a safety violation,
+    // or a livelock forces ok:false.
+    const primary: SimViolation | undefined = engineViolation ?? this.firstViolation
+    const ok = primary === undefined && livelocks === undefined
+
     return {
-      ok: this.firstViolation === undefined,
+      ok,
       seed: this.seedString,
       steps: this.stepCount,
       traceHash: hashTrace(trace),
       trace: trace.frames,
-      ...(this.firstViolation !== undefined ? { violation: this.firstViolation } : {}),
+      oraclesRun,
+      ...(primary !== undefined ? { violation: primary } : {}),
+      ...(liveness !== undefined ? { liveness } : {}),
+      ...(livelocks !== undefined ? { livelocks } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       metrics: zeroMetrics(trace.frames.length),
+    }
+  }
+
+  /** Current normalized config for a synthetic-violation witness (never throws). */
+  private safeCurrentConfig(): string {
+    try {
+      return this.machine?.getCurrentState() ?? ''
+    } catch {
+      return ''
     }
   }
 
@@ -620,11 +826,78 @@ export class Simulator<T extends object = object> {
 }
 
 /**
- * One-shot convenience over {@link Simulator}: construct, init, run, return the
- * {@link SimResult}.
+ * Build the per-step {@link LivenessSample} stream the {@link analyzeLiveness}
+ * oracle consumes from the accumulated canonical trace (A4). ONE sample per
+ * logical STEP: the driver emits, per step, N per-transition seam frames PLUS
+ * exactly one settle-boundary frame (driver.ts:487-512), all sharing the same
+ * `step`. Only the boundary frame carries the step's SETTLED observation — the
+ * final config `to`, the settle-time queue depth, and the step's `fireOutcome`.
+ * Timer observables are not carried per-frame in the content-only trace, so
+ * `pendingTimers`/`earliestTimerAt` read the no-pending-timer default — the
+ * cycle/self-loop detectors key on config + queue progress, which the trace DOES
+ * carry.
+ */
+function buildLivenessSamples(frames: readonly TraceFrame[]): LivenessSample[] {
+  // Collapse to ONE boundary frame PER STEP — the LAST frame of each contiguous
+  // same-`step` run (`step` is monotonic non-decreasing and contiguous; the
+  // boundary frame is pushed AFTER the step's seam frames). Feeding every frame
+  // 1:1 made a step's intra-step seam+boundary pair share a progress fingerprint
+  // and FALSELY trip the config-cycle / self-loop detectors on a machine that in
+  // fact terminates (a resolve-true step looked like "the same config twice").
+  //
+  // NOTE: an earlier fix collapsed by (config, queueDepth) across step BOUNDARIES
+  // — that ALSO erased a genuine single-state `s1 --E--> s1` self-loop (its every
+  // step shares one fingerprint), turning a real livelock into a false PROGRESSED
+  // (a false-NEGATIVE, the worst class for a sim oracle). Collapsing PER STEP is
+  // the correct grain: a real self-loop / A<->B livelock repeats its fingerprint
+  // across DISTINCT steps, which survive here as distinct samples for the
+  // cross-step detectors. (W5a A4 fix.)
+  const boundaries: TraceFrame[] = []
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i]
+    if (f === undefined) {
+      continue
+    }
+    const next = frames[i + 1]
+    if (next === undefined || next.step !== f.step) {
+      boundaries.push(f)
+    }
+  }
+  return boundaries.map((f, i) => {
+    const prev = i > 0 ? boundaries[i - 1] : undefined
+    // TERMINAL derived HONESTLY from the settle boundary — NEVER from position: a
+    // quiescent boundary whose captured `doneDelta` marks EVERY declared composite
+    // done is a genuine terminal configuration. Absent doneDelta (a single-leaf
+    // final with no declared composite) leaves terminal=false, which is SAFE — a
+    // truly terminated machine issues no resolve-true fire (getAvailableEvents()
+    // is empty -> a noop step with no fireOutcome), so the STUCK rules (which gate
+    // on fireOutcome==='resolve-true') never fire on it.
+    const terminal =
+      f.quiescent === true &&
+      f.doneDelta !== undefined &&
+      f.doneDelta.length > 0 &&
+      f.doneDelta.every((d) => d.done)
+    return {
+      config: f.to,
+      queueDepth: f.queue.internal + f.queue.external,
+      pendingTimers: 0,
+      earliestTimerAt: null,
+      configChanged: prev === undefined ? true : f.to !== prev.to,
+      healthy: true,
+      inFlight: false,
+      terminal,
+      t: f.t,
+      ...(f.fireOutcome ? { fireOutcome: f.fireOutcome } : {}),
+    }
+  })
+}
+
+/**
+ * One-shot convenience over {@link Simulator}: construct and {@link Simulator.run}
+ * (which drives `init()` INSIDE the run-window guard so an A5 real-timer escape /
+ * A1 engine error armed during the post-construction drain is observed), returning
+ * the {@link SimResult}.
  */
 export async function runSimulation<T extends object>(setup: SimSetup<T>, opts: SimOptions): Promise<SimResult> {
-  const sim = new Simulator<T>(setup, opts)
-  await sim.init()
-  return sim.run()
+  return new Simulator<T>(setup, opts).run()
 }

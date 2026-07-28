@@ -1,44 +1,38 @@
 /**
  * @module tests/sim/blockers_frozen
  *
- * ЗАМОРОЖЕННЫЕ red-тесты sim-блокеров (Юнит A, W1 ПОРЯДКОВЫЙ ИНВАРИАНТ).
+ * sim-блокеры Юнита A — РАЗМОРОЖЕННЫЕ в волне W5a (A1/A2/A4/A5/C2) + один ещё
+ * замороженный (C1 → W5b).
  *
- * Каждый `it` в этом файле был ПРОГНАН БЕЗ `.skip` на текущем HEAD (ветка
- * `remediation/w1-prep`, до фикса П2/W1 — catch во внутренней ветке
- * `processQueues`) и ФАКТИЧЕСКИ ВОСПРОИЗВЁЛ дефект: sim либо тихо проглатывает
- * реальный сбой движка (`ok:true` там, где должен быть `violation`), либо
- * наоборот ложно бракует легитимный прогон (`ok:false` там, где должен быть
- * `ok:true`). Фактический вывод каждого прогона записан в комментарии
- * `// HEAD-ФАКТ:` перед соответствующим `expect`.
+ * ИСТОРИЯ. Каждый `it` был сначала ПРОГНАН БЕЗ `.skip` на HEAD ветки
+ * `remediation/w1-prep` (до фикса движка W0-W4) и ФАКТИЧЕСКИ ВОСПРОИЗВЁЛ дефект
+ * sim-сантехники: sim либо тихо проглатывает реальный сбой движка (`ok:true` там,
+ * где должен быть `violation`), либо наоборот ложно бракует легитимный прогон.
+ * Фактический до-фикс вывод сохранён в комментариях `// HEAD-ФАКТ:` — как witness.
  *
- * ПРИЧИНА ЗАМОРОЗКИ (см. .plan/MASTER-remediation-plan.md §3/§4б, строка ~333):
- * фикс П2 (симметричный catch во внутренней ветке `processQueues`, W1) уничтожит
- * ВОСПРОИЗВЕДЕНИЕ A1 — после фикса внутренний брос больше не порождает
- * `unhandledRejection` (он корректно перехватывается и уходит в
- * onError/monitor), поэтому «на текущем HEAD» A1 физически перестанет
- * краснеть. Это ПОРЯДКОВЫЙ ИНВАРИАНТ волны W1: red-тесты sim СНИМАЮТСЯ
- * (зафиксированы здесь) ДО того, как П2 попадёт в HEAD — иначе воспроизведение
- * теряется безвозвратно.
+ * W5a-РАЗМОРОЗКА (эта волна). Движок УЖЕ ПОЧИНЕН (W0-W4): ошибки внутренних
+ * событий теперь маршрутизируются в `monitor.recordError` (W1 reportRuntimeError),
+ * НЕ в `unhandledRejection`; метрики честны (W4). ОДНАКО sim-сантехника вердикта
+ * ещё НЕ подключена к этому починенному движку — поэтому эти тесты приведены к
+ * ЦЕЛЕВОМУ контракту («ПОСЛЕ ФИКСА») и на ТЕКУЩЕМ HEAD КРАСНЕЮТ:
+ *   - A1 (#19)  — RTC-разрыв: recordError видна движком, но sim даёт ok:true.
+ *                 ЦЕЛЬ: ok:false + violation.kind==='engine' (синтетический).
+ *   - A2 (#20)  — fail-open: 0 оракулов ⇒ ok:true безусловно, нет oraclesRun.
+ *                 ЦЕЛЬ: SimResult.oraclesRun>0 (дефолт подключает INVARIANTS).
+ *   - A4 (#20)  — liveness отключён от вердикта: livelock ⇒ ok:true.
+ *                 ЦЕЛЬ: analyzeLiveness подключён ⇒ ok:false + livelocks[].
+ *   - A5 (#20)  — escape реального таймера невидим: quiescent/ok остаются true.
+ *                 ЦЕЛЬ: spy на глобальный таймер ⇒ warnings[kind:'timer-escape'].
+ *   - C2        — analyzeLiveness ложно STUCK на self-переходе С ПРОГРЕССОМ.
+ *                 ЦЕЛЬ: рост queue/timer/data ⇒ verdict !== 'STUCK'. (Юнит-уровень
+ *                 liveness.ts — ДО A4, MASTER §3 «C2 до A4».)
  *
- * Все пять сценариев — `describe.skip` (не исполняются обычным прогоном
- * `vitest run`). Разморозка (снятие `.skip`) запланирована по реестру §6
- * MASTER-remediation-plan.md волнами:
- *   - A1 (#19)              → W5a — «слушатель unhandledRejection на окно run»
- *   - A2 (fail-open)        → W5a — «oraclesRun» в отчёте + STRICT failOn
- *   - A4 (liveness/livelock)→ W5a — analyzeLiveness подключается к вердикту
- *     (после починки C2 — «C2 до A4», см. MASTER §3/строка 282)
- *   - A5 (real-timer escape)→ W5a — spy на глобальные таймеры → warning/fail
- *   - C1 (I-3 false-positive)→ W5b — settle-reason попадает в TraceFrame,
- *     WAITING_ON_* исключается из I-3
+ * ЕЩЁ ЗАМОРОЖЕН (снимается в W5b):
+ *   - C1 (#21)  — I-3 false-positive на легитимном WAITING_ON_TIMER: settle-reason
+ *                 попадает в TraceFrame, WAITING_ON_* исключается из I-3.
  *
- * При разморозке каждый `it` меняет полярность своего `expect` на
- * ПОСТ-ФИКС-ожидание (см. комментарий `// ПОСЛЕ ФИКСА:` в каждом блоке) —
- * НЕ удаляется и не переписывается с нуля: тот же сценарий/конфиг остаётся
- * red→green witness.
- *
- * Директива §0.5: файл ломающих изменений не боится (это тестовый артефакт,
- * не src движка). Директива §0.6: полнота — ничего не сокращено относительно
- * реально прогнанных сценариев.
+ * Директива §0.5: тестовый артефакт ломающих не боится. §0.6: полнота — сценарии/
+ * конфиги/HEAD-ФАКТ-witness сохранены дословно (тот же red→green witness).
  */
 
 import { describe, expect, it } from 'vitest'
@@ -53,28 +47,28 @@ interface Box {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// FROZEN — не исполняется. Снимается волнами W5a/W5b (см. заголовок модуля).
+// UNFROZEN (W5a) — A1/A2/A4/A5/C2 приведены к целевому контракту. C1 — FROZEN.
 // ─────────────────────────────────────────────────────────────────────────
-describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)', () => {
-  // ── A1 — RTC-разрыв: sim НЕ видит unhandledRejection (П2 / #19) ──────────
-  describe('A1 — RTC-break: internal-queue throw escapes as an unhandled rejection, invisible to SimResult', () => {
-    it('an internal raiseEvent()-driven invalid-event throw crashes past processQueues as a real unhandledRejection, yet SimResult.ok stays true', async () => {
+describe('sim blockers — W5a verdict-plumbing (A1/A2/A4/A5/C2 unfrozen; C1 frozen→W5b)', () => {
+  // ── A1 — RTC-разрыв: sim ДОЛЖЕН видеть recordError движка как violation ──
+  describe('A1 — RTC-break: an engine-internal invalid-event throw must surface as a SimResult violation', () => {
+    it('an internal raiseEvent()-driven invalid-event throw (now routed to monitor.recordError by W1) must make SimResult.ok false with a synthetic engine violation', async () => {
       // ЧТО ФИКСИРУЕТ: `invoke:[{event:'NONEXISTENT', delay:1}]` на состоянии
-      // 'idle' без соответствующего события в `events` воспроизводит П2:
-      // invoke-таймер срабатывает через движковый `raiseEvent` (внутренняя
-      // очередь), `processQueues`'s internal-branch (state_machine.ts:354-361)
-      // НЕ имеет catch (в отличие от external-branch :362-373), поэтому
-      // `Invalid event: NONEXISTENT for state: idle` (:420-425) пробрасывается
-      // из async processQueues(), вызванного через
-      // `queueMicrotask(() => this.processQueues())` (:328) БЕЗ .catch — это
-      // РЕАЛЬНЫЙ process-level `unhandledRejection`, а не просто отклонённый
-      // fireEvent.
+      // 'idle' без соответствующего события в `events`: invoke-таймер срабатывает
+      // через движковый `raiseEvent` (внутренняя очередь), внутренняя ветка
+      // `processQueues` бросает `Invalid event: NONEXISTENT for state: idle`.
       //
-      // ПОСЛЕ ФИКСА (П2, W1): симметричный catch в internal-branch убирает
-      // unhandledRejection — ошибка уходит в onError/monitor, процесс жив;
-      // ЭТОТ КОНКРЕТНЫЙ unhandledRejection перестаёт возникать вовсе, так что
-      // это `it` необходимо ПЕРЕСТРОИТЬ на "слушатель окна run" (W5a #19),
-      // не просто инвертировать expect — отсюда W1-порядковый-инвариант.
+      // ДО W1 это уходило в process-level `unhandledRejection` и sim НЕ видел
+      // (ok:true). ПОСЛЕ W1 (движок починен) симметричный catch маршрутизирует
+      // ошибку в `monitor.recordError` (reportRuntimeError) — процесс жив,
+      // unhandledRejection НЕ возникает. НО sim-сантехника вердикта ещё НЕ
+      // подключила `SimMonitor.recordError` к вердикту, поэтому на ТЕКУЩЕМ HEAD
+      // sim ВСЁ РАВНО даёт ok:true — ложный OK при реальном движковом сбое.
+      //
+      // ЦЕЛЬ W5a #19: (а) SimMonitor.recordError фиксирует ошибку → вердикт видит
+      // её (ok:false, синтетический violation kind:'engine'); (б) на остаточные
+      // настоящие unhandledRejection — слушатель на окно run → синтетический
+      // violation с teardown/скоупингом.
       let unhandled: unknown
       const handler = (err: unknown): void => {
         unhandled = err
@@ -103,35 +97,27 @@ describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)'
       await Promise.resolve()
       process.removeListener('unhandledRejection', handler)
 
-      // HEAD-ФАКТ (прогон на remediation/w1-prep, до П2):
-      //   result.ok === true, result.violation === undefined
-      //   unhandled instanceof StateMachineError,
-      //     message === "Invalid event: NONEXISTENT for state: idle"
-      // sim's own SAFETY oracle set (I-1..I-12) never sees this — it is a
-      // process-level crash-class defect the harness has NO seam for.
-      expect(result.ok).toBe(true)
-      expect(result.violation).toBeUndefined()
-      expect(unhandled).toBeInstanceOf(Error)
-      expect((unhandled as Error).message).toMatch(/Invalid event: NONEXISTENT for state: idle/)
+      // HEAD-ФАКТ (прогон на remediation/w1-prep, движок W0-W4 починен):
+      //   unhandled === undefined  (W1's catch contained the internal throw —
+      //     no process-level unhandledRejection remains)
+      //   result.ok === true       ← ЛОЖНЫЙ OK: recordError видна движком, но
+      //   result.violation === undefined    sim не подключил её к вердикту.
 
-      // ПОСЛЕ ФИКСА (когда W5a #19 lands a run-window unhandledRejection
-      // listener that synthesizes a violation of kind:'engine'):
-      //   expect(unhandled).toBeUndefined() // П2's catch already contained it
-      //   expect(result.ok).toBe(false)
-      //   expect(result.violation?.kind).toBe('engine') // synthetic engine violation
+      // ПОСЛЕ ФИКСА (W5a #19): recordError → вердикт; окно run ловит остаточные
+      // unhandledRejection → синтетический violation kind:'engine'.
+      expect(unhandled).toBeUndefined() // W1's catch already contained it
+      expect(result.ok).toBe(false)
+      expect((result.violation as any)?.kind).toBe('engine')
     })
   })
 
-  // ── A2 — fail-open: 0 оракулов → ok:true безусловно ──────────────────────
-  describe('A2 — fail-open: zero invariants passed still reports ok:true unconditionally', () => {
-    it('runSimulation(setup, {seed, steps}) with no `invariants` field returns ok:true and carries no oracle-count field at all', async () => {
-      // ЧТО ФИКСИРУЕТ: SimOptions.invariants является ОПЦИОНАЛЬНЫМ, и
-      // `Simulator.evaluateSafety` — no-op когда `this.checkerCtx === undefined`
-      // (public.ts:461-469), что происходит именно когда `invariants.length===0`
-      // (public.ts:411). Значит ЛЮБОЙ прогон без явно переданных инвариантов
-      // ВСЕГДА возвращает ok:true, СТРУКТУРНО, вне зависимости от того, что на
-      // самом деле произошло в трассе. SimResult не несёт даже поля,
-      // фиксирующего "сколько оракулов реально отработало" — потребитель не
+  // ── A2 — fail-open: 0 оракулов ⇒ ok:true. ЦЕЛЬ: oraclesRun>0 ──────────────
+  describe('A2 — fail-open: a run with no invariants must not report a rubber ok:true', () => {
+    it('runSimulation(setup, {seed, steps}) with no `invariants` must carry oraclesRun>0 (default builtins attached), not a structural ok:true', async () => {
+      // ЧТО ФИКСИРУЕТ: SimOptions.invariants ОПЦИОНАЛЬНО, и `evaluateSafety` —
+      // no-op когда `checkerCtx === undefined` (public.ts:461-469), что происходит
+      // именно когда `invariants.length === 0` (public.ts:411). ЛЮБОЙ прогон без
+      // явных инвариантов ВСЕГДА возвращает ok:true СТРУКТУРНО — потребитель не
       // может ОТЛИЧИТЬ «прогон чист» от «прогон никем не проверялся».
       const result = await runSimulation<Box>(
         () => ({
@@ -150,31 +136,22 @@ describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)'
       // HEAD-ФАКТ (прогон на remediation/w1-prep):
       //   result.ok === true, result.violation === undefined
       //   Object.keys(result) === ['ok','seed','steps','traceHash','trace','metrics']
-      //     — НЕТ oraclesRun/oraclesEvaluated ни в каком виде.
-      expect(result.ok).toBe(true)
-      expect(result.violation).toBeUndefined()
-      expect(Object.keys(result).sort()).toEqual(['metrics', 'ok', 'seed', 'steps', 'trace', 'traceHash'].sort())
-      expect((result as Record<string, unknown>)['oraclesRun']).toBeUndefined()
+      //     — НЕТ oraclesRun ни в каком виде: резиновый ok:true.
 
-      // ПОСЛЕ ФИКСА (A2, W5a #20): SimResult несёт `oraclesRun` (или
-      // эквивалент); контракт STRICT `ok:true ⇒ oraclesRun>0`, дефолт
-      // `builtins:'all-working'` подключает INVARIANTS автоматически когда
-      // консьюмер не передал свои:
-      //   expect((result as any).oraclesRun).toBeGreaterThan(0)
+      // ПОСЛЕ ФИКСА (A2, W5a #20): SimResult несёт `oraclesRun`; контракт STRICT
+      // `ok:true ⇒ oraclesRun>0`; дефолт `builtins:'all-working'` подключает
+      // INVARIANTS автоматически когда консьюмер не передал свои.
+      expect((result as any).oraclesRun).toBeGreaterThan(0)
     })
   })
 
-  // ── A4 — liveness отключён от вердикта: livelock/run-away → ok:true ──────
-  describe('A4 — liveness oracle exists but is disconnected from SimResult.ok', () => {
-    it('an A<->B livelock (configuration cycle, never terminates) reports ok:true via runSimulation, though analyzeLiveness independently classifies the SAME trace as STUCK', async () => {
-      // ЧТО ФИКСИРУЕТ: `sim/liveness.ts`'s `analyzeLiveness` (Step-6 oracle,
-      // DoD 6 — «configuration cycle» K=states.length+1) СУЩЕСТВУЕТ и КОРРЕКТНО
-      // классифицирует A↔B бесконечное чередование как STUCK (см.
-      // liveness.test.ts:58-70 — тот же паттерн). Но `Simulator`/`runSimulation`
-      // (public.ts) НИКОГДА не вызывает `analyzeLiveness` — `SimResult` не
-      // содержит liveness/livelocks поля вовсе (см. SimResult interface,
-      // public.ts:132-141: только ok/seed/steps/traceHash/trace/violation/
-      // metrics). Оракул написан, но не подключён к вердикту прогона.
+  // ── A4 — liveness подключён к вердикту: livelock ⇒ ok:false ──────────────
+  describe('A4 — liveness oracle must be wired into SimResult.ok', () => {
+    it('an A<->B livelock (configuration cycle, never terminates) must report ok:false with a livelocks[] headline via runSimulation(mode:liveness)', async () => {
+      // ЧТО ФИКСИРУЕТ: `analyzeLiveness` (liveness.ts) КОРРЕКТНО классифицирует
+      // A↔B бесконечное чередование как STUCK 'configuration cycle', но
+      // `runSimulation`/`Simulator` НИКОГДА его не вызывает — `SimResult` не несёт
+      // liveness/livelocks поля вовсе. Оракул написан, но не подключён к вердикту.
       const result = await runSimulation<Box>(
         () => ({
           config: {
@@ -189,11 +166,11 @@ describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)'
           },
           owner: { state: 'a' } as any,
         }),
-        { seed: '1', steps: 20 },
+        { seed: '1', steps: 20, mode: 'liveness' },
       )
 
       // Feed the identical observed trace through analyzeLiveness directly —
-      // proving the oracle WOULD catch it if wired.
+      // proving the oracle WOULD catch it if wired (это witness, не вердикт).
       const samples: LivenessSample[] = result.trace.map((f: TraceFrame, i) => ({
         config: f.to,
         queueDepth: f.queue.internal + f.queue.external,
@@ -209,35 +186,87 @@ describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)'
       const liveness = analyzeLiveness(samples, { stateCount: 2, budgetVirtualMs: 10_000 })
 
       // HEAD-ФАКТ (прогон на remediation/w1-prep):
-      //   result.ok === true, result.violation === undefined
-      //   trace bounces a -> b -> b -> b -> a -> a -> a -> b -> ... (never done)
-      //   liveness.verdict === 'STUCK', liveness.reason === 'configuration cycle'
-      expect(result.ok).toBe(true)
-      expect(result.violation).toBeUndefined()
+      //   result.ok === true, result.violation === undefined  ← ЛОЖНЫЙ OK
+      //   liveness.verdict === 'STUCK', reason === 'configuration cycle'
+      //     (оракул ловит, но вердикт прогона его игнорирует)
+
+      // Оракул независимо подтверждает livelock (witness — держим как якорь):
       expect(liveness.verdict).toBe('STUCK')
       expect(liveness.reason).toBe('configuration cycle')
 
-      // ПОСЛЕ ФИКСА (A4, W5a #20 — ПОСЛЕ C2 «ложный STUCK на прогрессе»
-      // починен, MASTER §3 «C2 до A4»): runSimulation подключает
-      // analyzeLiveness, mode по умолчанию 'both' (MASTER §2.3):
-      //   expect(result.ok).toBe(false)
-      //   expect(result.livelocks?.length).toBeGreaterThan(0) // headline field
+      // ПОСЛЕ ФИКСА (A4, W5a #20 — analyzeLiveness подключён, mode 'liveness'/'both'):
+      expect(result.ok).toBe(false)
+      expect((result as any).livelocks?.length).toBeGreaterThan(0) // headline field
     })
+
+    // ── A4-regress: false-NEGATIVE guard (D1) — single-state resolve-true self-loop ──
+    // Критик (fable, статический разбор A4-фикса) нашёл, что первая версия фикса
+    // (схлопывание по (config,queueDepth) ЧЕРЕЗ границы шагов) стирала одно-
+    // состоянийный livelock `s1 --E--> s1` в один sample ⇒ ложный PROGRESSED
+    // (false-negative — ХУДШИЙ класс для sim-оракула). buildLivenessSamples теперь
+    // схлопывает ПО ШАГУ (boundary-фрейм каждого step), поэтому межшаговое
+    // повторение fingerprint выживает и правило (3) выносит STUCK.
+    for (const seed of ['1', '2', '42', '99']) {
+      it(`a single-state resolve-true self-loop (s1 --E--> s1) must report ok:false STUCK, never a false PROGRESSED (D1, seed=${seed})`, async () => {
+        const result = await runSimulation<Box>(
+          () => ({
+            config: {
+              name: 'D1SelfLoop',
+              stateAttribute: 'state',
+              initialState: 's1',
+              states: { s1: {} },
+              events: { E: { transitions: [{ from: 's1', to: 's1' }] } },
+            },
+            owner: { state: 's1' } as any,
+          }),
+          { seed, steps: 6, mode: 'liveness' },
+        )
+        expect(result.ok).toBe(false)
+        expect((result as any).liveness?.verdict).toBe('STUCK')
+        expect((result as any).livelocks?.length).toBeGreaterThan(0)
+      })
+    }
+
+    // ── A4-regress: false-POSITIVE guard — a legitimately terminating machine ──
+    // Исходный A4-дефект (verify RESIDUAL): liveness кричал ok:false STUCK
+    // 'configuration cycle' на КАЖДОЙ завершающейся машине при mode 'liveness'|'both'
+    // (дубли фреймов давали ложный config-cycle до финальных фреймов). После фикса
+    // per-step — терминирующая машина PROGRESSED (noop-шаги в финале не несут
+    // resolve-true, правила STUCK их не трогают).
+    for (const seed of ['1', '2', '42', '99']) {
+      it(`a terminating machine (s1->s2->s3 final) must report ok:true, never a false STUCK (seed=${seed})`, async () => {
+        const result = await runSimulation<Box>(
+          () => ({
+            config: {
+              name: 'TerminatingProbe',
+              stateAttribute: 'state',
+              initialState: 's1',
+              states: { s1: {}, s2: {}, s3: { final: true } },
+              events: {
+                go1: { transitions: [{ from: 's1', to: 's2' }] },
+                go2: { transitions: [{ from: 's2', to: 's3' }] },
+              },
+            },
+            owner: { state: 's1' } as any,
+          }),
+          { seed, steps: 10, mode: 'both' },
+        )
+        expect(result.ok).toBe(true)
+        expect((result as any).liveness?.verdict).toBe('PROGRESSED')
+        expect((result as any).livelocks).toBeUndefined()
+      })
+    }
   })
 
-  // ── A5 — escape реального таймера невидим для sim ────────────────────────
-  describe('A5 — a real (non-virtual) timer armed from onEnter is invisible: quiescent/ok stay true', () => {
-    it('an onEnter action that calls the REAL global setTimeout (bypassing env.scheduler) leaves quiescent:true / ok:true with no warning', async () => {
+  // ── A5 — escape реального таймера ДОЛЖЕН быть виден sim ───────────────────
+  describe('A5 — a real (non-virtual) timer armed from onEnter must be flagged as a timer-escape warning', () => {
+    it('an onEnter action that calls the REAL global setTimeout (bypassing env.scheduler) must surface a warnings[kind:timer-escape] entry', async () => {
       // ЧТО ФИКСИРУЕТ: sim's `env.scheduler` (virtual, ObservableScheduler) —
       // единственный DI-путь таймеров, который settleMacrostep/quiescence
-      // отслеживает (`env.earliestExecuteAt()`). НИЧТО в `src/sim/**` не
-      // патчит/шпионит глобальный `setTimeout` (grep 'setTimeout|setInterval'
-      // src/sim/*.ts подтверждает — сантехника settle.ts явно документирует
-      // "no real timer ever runs in the hashed path", но ничего не МЕШАЕТ
-      // консьюмерскому onEnter-действию вызвать его напрямую). Такой "escape"
-      // полностью невидим: settleMacrostep's quiescence-предикат не видит
-      // армированный реальный таймер вообще (он не в env.scheduler), поэтому
-      // отчёт врёт "всё тихо".
+      // отслеживает. НИЧТО в `src/sim/**` не патчит/шпионит глобальный
+      // `setTimeout`, поэтому консьюмерский onEnter, вызвавший его напрямую,
+      // полностью невидим: settleMacrostep объявляет quiescent:true пока висит
+      // реальный macrotask — отчёт врёт «всё тихо».
       const { vi } = await import('vitest')
       const spy = vi.spyOn(globalThis, 'setTimeout')
       const armedRealTimers: ReturnType<typeof setTimeout>[] = []
@@ -267,27 +296,88 @@ describe.skip('sim blockers — FROZEN pre-fix red-tests (W1 ordinal invariant)'
       )
 
       // HEAD-ФАКТ (прогон на remediation/w1-prep):
-      //   spy call count === 1 (the real global setTimeout WAS armed)
-      //   result.ok === true, last frame quiescent === true — no warning field
-      //   exists anywhere on SimResult for this.
-      expect(spy).toHaveBeenCalled()
-      expect(result.ok).toBe(true)
-      expect(result.trace[result.trace.length - 1]?.quiescent).toBe(true)
+      //   spy call count >= 1 (реальный global setTimeout БЫЛ армирован)
+      //   result.ok === true, последний фрейм quiescent === true — НЕТ никакого
+      //   warnings-поля на SimResult для этого escape: отчёт врёт «тихо».
+      expect(spy).toHaveBeenCalled() // the escape did happen
 
       for (const h of armedRealTimers) {
         clearTimeout(h)
       }
       spy.mockRestore()
 
-      // ПОСЛЕ ФИКСА (A5, W5a #20): spy/hook on the global timer surface
-      // records an escape as a `warnings` entry (kind:'timer-escape'); STRICT
-      // failOn config can fail `ok` on it (MASTER §2.3):
-      //   expect(result.warnings?.some((w) => w.kind === 'timer-escape')).toBe(true)
+      // ПОСЛЕ ФИКСА (A5, W5a #20): hook на глобальный таймер фиксирует escape как
+      // `warnings` entry (kind:'timer-escape'); STRICT failOn может провалить ok.
+      expect((result as any).warnings?.some((w: any) => w.kind === 'timer-escape')).toBe(true)
     })
   })
 
-  // ── C1 — I-3 false-positive на легитимном WAITING_ON_TIMER ──────────────
-  describe('C1 — I-3 false-positive: a sibling parallel region\'s own pending future timer is misread as an RTC break', () => {
+  // ── C2 — analyzeLiveness НЕ должен ложно STUCK на self-переходе с прогрессом
+  describe('C2 — analyzeLiveness must not report a false STUCK when observables progress on an unchanged config', () => {
+    it('a resolve-true self-loop that keeps GROWING the queue (progress via queue depth, config unchanged) must NOT be classified STUCK', () => {
+      // ЧТО ФИКСИРУЕТ: liveness.ts self-loop rule (:224-236) ветвится на
+      // `fireOutcome==='resolve-true' && !configChanged && !terminal` и ИГНОРИРУЕТ
+      // рост наблюдаемых (queue/timer/data). Легитимный self-переход, который НЕ
+      // меняет config, но делает реальную работу (растёт очередь / армируется
+      // таймер / меняются данные), ошибочно классифицируется как STUCK.
+      //
+      // Сэмплы: config неизменен ('x'), но queueDepth монотонно РАСТЁТ — это
+      // наблюдаемый прогресс, НЕ no-progress self-loop.
+      const samples: LivenessSample[] = [
+        {
+          config: 'x',
+          queueDepth: 0,
+          pendingTimers: 0,
+          earliestTimerAt: null,
+          fireOutcome: 'resolve-true',
+          configChanged: true,
+          healthy: true,
+          inFlight: false,
+          terminal: false,
+          t: 0,
+        },
+        {
+          config: 'x',
+          queueDepth: 1, // ← ПРОГРЕСС: очередь выросла (config тот же)
+          pendingTimers: 0,
+          earliestTimerAt: null,
+          fireOutcome: 'resolve-true',
+          configChanged: false,
+          healthy: true,
+          inFlight: false,
+          terminal: false,
+          t: 1,
+        },
+        {
+          config: 'x',
+          queueDepth: 2, // ← ПРОГРЕСС: очередь снова выросла
+          pendingTimers: 0,
+          earliestTimerAt: null,
+          fireOutcome: 'resolve-true',
+          configChanged: false,
+          healthy: true,
+          inFlight: false,
+          terminal: false,
+          t: 2,
+        },
+      ]
+
+      const liveness = analyzeLiveness(samples, { stateCount: 2, budgetVirtualMs: 10_000 })
+
+      // HEAD-ФАКТ (прогон на remediation/w1-prep):
+      //   liveness.verdict === 'STUCK'
+      //   liveness.reason === 'resolve-true with no configuration change (self-loop)'
+      //     — ложный STUCK: rule (:226) увидел !configChanged и вынес STUCK, хотя
+      //     queueDepth рос (наблюдаемый прогресс), т.е. это НЕ livelock.
+
+      // ПОСЛЕ ФИКСА (C2): rule учитывает прогресс observables (queue/timer/data);
+      // рост queueDepth на неизменном config ⇒ НЕ STUCK.
+      expect(liveness.verdict).not.toBe('STUCK')
+    })
+  })
+
+  // ── C1 — ЕЩЁ ЗАМОРОЖЕН (W5b): I-3 false-positive на легит WAITING_ON_TIMER ─
+  describe.skip('C1 — I-3 false-positive: a sibling parallel region\'s own pending future timer is misread as an RTC break (FROZEN→W5b)', () => {
     it('a resolve-true settle boundary in region r1 is flagged I-3 even though the non-quiescence is r2\'s OWN unrelated future invoke timer (WAITING_ON_TIMER, not an RTC violation)', async () => {
       // ЧТО ФИКСИРУЕТ: composite `root` с параллельными регионами r1/r2. r1
       // имеет только событие 'go' (r1a->r1b), r2's initial state r2a arms an

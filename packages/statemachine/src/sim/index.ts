@@ -62,6 +62,8 @@ export type {
   SimSetup,
   SimSnapshot,
   SimTarget,
+  SimViolation,
+  SimWarning,
   StepOutcome,
 } from './public'
 

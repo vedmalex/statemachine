@@ -221,17 +221,41 @@ export function analyzeLiveness(
     healthyFps.push({ fp, idx: i })
   }
 
-  // (3) self-loop STUCK: resolve-true + config unchanged on a HEALTHY sample.
-  for (const s of samples) {
-    if (s.healthy && s.fireOutcome === 'resolve-true' && !s.configChanged && !s.terminal) {
-      // A resolve-true that did not change the config and did not terminate is a
-      // no-progress self-loop ⇒ STUCK (only on a healthy sample — fairness gate).
-      return {
-        verdict: 'STUCK',
-        quiescence: classifyQuiescence(s),
-        witness: normalizeParts(s.config),
-        reason: 'resolve-true with no configuration change (self-loop)',
-      }
+  // (3) self-loop STUCK: resolve-true + config unchanged on a HEALTHY sample —
+  // BUT only when NO observable progress accompanies the unchanged config (C2).
+  // A resolve-true self-transition that leaves the composite unchanged yet keeps
+  // GROWING (or shrinking) an observable — the queue depth, the pending-timer
+  // count, or the earliest armed deadline — is doing real work, not livelocking.
+  // Ignoring that progress (the pre-C2 `!configChanged`-only branch) falsely
+  // classified a legitimate progressing self-loop as STUCK. We therefore compare
+  // each unchanged-config self-loop sample against its immediate predecessor and
+  // only declare STUCK when the observables ALSO held identical (true no-progress).
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i]
+    if (s === undefined) {
+      continue
+    }
+    if (!(s.healthy && s.fireOutcome === 'resolve-true' && !s.configChanged && !s.terminal)) {
+      continue
+    }
+    const prev = samples[i - 1]
+    const observableProgress =
+      prev !== undefined &&
+      (s.queueDepth !== prev.queueDepth ||
+        s.pendingTimers !== prev.pendingTimers ||
+        s.earliestTimerAt !== prev.earliestTimerAt)
+    if (observableProgress) {
+      // The config held but an observable moved: real progress, not a self-loop.
+      continue
+    }
+    // A resolve-true that changed NEITHER the config NOR any observable and did
+    // not terminate is a genuine no-progress self-loop ⇒ STUCK (healthy only —
+    // fairness gate).
+    return {
+      verdict: 'STUCK',
+      quiescence: classifyQuiescence(s),
+      witness: normalizeParts(s.config),
+      reason: 'resolve-true with no configuration change (self-loop)',
     }
   }
 
