@@ -313,7 +313,7 @@ function buildDriver(topology: TopologySpec, seed: bigint, faults: FaultPlan = {
 /** Map a closed-union {@link Op} onto the Step-3 {@link DriverOp} the driver runs.
  * The op's STABLE `id` is carried as `opId` so the driver can resolve per-op
  * channel faults keyed by that id (R22). */
-function toDriverOp(op: Op): DriverOp | null {
+function toDriverOp(op: Op): DriverOp {
   switch (op.kind) {
     case 'fire':
       return { kind: 'fire', event: op.event, args: op.args, opId: op.id }
@@ -321,10 +321,22 @@ function toDriverOp(op: Op): DriverOp | null {
       return { kind: 'advance', dtMs: op.dtMs, opId: op.id }
     case 'noop':
       return { kind: 'noop', opId: op.id }
-    // snapshot/restore are part of the frozen Op union but are not driven until
-    // the Simulator lands snapshot/restore (Step 10); skip them here.
-    default:
-      return null
+    // D5 fix: `snapshot`/`restore` are part of the frozen Op union but the driver
+    // has NO DriverOp for them yet (Step 10 not landed). Previously they were
+    // SILENTLY SKIPPED — a hand-authored scenario with a `restore` op ran clean,
+    // producing NO frame and NO error, so the author was misled into thinking the
+    // restore was exercised. Fail LOUDLY instead: an undrivable op is a scenario
+    // authoring error, not a no-op. (The coverage-path persistence round-trip uses
+    // the SEPARATE `CoverageScenario.snapshotRestore` engine saveState/restoreState
+    // flag — coverage.ts:286 — NOT this Op union, so it is unaffected.)
+    default: {
+      const undrivable = op as { kind: string; id?: string }
+      throw new Error(
+        `runScenario: op kind '${undrivable.kind}'${undrivable.id !== undefined ? ` (id '${undrivable.id}')` : ''} is not drivable — ` +
+          `snapshot/restore ops are declared in the frozen Op union but the Simulator does not yet drive them (Step 10). ` +
+          `Remove the op or drive persistence via the Simulator snapshot()/restore() API.`,
+      )
+    }
   }
 }
 
@@ -351,10 +363,7 @@ export async function runScenario(spec: ScenarioSpec): Promise<CanonicalTrace> {
   const driver = buildDriver(spec.topology, seed, spec.faults)
   await driver.init()
   for (const op of spec.ops) {
-    const dop = toDriverOp(op)
-    if (dop !== null) {
-      await driver.step(dop)
-    }
+    await driver.step(toDriverOp(op))
   }
   return driver.trace()
 }

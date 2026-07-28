@@ -73,6 +73,16 @@ lowest-step witness у I-10. Критик подтвердил. Оставлен
 - **DEFAULT-set staleness** — комментарий актуализирован; I-9 добавлен (sound+вакуумен); I-3/I-5 честно вне с причиной.
 - Все хэш-тесты — self-сравнения (нет литералов) → bump безопасен; knip-чисто (3 unused типа — pre-existing model.ts/types.ts).
 
+## #22 — repro-хэш / генератор-скелет / undrivable-op (B1/D1/D5) — CLOSED
+
+| id | сев | что было | фикс |
+|---|---|---|---|
+| **B1** | M | persistent traceHash = `hashOfTrace(configHash, frameCount)` = `${configHash}:${frameCount}` — 2 РАЗНЫХ прогона с тем же конфигом и числом фреймов → ОДИН hash; течёт в MinimalRepro через `run.traceHash` | `defaultShrinkRunner` использует полный `hashTrace(trace)` (content-only, Date-independent, O(frames) ничтожно рядом с runScenario+runSafety); слабый `hashOfTrace` удалён. Тест: persisted hash === полный hashTrace, не содержит ':' |
+| **D5** | L | scenario Op-union `snapshot`/`restore` → `toDriverOp` возвращал `null` → молча пропускался (нет фрейма/ошибки; автор введён в заблуждение) | `toDriverOp` БРОСАЕТ явную ошибку на недрайвимый op. Безопасно: Op-union snapshot/restore нигде не драйвятся (shrinker-тесты — только `shrinkCacheKey`; coverage-персистентность — через ОТДЕЛЬНЫЙ флаг `snapshotRestore`→saveState/restoreState, не Op-union). Тест: runScenario rejects на restore/snapshot op |
+| **D1** | M | генератор фиксированной формы (composite→region→leaf, depth 2); N сидов варьируют только детали | Honest scope в JSDoc `genConfig`: это ENGINE-PATH фаззер (селекция/RTC/join/history/invoke/faults на богатой фикс-топологии), НЕ topology-SHAPE фаззер; depth-3+/иная вложенность — вне досягаемости, покрывается hand-authored W1-корпусом. Фикс-форма = корректность-by-construction + replay-детерминизм; варьирование их бы forfeit-нуло. (D2 закрыт в W5a) |
+
++2 регресс-теста в replay.test.ts (B1 полный hash, D5 throw). 939 passed / 9 skipped.
+
 ## Итог W5b
 
 **937 passed / 9 skipped; оба tsc (build+typecheck) чисты; knip чист (re-changes)**. W0-W5a регресс цел.

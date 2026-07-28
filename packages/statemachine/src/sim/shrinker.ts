@@ -63,7 +63,7 @@ import type { CheckerContext, Violation } from './invariants'
 import { runSafety } from './invariants.runner'
 import type { FaultPlan, FaultSpec } from './faults'
 import type { Op, ScenarioSpec, TopologySpec } from './scenario'
-import { normalizeParts } from './trace'
+import { hashTrace, normalizeParts } from './trace'
 
 /** The fingerprint tuple the predicate matches on (R15) — the oracle's, verbatim. */
 export type ViolationFingerprint = Violation['fingerprint']
@@ -140,27 +140,22 @@ export async function defaultShrinkRunner(candidate: ScenarioSpec): Promise<Shri
     header: trace.header,
   }
   const violation = runSafety(INVARIANTS, trace, ctx)
-  // traceHash is recomputed lazily by callers that need it; here we fold a cheap
-  // structural hash over the frames (NEVER via Date.now — see module doc).
+  // B1 fix: the replay summary MUST carry the FULL canonical `hashTrace` (a
+  // content-only, Date-independent digest over EVERY frame field). The prior cheap
+  // `configHash:frameCount` digest collided — two DIFFERENT runs of the same config
+  // with the same frame count shared one hash — so a persisted MinimalRepro could
+  // not tell distinct failures apart on replay. hashTrace is O(frames), negligible
+  // beside the runScenario + runSafety this runner already performs per candidate.
   const frames = trace.frames
   const last = frames.length > 0 ? frames[frames.length - 1] : undefined
   const finalState = last !== undefined ? normalizeParts(last.to) : ''
   const finalQueueDepth = last !== undefined ? last.queue.internal + last.queue.external : 0
   return {
     violation,
-    traceHash: hashOfTrace(trace.header.configHash, frames.length),
+    traceHash: hashTrace(trace),
     finalState,
     finalQueueDepth,
   }
-}
-
-/**
- * A cheap structural digest of a trace usable as a replay summary. NOT a
- * substitute for ADR-1 `hashTrace` (callers wanting the full canonical hash use
- * the public surface); it is Date-independent by construction.
- */
-function hashOfTrace(configHashValue: string, frameCount: number): string {
-  return `${configHashValue}:${frameCount}`
 }
 
 // ── predicate (R15): strict full-tuple fingerprint equality ──────────────────
