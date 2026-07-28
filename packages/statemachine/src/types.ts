@@ -377,6 +377,16 @@ export interface ExitContext {
    * `true` — the node was swept from OUTSIDE before its region completed
    * (parallel-exit / abort); `false` — the region reached its final
    * configuration (natural completion).
+   *
+   * CONVENTION (W3b.1 LOW): `preempted` is judged on COMPLETION, not on WHO
+   * fired the transition. A flat, non-`final` leaf that fires its OWN outgoing
+   * transition (it is the transition's `source`) is a self-initiated exit yet
+   * still reports `preempted: true`, because the leaf had not reached a final
+   * configuration — "preempted" here means "left before completing", and a
+   * self-initiated exit of a non-final leaf is exactly that. A caller that must
+   * distinguish a self-initiated flat exit from an outside sweep should compare
+   * the exiting leaf against the fired transition's source itself, rather than
+   * read that distinction into `preempted`.
    */
   preempted: boolean
   /** Whether the node being exited was itself `final` at the moment of exit. */

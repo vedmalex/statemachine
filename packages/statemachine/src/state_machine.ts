@@ -22,6 +22,7 @@ import {
   type ExitContext,
   type FireResult,
   type InvokeOperation,
+  type InvokeTimer,
   type StateInvocation,
   type FunctionRegistry,
   type IErrorHandler,
@@ -205,6 +206,13 @@ export class StateMachine<
   // teardownStateTimers). Keyed by the leaf state name, one controller per
   // running operation of that leaf.
   private activeInvokes: Map<string, AbortController[]> = new Map()
+  // W3b.1 livelock bound: consecutive invoke-operation restarts after an
+  // aborted-without-commit microstep, per source leaf. Reset on a committed
+  // exit of the leaf. A deterministically-throwing onExit would otherwise loop
+  // relaunch→onDone→exit-throw→re-abort→relaunch forever; past the cap the
+  // operation is left cancelled and the fact is recorded (observable), not spun.
+  private invokeRestartCount: Map<string, number> = new Map()
+  private readonly MAX_INVOKE_RESTARTS = 3
   private stateEntryTimes: Map<string, number> = new Map()
   // OTS (SPEC §6.1): per-microstep guard-result memo so a candidate governing
   // several active leaves has its guard evaluated at most once. Set/cleared by
@@ -392,6 +400,12 @@ export class StateMachine<
         {},
       )
     }
+
+    // W3b.1 LOW (§0.6) — advisory cross-check: an invoke that raises an event
+    // absent from the events map (a typo'd `onDone`/`onError`, or a timer
+    // `event`) can never be handled → a silent no-handler stall. Warn once at
+    // construction; non-fatal (parity with the other advisory model diagnostics).
+    this.warnUnknownInvokeEvents()
 
     if (adaptee) {
       this.persistenceAdapter = adaptee as unknown as StatePersistenceAdapter
@@ -1756,20 +1770,8 @@ export class StateMachine<
       }
 
       if (stateData.invoke && Array.isArray(stateData.invoke)) {
-        deserializedState.invoke = await Promise.all(
-          stateData.invoke.map(async (inv: any) => ({
-            ...inv,
-            cond: await StateMachine.deserializeActionAsync(
-              inv.cond,
-              registry,
-              strict,
-            ),
-            action: await StateMachine.deserializeActionAsync(
-              inv.action,
-              registry,
-              strict,
-            ),
-          })),
+        deserializedState.invoke = stateData.invoke.map((inv: any) =>
+          StateMachine.deserializeInvokeEntry(inv, registry, strict),
         )
       }
 
@@ -1864,11 +1866,9 @@ export class StateMachine<
         }
 
         if (stateData.invoke && Array.isArray(stateData.invoke)) {
-          deserializedState.invoke = stateData.invoke.map((inv: any) => ({
-            ...inv,
-            cond: StateMachine.deserializeAction(inv.cond, registry, strict),
-            action: StateMachine.deserializeAction(inv.action, registry, strict),
-          }))
+          deserializedState.invoke = stateData.invoke.map((inv: any) =>
+            StateMachine.deserializeInvokeEntry(inv, registry, strict),
+          )
         }
 
         // W0.2 regions recursion: nested region states run through the SAME
@@ -2072,6 +2072,69 @@ export class StateMachine<
     strict = false,
   ): Promise<any> {
     return StateMachine.deserializeAction(action, registry, strict)
+  }
+
+  /**
+   * П.7 (W3b.1) — restore ONE serialized `invoke` entry.
+   *
+   * A `{ type:'operation' }` MARKER (emitted by {@link serializeInvokeEntry}
+   * for the long-running form) carries NO `src` body (W0 invariant П1). Re-link
+   * the `src` from the consumer registry (`options.actions`) by its
+   * slot/id/name when supplied; otherwise the entry stays src-less and both the
+   * entry ({@link armStateInvoke}) and resume ({@link resumeTimers}) paths skip
+   * it via {@link isResumableTimerInvocation} — never a NaN phantom timer. The
+   * TIMER form is restored exactly as before (cond/action registry resolution).
+   */
+  private static deserializeInvokeEntry(
+    inv: any,
+    registry?: FunctionRegistry,
+    strict = false,
+  ): any {
+    const cond = StateMachine.deserializeAction(inv.cond, registry, strict)
+
+    if (inv && inv.type === 'operation') {
+      const { type: _type, slot, name, ...rest } = inv
+      const src = StateMachine.resolveInvokeSrc(slot, inv.id, name, registry)
+      const restored: any = { ...rest, cond }
+      if (src) restored.src = src
+      return restored
+    }
+
+    return {
+      ...inv,
+      cond,
+      action: StateMachine.deserializeAction(inv.action, registry, strict),
+    }
+  }
+
+  /**
+   * П.7 (W3b.1) — resolve an operation-marker `src` from the consumer registry
+   * by (in order) its per-slot key, its `states.`-prefixed form, its `id`, then
+   * its bare `name`. OWN-key lookup only (`Object.hasOwn`) — parity with
+   * {@link deserializeAction}'s resolver (a bracket index would leak an
+   * Object.prototype builtin). Returns `undefined` when nothing resolves; the
+   * body is NEVER compiled.
+   */
+  private static resolveInvokeSrc(
+    slot: string | undefined,
+    id: string | undefined,
+    name: string | undefined,
+    registry?: FunctionRegistry,
+  ): ((...a: any[]) => any) | undefined {
+    if (!registry) return undefined
+    const keys = [
+      slot,
+      slot ? `states.${slot}` : undefined,
+      id,
+      name && name.length > 0 ? name : undefined,
+    ]
+    for (const key of keys) {
+      if (key && Object.hasOwn(registry, key)) {
+        const candidate = registry[key]
+        if (typeof candidate === 'function') return candidate
+      }
+    }
+    return undefined
   }
 
   /**
@@ -3657,14 +3720,23 @@ export class StateMachine<
 
       if (result.kind === 'abort-exit') {
         // EO-5: an aborted (onExit-failed) microstep returns to the source with
-        // its timers INTACT — never a silent torn-down zombie. Because teardown
+        // its TIMERS intact — never a silent torn-down zombie. Because teardown
         // is post-commit only, the source's invoke/watchdog timers were never
-        // touched, so no re-arm is required (re-arming here would DUPLICATE a
-        // still-live source timer, and re-create a one-shot invoke timer that
-        // already fired — the reentrancy double-fire trap).
+        // touched, so no timer re-arm is required (re-arming a one-shot timer
+        // that already fired is the reentrancy double-fire trap).
         this.logger.warn('Transition aborted due to onExit error', {
           state: currentState,
         })
+        // П.1д (W3b.1) — ASYMMETRY WITH TIMERS: {@link executeExitActions}
+        // `abort()`-ed the exited leaves' invoke OPERATIONS BEFORE onExit ran,
+        // but the microstep did NOT commit, so those leaves are still active and
+        // their operations are now dead forever (their onDone is suppressed by
+        // `signal.aborted`) → a silent STALL. Unlike a one-shot timer, an
+        // operation is RESTARTABLE (fresh signal, no double-fire trap), so
+        // relaunch the operations of every still-active exited source leaf.
+        for (const s of exitStates) {
+          this.rearmInvokeOperationsAfterAbort(obj, s)
+        }
         return undefined
       }
 
@@ -3673,7 +3745,16 @@ export class StateMachine<
         // and teardown is post-commit, so the source timers stand as-is (the
         // invoke that fired the event was already consumed by the scheduler and
         // must NOT be re-armed — that would re-trigger the failing event in a
-        // loop). Just rethrow for the caller to record exactly once.
+        // loop). But the exited leaves' invoke OPERATIONS were abort()-ed in
+        // executeExitActions before the throw, and — like the abort-exit branch
+        // (W3b.1) — those leaves remain active without a commit, so their
+        // operations are dead forever (silent stall) unless relaunched. This
+        // covers throw from onEnter-without-errorState / onExit-without-
+        // abortOnExitError / onTransition / onAfter. Bounded to avoid the
+        // deterministic-throw livelock (see rearmInvokeOperationsAfterAbort).
+        for (const s of exitStates) {
+          this.rearmInvokeOperationsAfterAbort(obj, s)
+        }
         throw result.error
       }
 
@@ -3733,6 +3814,10 @@ export class StateMachine<
       this.stateAttribute,
       config as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
     )
+    // A committed configuration clears the invoke-restart counters for the
+    // leaves that left it — the abort-restart loop is broken, so a later
+    // aborted microstep on a fresh entry starts counting from zero (W3b.1).
+    this.invokeRestartCount.clear()
   }
 
   /**
@@ -3939,38 +4024,26 @@ export class StateMachine<
       // onExit (executeExitActions). onDone/onError are raised as INTERNAL
       // events; the event of an already-aborted operation is dropped.
       if (this.isInvokeOperation(invocation)) {
-        const op = invocation
-        const controller = new AbortController()
+        const { controller, timerId } = this.launchInvokeOperation(
+          obj,
+          toStateName,
+          invocation,
+        )
         controllers.push(controller)
-        const startOp = () => {
-          // Still in the leaf, and not already aborted by an exit that raced the
-          // scheduled start.
-          const currentState = this.getCurrentState(obj as any)
-          if (!currentState?.split('|').includes(toStateName)) return
-          if (controller.signal.aborted) return
-          let result: Promise<unknown>
-          try {
-            result = op.src(obj.adaptee, controller.signal)
-          } catch (err) {
-            this.handleInvokeRejection(obj, op, controller, err, toStateName)
-            return
-          }
-          Promise.resolve(result).then(
-            (value) => {
-              // Cancelled (leaf left before settle) → drop the completion event.
-              if (controller.signal.aborted) return
-              if (op.onDone) {
-                this.raiseEvent(op.onDone as string, obj as any, value)
-                this.scheduleProcessing()
-              }
-            },
-            (err) => {
-              this.handleInvokeRejection(obj, op, controller, err, toStateName)
-            },
-          )
-        }
-        const timerId = this.setTimer(startOp, 0)
         timers.push(timerId)
+        continue
+      }
+
+      // П.7 (W3b.1) — a restored OPERATION marker (`type:'operation'`) whose
+      // `src` could NOT be re-linked from the registry is NOT a timer: it has no
+      // numeric `delay` and no `event`. Falling through would `setTimer(cb,
+      // undefined→NaN)` and later `raiseEvent(undefined)` — a phantom event on
+      // every entry. Skip it explicitly (parity with the resumeTimers guard).
+      if (!this.isResumableTimerInvocation(invocation)) {
+        this.logger.warn(
+          'invoke operation not serializable; skipping non-resumable invoke on entry',
+          { state: toStateName },
+        )
         continue
       }
 
@@ -4005,6 +4078,153 @@ export class StateMachine<
   }
 
   /**
+   * W3b (SPEC §6а) — start ONE long-running invoke operation via the scheduler
+   * (setTimer delay 0) so its launch is deterministic under an injected
+   * scheduler, returning the fresh {@link AbortController} and the launch timer
+   * id. Extracted from {@link armStateInvoke} so the П.1д abort-exit re-arm
+   * ({@link rearmInvokeOperationsAfterAbort}) can relaunch a source leaf's
+   * operation with a FRESH signal without duplicating the launch body.
+   */
+  private launchInvokeOperation(
+    obj: Adapter<TOwner>,
+    toStateName: string,
+    op: InvokeOperation<TOwner>,
+  ): { controller: AbortController; timerId: any } {
+    const controller = new AbortController()
+    const startOp = () => {
+      // Still in the leaf, and not already aborted by an exit that raced the
+      // scheduled start.
+      const currentState = this.getCurrentState(obj as any)
+      if (!currentState?.split('|').includes(toStateName)) return
+      if (controller.signal.aborted) return
+      let result: Promise<unknown>
+      try {
+        result = op.src(obj.adaptee, controller.signal)
+      } catch (err) {
+        this.handleInvokeRejection(obj, op, controller, err, toStateName)
+        return
+      }
+      Promise.resolve(result).then(
+        (value) => {
+          // Cancelled (leaf left before settle) → drop the completion event.
+          if (controller.signal.aborted) return
+          if (op.onDone) {
+            this.raiseEvent(op.onDone as string, obj as any, value)
+            this.scheduleProcessing()
+          }
+        },
+        (err) => {
+          this.handleInvokeRejection(obj, op, controller, err, toStateName)
+        },
+      )
+    }
+    const timerId = this.setTimer(startOp, 0)
+    return { controller, timerId }
+  }
+
+  /**
+   * П.1д (W3b.1) — after an ABORTED (non-committed) microstep the machine is
+   * back in the SOURCE configuration, but {@link executeExitActions} already
+   * `abort()`-ed the source leaves' invoke OPERATIONS before `onExit` ran. The
+   * leaf is still active, so its operation must LIVE AGAIN: relaunch it with a
+   * FRESH AbortSignal (an operation is restartable — `src` re-runs cleanly and,
+   * unlike a one-shot EO-5 timer, there is no re-arm double-fire trap). ONLY the
+   * operation arms are restarted; timer-form invokes are LEFT UNTOUCHED (EO-5 —
+   * their handles were never torn down and re-arming would duplicate a live /
+   * already-fired one-shot timer). No-op when the leaf has no operations, has
+   * left the configuration, or its `cond` now declines.
+   */
+  private rearmInvokeOperationsAfterAbort(
+    obj: Adapter<TOwner>,
+    stateName: string,
+  ): void {
+    const toState = this.states.get(stateName)
+    if (!toState || !toState.invoke || toState.invoke.length === 0) return
+    if (!toState.invoke.some((inv) => this.isInvokeOperation(inv))) return
+    // Only relaunch for a leaf that REMAINS in the (uncommitted) configuration.
+    const currentState = this.getCurrentState(obj as any)
+    if (!currentState?.split('|').includes(stateName)) return
+
+    // Livelock bound (W3b.1): cap consecutive restarts of a leaf whose exit keeps
+    // failing. Past the cap, leave the operation cancelled and record it so the
+    // failure is observable (W5) instead of an unbounded relaunch loop.
+    const restarts = (this.invokeRestartCount.get(stateName) ?? 0) + 1
+    this.invokeRestartCount.set(stateName, restarts)
+    if (restarts > this.MAX_INVOKE_RESTARTS) {
+      this.reportRuntimeError(
+        new StateMachineError(
+          `invoke operation of "${stateName}" left cancelled: exit kept aborting ` +
+            `(${this.MAX_INVOKE_RESTARTS} restarts exceeded — possible always-throwing onExit)`,
+          { state: stateName },
+        ),
+        { state: stateName },
+        obj as unknown as Adapter<PropertiesOf<TOwner>>,
+      )
+      return
+    }
+
+    // The already-aborted controllers are useless — discard the refs; the launch
+    // timers stay tracked in activeTimers (the fired one-shot startOp is inert).
+    this.activeInvokes.delete(stateName)
+
+    const controllers: AbortController[] = []
+    const timers = this.activeTimers.get(stateName) ?? []
+    for (const invocation of toState.invoke) {
+      if (!this.isInvokeOperation(invocation)) continue
+      if (invocation.cond) {
+        try {
+          if (!invocation.cond(obj.adaptee)) continue
+        } catch (e) {
+          this.logger.error(
+            'Error in invoke condition',
+            { state: stateName },
+            e as Error,
+          )
+          continue
+        }
+      }
+      const { controller, timerId } = this.launchInvokeOperation(
+        obj,
+        stateName,
+        invocation,
+      )
+      controllers.push(controller)
+      timers.push(timerId)
+    }
+    if (controllers.length > 0) {
+      this.activeInvokes.set(stateName, controllers)
+      this.activeTimers.set(stateName, timers)
+    }
+  }
+
+  /**
+   * W3b.1 LOW (§0.6) — advisory INVOKE_UNKNOWN_EVENT scan. Every event an
+   * invoke can raise (the operation form's `onDone`/`onError`, the timer form's
+   * `event`) is cross-checked against the declared events map; a reference to
+   * an undeclared event is warned once at construction (never handled → a
+   * silent no-handler stall otherwise). Advisory only — never throws.
+   */
+  private warnUnknownInvokeEvents(): void {
+    for (const [stateName, state] of this.states) {
+      if (!state.invoke || state.invoke.length === 0) continue
+      for (const invocation of state.invoke) {
+        const referenced = this.isInvokeOperation(invocation)
+          ? [invocation.onDone, invocation.onError]
+          : [(invocation as InvokeTimer<TOwner>).event]
+        for (const eventName of referenced) {
+          if (eventName === undefined) continue
+          if (!this.events.has(eventName as keyof SMConfig['events'])) {
+            this.logger.warn(
+              'INVOKE_UNKNOWN_EVENT: invoke references an event not in the events map',
+              { state: String(stateName), event: String(eventName) },
+            )
+          }
+        }
+      }
+    }
+  }
+
+  /**
    * W3b (SPEC §6а) — discriminate the {@link StateInvocation} union: the
    * long-running operation arm carries a `src` FUNCTION; the timer arm does not.
    */
@@ -4012,6 +4232,26 @@ export class StateMachine<
     invocation: StateInvocation<TOwner>,
   ): invocation is InvokeOperation<TOwner> {
     return typeof (invocation as InvokeOperation<TOwner>).src === 'function'
+  }
+
+  /**
+   * П.7 (W3b.1) — a genuine TIMER-form invocation must carry a finite numeric
+   * `delay` and an `event` to raise. A restored OPERATION marker whose `src`
+   * was not re-linked from the registry has NEITHER — treating it as a timer
+   * yields `Math.max(0, undefined - elapsed) = NaN` → an immediate
+   * `setTimer` → `raiseEvent(undefined)` phantom event. This guard rejects such
+   * non-resumable entries on both the entry ({@link armStateInvoke}) and resume
+   * ({@link resumeTimers}) paths.
+   */
+  private isResumableTimerInvocation(
+    invocation: StateInvocation<TOwner>,
+  ): boolean {
+    const timer = invocation as InvokeTimer<TOwner>
+    return (
+      typeof timer.delay === 'number' &&
+      Number.isFinite(timer.delay) &&
+      timer.event !== undefined
+    )
   }
 
   /**
@@ -4308,6 +4548,19 @@ export class StateMachine<
         // serialized snapshot (its promise/AbortSignal do not survive) — skip it
         // here; a fresh entry re-launches it via armStateInvoke.
         if (this.isInvokeOperation(invocation)) continue
+        // П.7 (W3b.1) — a restored OPERATION marker (`type:'operation'`, src
+        // dropped on serialize) is NOT a timer: it has no numeric `delay` and no
+        // `event`. Without this guard it would fall through to `Math.max(0,
+        // undefined - elapsed) = NaN` → an immediate `setTimer` → a phantom
+        // `raiseEvent(undefined)`. Skip it (honestly, with a warn) — there is no
+        // live src to resume, and any registry re-link happens on fresh entry.
+        if (!this.isResumableTimerInvocation(invocation)) {
+          this.logger.warn(
+            'invoke operation not serializable; skipping non-resumable invoke on resume',
+            { state: stateName },
+          )
+          continue
+        }
         const remaining = Math.max(0, invocation.delay - elapsed)
 
         // If time already passed, fire immediately (in next tick)
@@ -4466,19 +4719,8 @@ export class StateMachine<
     }
 
     if (node.invoke) {
-      serializedState.invoke = await Promise.all(
-        node.invoke.map(async (inv: any) => ({
-          ...inv,
-          cond: inv.cond != null
-            ? await serializeActionRefAsync(inv.cond, `${slotBase}.invoke.cond`)
-            : undefined,
-          action: inv.action != null
-            ? await serializeActionRefAsync(
-              inv.action,
-              `${slotBase}.invoke.action`,
-            )
-            : undefined,
-        })),
+      serializedState.invoke = node.invoke.map((inv: any) =>
+        this.serializeInvokeEntry(inv, slotBase),
       )
     }
 
@@ -4529,6 +4771,52 @@ export class StateMachine<
   }
 
   /**
+   * П.7 (W3b.1) — serialize ONE `invoke` entry body-free.
+   *
+   * The long-running OPERATION form ({@link InvokeOperation}) carries a `src`
+   * FUNCTION. Spreading `...inv` sent it straight into `JSON.stringify`, which
+   * SILENTLY DROPS a function — leaving a bare `{onDone}` that the restore path
+   * mistakes for a timer (undefined delay → NaN timer → `raiseEvent(undefined)`
+   * phantom events). Instead the operation is serialized as an EXPLICIT
+   * body-free MARKER (`type:'operation'`, keeping `id`/`onDone`/`onError`/`cond`
+   * and a `slot`/`name` handle for registry re-link) — symmetric to the W0.2
+   * action-slot reference. The `src` body is NEVER serialized (W0 invariant П1);
+   * {@link deserializeInvokeEntry} re-links it from `options.actions` by
+   * slot/id/name when available, else the entry is honestly skipped on resume.
+   *
+   * The TIMER form is preserved verbatim (minus the resolved `cond`/`action`
+   * body-free refs), byte-identical to the previous spread.
+   */
+  private serializeInvokeEntry(inv: any, slotBase: string): any {
+    const cond =
+      inv.cond != null
+        ? serializeActionRef(inv.cond, `${slotBase}.invoke.cond`)
+        : undefined
+
+    if (typeof inv.src === 'function') {
+      const marker: any = {
+        type: 'operation',
+        slot: `${slotBase}.invoke.src`,
+        onDone: inv.onDone,
+        onError: inv.onError,
+        cond,
+      }
+      if (inv.id !== undefined) marker.id = inv.id
+      if (inv.src.name) marker.name = inv.src.name
+      return marker
+    }
+
+    return {
+      ...inv,
+      cond,
+      action:
+        inv.action != null
+          ? serializeActionRef(inv.action, `${slotBase}.invoke.action`)
+          : undefined,
+    }
+  }
+
+  /**
    * Serialize state with optimized performance.
    *
    * The flat map key is the state's dotted path (`state.name`), used as the
@@ -4573,15 +4861,9 @@ export class StateMachine<
     }
 
     if (node.invoke) {
-      serializedState.invoke = node.invoke.map((inv: any) => ({
-        ...inv,
-        cond: inv.cond != null
-          ? serializeActionRef(inv.cond, `${slotBase}.invoke.cond`)
-          : undefined,
-        action: inv.action != null
-          ? serializeActionRef(inv.action, `${slotBase}.invoke.action`)
-          : undefined,
-      }))
+      serializedState.invoke = node.invoke.map((inv: any) =>
+        this.serializeInvokeEntry(inv, slotBase),
+      )
     }
 
     if (node.regions && typeof node.regions === 'object') {
