@@ -2890,21 +2890,31 @@ export class StateMachine<
   }
 
   /**
-   * SPEC §4.3 — does `T1` (cover map `m1`) STRICTLY dominate `T2` (`m2`)? True
-   * iff they govern the SAME set of active leaves and, on every leaf, `T1`'s
-   * source equals or is a descendant of `T2`'s, strictly deeper on at least one.
-   * Different coverage (sibling regions/branches) is incomparable → `false`, so
-   * such candidates diverge at document order (§4.4), never by dominance.
+   * SPEC §4.3 — does `T1` (cover map `m1`) STRICTLY dominate `T2` (`m2`)?
+   *
+   * SUBSET dominance (W3-B.1 fix, finding #1): `T1` dominates `T2` iff T1's
+   * governed leaves are a SUBSET of T2's, and on every leaf T1 governs, T1's
+   * source equals or is a descendant of T2's, strictly deeper on at least one.
+   * This makes a narrow deep candidate (a lane leaf `RUN.read.busy`, covering
+   * one leaf) dominate a broad shallow one (the parent `RUN`, covering both
+   * lanes) — the descendant preempts the ancestor even when their coverage
+   * differs, as SCXML/UML require and §6a/§9.1 promise. The earlier size-equality
+   * gate made these INCOMPARABLE, so document order decided and a first-declared
+   * parent could beat a lane leaf (last-declared regression). Subset dominance
+   * stays a strict partial order: reflexive-free (needs a strict descendant),
+   * transitive (A⊆B⊆C with pointwise descent ⇒ A⊆C), antisymmetric.
+   *
+   * Incomparable coverage (sibling regions/branches, neither a subset of the
+   * other) → `false`, so such candidates diverge at document order (§4.4).
    */
   private dominates(
     m1: Map<string, string>,
     m2: Map<string, string>,
   ): boolean {
-    if (m1.size !== m2.size) return false
     let strict = false
     for (const [leaf, s1] of m1) {
       const s2 = m2.get(leaf)
-      if (s2 === undefined) return false // incomparable coverage
+      if (s2 === undefined) return false // T1 governs a leaf T2 doesn't → not a subset
       if (s1 === s2) continue
       if (s1.startsWith(s2 + '.')) {
         strict = true // s1 is a strict descendant of s2 on this leaf
@@ -2945,9 +2955,9 @@ export class StateMachine<
       error?: Error
     }> = []
 
-    // Descendant-dominance FILTER (§4, implementation subtlety): drop T2 when a
-    // T1 of the SAME priority AND specificity strictly dominates it. The sorted
-    // order is otherwise preserved.
+    // Descendant-dominance as ORDER (§4, W3-B.1): a dominating descendant is
+    // ordered BEFORE the ancestor it dominates (never a comparator branch —
+    // dominance is a PARTIAL order; a stable topological reorder is used below).
     //
     // Perf (W3-B residual): dominance only ever applies WITHIN a group of equal
     // (priority, specificity). On a wide event whose candidates differ in those
@@ -2981,20 +2991,32 @@ export class StateMachine<
           }
           return m
         }
-        survivors = candidates.filter((c2, i2) => {
-          for (let i1 = 0; i1 < candidates.length; i1++) {
-            if (i1 === i2) continue
-            const c1 = candidates[i1]!
-            if (
-              c1.priority === c2.priority &&
-              c1.specificity === c2.specificity &&
-              this.dominates(coverOf(i1), coverOf(i2))
-            ) {
-              return false
-            }
-          }
-          return true
-        })
+        // W3-B.1 finding #2: dominance is an ORDER, not a filter. A dominating
+        // descendant is placed BEFORE the ancestor it dominates, but the
+        // ancestor is NOT removed — the lazy guard loop tries the descendant
+        // first and FALLS BACK to the ancestor if the descendant's guard rejects
+        // (SCXML/UML bubble-up; §6.1). STABLE topological reorder: repeatedly
+        // take the first remaining candidate (in pre-sorted order) not dominated
+        // by any other remaining one. Dominance is a strict partial order, so a
+        // maximal element always exists → terminates, deterministic.
+        const idxOf = new Map(candidates.map((c, i) => [c, i]))
+        const domOrder = (
+          a: PreparedTransition<TOwner, SMConfig['states']>,
+          b: PreparedTransition<TOwner, SMConfig['states']>,
+        ) =>
+          a.priority === b.priority &&
+          a.specificity === b.specificity &&
+          this.dominates(coverOf(idxOf.get(a)!), coverOf(idxOf.get(b)!))
+        const remaining = candidates.slice()
+        const ordered: PreparedTransition<TOwner, SMConfig['states']>[] = []
+        while (remaining.length > 0) {
+          let idx = remaining.findIndex(
+            (c) => !remaining.some((o) => o !== c && domOrder(o, c)),
+          )
+          if (idx < 0) idx = 0 // cycle-safety (unreachable for a partial order)
+          ordered.push(remaining.splice(idx, 1)[0]!)
+        }
+        survivors = ordered
       }
     }
 

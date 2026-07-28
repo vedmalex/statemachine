@@ -436,3 +436,92 @@ describe('conformance — W3C SCXML IRP applicable vectors (SPEC §4в)', () => 
     ).toBe('firstDecl')
   })
 })
+
+// W3-B.1 (critic-приёмка W3-B, findings #1/#2): subset-dominance + dominance
+// as ORDER not filter. A lane leaf (narrow coverage, deep source) preempts the
+// composite parent (broad coverage, shallow source) in BOTH declaration orders,
+// and when the leaf's guard REJECTS the parent is a legitimate fallback.
+describe('W3-B.1 — multi-lane composite: leaf preempts parent, parent is guard-fallback', () => {
+  const mk = (transitions: any[]) =>
+    createMachine(
+      {
+        name: 'ml',
+        stateAttribute: 'state',
+        initialState: 'RUN',
+        states: {
+          RUN: {
+            initial: 'read.busy|write.busy',
+            regions: {
+              read: { busy: {}, done: {} },
+              write: { busy: {}, done: {} },
+            },
+          },
+          ABORTED: {},
+          RD: {},
+        },
+        events: { ev: { transitions } },
+      } as any,
+      { state: 'RUN' } as any,
+    )
+
+  it('finding #1: leaf from:RUN.read.busy beats parent from:RUN — parent declared FIRST', async () => {
+    const sm = mk([
+      { from: 'RUN', to: 'ABORTED' },
+      { from: 'RUN.read.busy', to: 'RD' },
+    ])
+    await sm.fireEvent('ev')
+    // Descendant preempts even though the parent covers 2 lanes (different
+    // coverage size) and is declared first. Pre-W3-B.1: 'ABORTED' (last-declared).
+    expect(sm.getCurrentState()).toContain('RD')
+  })
+
+  it('finding #1: leaf beats parent — leaf declared FIRST (symmetry)', async () => {
+    const sm = mk([
+      { from: 'RUN.read.busy', to: 'RD' },
+      { from: 'RUN', to: 'ABORTED' },
+    ])
+    await sm.fireEvent('ev')
+    expect(sm.getCurrentState()).toContain('RD')
+  })
+
+  it('finding #2: leaf guard REJECTS → parent is the fallback (dominance is order, not filter)', async () => {
+    const sm = mk([
+      { from: 'RUN.read.busy', to: 'RD', guard: () => false },
+      { from: 'RUN', to: 'ABORTED' },
+    ])
+    await sm.fireEvent('ev')
+    // The dominated parent was NOT dropped before guards; it fires when the
+    // dominating leaf's guard fails. Pre-W3-B.1 filter: neither, RUN stuck.
+    expect(sm.getCurrentState()).toBe('ABORTED')
+  })
+})
+
+// Specificity class 1 ('a|*' partial wildcard) — was uncovered (critic W3-B §5).
+describe('specificity: explicit > partial-wildcard (a|*) > full wildcard', () => {
+  it('explicit from beats a partial-wildcard from on the same event', async () => {
+    const sm = createMachine(
+      {
+        name: 'spec1',
+        stateAttribute: 'state',
+        initialState: 'a',
+        states: {
+          a: { regions: { x: { p: {}, q: {} }, y: { m: {}, n: {} } }, initial: 'x.p|y.m' },
+          EXPL: {},
+          PART: {},
+        },
+        events: {
+          go: {
+            transitions: [
+              // partial wildcard declared FIRST; explicit must still win by specificity
+              { from: 'a.x.p|*', to: 'PART' },
+              { from: 'a.x.p|a.y.m', to: 'EXPL' },
+            ],
+          },
+        },
+      } as any,
+      { state: 'a' } as any,
+    )
+    await sm.fireEvent('go')
+    expect(sm.getCurrentState()).toBe('EXPL')
+  })
+})
