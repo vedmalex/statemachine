@@ -5,17 +5,19 @@
  * ADR-3 C (R1) Adapter-write capture seam — the single ratified capture
  * primitive. A harness-owned wrapper of the consumer's {@link Adapter} that
  * observes EVERY engine state-write as a raw `(from,to)` pair, REPLACING the
- * superseded capture-inside-`recordTransition` mechanism (which runs `(time,true)`
- * at state_machine.ts:2060 AFTER the :2048 write, cannot read `from`, and is
- * blind to the errorState fallback at :2020 and the history-restore bypasses).
+ * superseded capture-inside-`recordTransition` mechanism. `recordTransition` is
+ * unfit as a capture point: it runs AFTER the configuration write so it cannot
+ * read `from`, and (post-W4) it is called with a `success` FLAG — `true` on a
+ * committed transition, `false` on a refusal (guard-reject / abort / errorState
+ * recovery) — none of which carries the `(from,to)` write. The errorState recovery
+ * in particular commits via `commitConfiguration` and records `recordTransition(0,
+ * false)`, so a capture keyed on a successful recordTransition would miss it.
  *
- * Wrapping the `set` METHOD is load-bearing: all THREE write sites funnel through
- * `adaptee.set(this.stateAttribute, ...)`:
- *  - :1116 shallow-history restore (`return` before :1204)
- *  - :1126 deep-history restore    (`return` before :1204)
- *  - :1204 setCurrentStateInternal
- * plus the errorState fallback at :2020 (`setCurrentState; return`, which skips
- * the :2060 recordTransition).
+ * Wrapping the `set` METHOD is load-bearing: every state write funnels through
+ * `adaptee.set(this.stateAttribute, ...)` — the shallow/deep history-restore
+ * bypasses, `setCurrentStateInternal`, AND the errorState fallback commit — so the
+ * seam observes all of them regardless of which recordTransition flag (if any)
+ * accompanies the write.
  *
  * {@link CaptureSink} is CONTEXT-FREE: it observes only the raw `(from,to)` of
  * each write. The driver (Step 3) supplies the live sink that stamps

@@ -14,10 +14,11 @@
  *
  * Checkers are PURE functions of `(frame|state, ctx)` (ADR-6 c3): they make NO
  * live engine read. `getRegionKey` is REPLICATED in {@link ConfigGraph} (the
- * engine's is PRIVATE at state_machine.ts:2435, never called). Outcomes come from
- * the `fireEvent` Promise + the Step-2 Adapter-seam deltas captured in the trace,
- * NEVER from `IMonitor` (recordTransition is hardcoded `(time,true)` at :2059-2060
- * and cannot be a determinism signal).
+ * engine's is PRIVATE in state_machine.ts, never called). Outcomes come from the
+ * `fireEvent` Promise + the Step-2 Adapter-seam deltas captured in the trace,
+ * NEVER from `IMonitor`. Post-W4 `recordTransition` carries a `success` FLAG
+ * (`true` commit / `false` refusal), but it still runs AFTER the write and is not
+ * a determinism signal — the Adapter-seam deltas remain the sole outcome source.
  *
  * No `Math.random` / `Date.now` / `performance.now`; no local settle/drain/flush.
  */

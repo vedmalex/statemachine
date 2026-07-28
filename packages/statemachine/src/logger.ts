@@ -242,6 +242,20 @@ export class LoggerFactory {
     LoggerFactory.defaultConfig = { ...DEFAULT_LOGGER_CONFIG, ...config }
   }
 
+  /**
+   * W4.1 #5 — set the default level AND propagate it to every ALREADY-created
+   * logger. Each logger snapshots its config at construction, so replacing the
+   * factory default alone never reaches the pre-existing `stateMachineLogger` the
+   * engine logs through — `setDefaultLogLevel` would appear to do nothing to the
+   * engine. Re-applying to the live cache makes the control surface real.
+   */
+  static setDefaultLevel(level: LogLevel): void {
+    LoggerFactory.setDefaultConfig({ level })
+    for (const logger of LoggerFactory.loggers.values()) {
+      logger.updateConfig({ level })
+    }
+  }
+
   static getLogger(source: string, config?: Partial<LoggerConfig>): Logger {
     const key = source
     if (!LoggerFactory.loggers.has(key)) {
@@ -261,7 +275,9 @@ export class LoggerFactory {
 // Convenience exports
 export const getLogger = LoggerFactory.getLogger
 export const setDefaultLogLevel = (level: LogLevel) => {
-  LoggerFactory.setDefaultConfig({ level })
+  // W4.1 #5: propagate to live loggers (incl. the engine's `stateMachineLogger`),
+  // not just the factory default used for FUTURE loggers.
+  LoggerFactory.setDefaultLevel(level)
 }
 
 // Pre-configured loggers for common use cases

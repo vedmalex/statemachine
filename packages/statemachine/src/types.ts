@@ -93,6 +93,11 @@ export interface MonitorMetricsSnapshot {
   successCount: number
   errorCount: number
   averageDuration: number
+  /**
+   * W4.1 #1 — штатные ОТКАЗЫ перехода (guard-rejected / abort / errorState),
+   * counted SEPARATELY from `errorCount` (genuine errors). Optional (additive).
+   */
+  failedTransitions?: number
 }
 
 /**
@@ -442,6 +447,12 @@ export type Event<T extends object, S extends States<T>> = {
  *    target configuration was contradictory). Observably distinct from
  *    `no-transition` (no candidate at all) so the W5 sim oracle can tell "nothing
  *    to do" from "a started microstep was rolled back".
+ *  - `error-state` (W4.1 #3) — the requested transition FAILED (onEnter threw) and
+ *    the machine recovered into the configured `errorState`. The target transition
+ *    did NOT fire, so `fired` is `false` — consistent with the monitor, which
+ *    records this as a failed transition, and with the observable state now sitting
+ *    in `errorState`. (The old code returned `fired:true` with the requested
+ *    `a→b`, contradicting both other public channels.)
  *
  * `fireEvent` deliberately keeps returning `boolean`: `{ fired: false }` is a
  * truthy object, so any `if (await sm.fireEvent(e))` would silently invert.
@@ -454,7 +465,7 @@ export type FireResult =
     }
   | {
       fired: false
-      reason: 'no-transition' | 'guard-rejected' | 'guard-error' | 'aborted'
+      reason: 'no-transition' | 'guard-rejected' | 'guard-error' | 'aborted' | 'error-state'
       /** Per-candidate rejection detail, present for the guard-* reasons. */
       rejected?: Array<{
         /** `'from -> to'` label of the rejected transition. */

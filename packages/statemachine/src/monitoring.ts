@@ -76,6 +76,15 @@ export class MetricsCollector {
   private config: MonitoringConfig
   private startTime: number = Date.now()
   private transitionCount = 0
+  // W4.1 #1 — REFUSAL vs ERROR are DISTINCT domains and must NOT be conflated:
+  //   • failedTransitions — штатные ОТКАЗЫ перехода (guard-rejected / onExit-abort /
+  //     errorState recovery). A healthy machine legitimately refuses transitions;
+  //     these are NOT engine errors and MUST NOT drive health/errorRate.
+  //   • errorCount — GENUINE errors only (guard-throw / action-throw via recordError).
+  // The old code routed `recordTransition(_, false)` into recordError, so a healthy
+  // machine with guard-rejects reported errorRate>0 → false-'critical' (the EO-3 lie
+  // in reverse). health/errorRate is derived from errorCount ALONE.
+  private failedTransitions = 0
   private errorCount = 0
 
   constructor(config: Partial<MonitoringConfig> = {}) {
@@ -83,12 +92,16 @@ export class MetricsCollector {
   }
 
   /**
-   * Record a state transition
+   * Record a state transition. `success === false` marks a REFUSAL (a failed
+   * transition — guard-rejected / abort / errorState recovery), NOT an engine
+   * error: it increments `failedTransitions`, never `errorCount`. Genuine errors
+   * flow through {@link recordError} exclusively.
    */
-  recordTransition(transitionTime: number): void {
+  recordTransition(transitionTime: number, success: boolean = true): void {
     if (!this.config.enabled) return
 
     this.transitionCount++
+    if (!success) this.failedTransitions++
 
     const metrics: PerformanceMetrics = {
       transitionTime,
@@ -102,7 +115,8 @@ export class MetricsCollector {
   }
 
   /**
-   * Record an error
+   * Record a GENUINE error (guard-throw / action-throw). Distinct from a refusal;
+   * this is the SOLE input to health/errorRate.
    */
   recordError(): void {
     if (!this.config.enabled) return
@@ -114,9 +128,11 @@ export class MetricsCollector {
    */
   getMetricsSummary(): {
     totalTransitions: number
+    failedTransitions: number
     totalErrors: number
     averageTransitionTime: number
     errorRate: number
+    refusalRate: number
     uptime: number
   } {
     const now = Date.now()
@@ -135,6 +151,11 @@ export class MetricsCollector {
     // 'healthy', hiding the failure from the W5 sim oracle. With no transitions
     // but recorded errors the error rate is effectively 100%; with neither it is
     // an honest 0%.
+    //
+    // W4.1 #1: errorRate is derived from GENUINE errors (errorCount) ONLY — a
+    // штатный guard-refusal (failedTransitions) never inflates it. This closes the
+    // reverse-EO-3 lie where a healthy machine with a couple of guard-rejects
+    // tipped past errorRateCritical and reported 'critical'.
     const errorRate =
       this.transitionCount > 0
         ? (this.errorCount / this.transitionCount) * 100
@@ -142,11 +163,20 @@ export class MetricsCollector {
           ? 100
           : 0
 
+    // Advisory refusal signal — the штатные отказы rate, kept SEPARATE from
+    // errorRate so consumers can observe refusals without polluting health.
+    const refusalRate =
+      this.transitionCount > 0
+        ? (this.failedTransitions / this.transitionCount) * 100
+        : 0
+
     return {
       totalTransitions: this.transitionCount,
+      failedTransitions: this.failedTransitions,
       totalErrors: this.errorCount,
       averageTransitionTime,
       errorRate,
+      refusalRate,
       uptime,
     }
   }
@@ -167,6 +197,7 @@ export class MetricsCollector {
   clearMetrics(): void {
     this.metrics = []
     this.transitionCount = 0
+    this.failedTransitions = 0
     this.errorCount = 0
     this.startTime = Date.now()
   }
@@ -491,8 +522,12 @@ export class StateMachineMonitor {
    * Record a transition for monitoring (F-T4-TS-5 widening: added success + context params)
    */
   recordTransition(transitionTime: number, success: boolean = true, _context?: TransitionContext): void {
-    this.metricsCollector.recordTransition(transitionTime)
-    if (!success) this.metricsCollector.recordError()
+    // W4.1 #1: a REFUSAL (success === false) is a failed transition, NOT an
+    // engine error — it must NOT be routed into recordError (that inflated
+    // errorCount/errorRate and reported a healthy guard-rejecting machine as
+    // 'critical'). The collector records it as a failedTransition; genuine errors
+    // arrive only via {@link recordError}.
+    this.metricsCollector.recordTransition(transitionTime, success)
     // _context kept for future enrichment
   }
 
@@ -517,11 +552,13 @@ export class StateMachineMonitor {
     const summary = this.metricsCollector.getMetricsSummary()
     return {
       totalTransitions: summary.totalTransitions,
-      // EO-3 (honesty): successCount is a COUNT and can never be negative. When
-      // more errors than transitions were recorded (a broken machine records
-      // errors without a matching successful transition), the naive subtraction
-      // went negative (e.g. 1 − 3 = −2) — a nonsensical public metric. Clamp to 0.
-      successCount: Math.max(0, summary.totalTransitions - summary.totalErrors),
+      // W4.1 #1: successCount = totalTransitions − failedTransitions. Subtracting
+      // ERRORS instead mixed two domains (critic: 5 successes + 2 guard-errors →
+      // 5 − 2 = 3 was a LIE; the 5 successful transitions still happened). Errors
+      // are NOT recorded in the transition domain (guard-error never calls
+      // recordTransition), so success is transitions minus the штатные refusals.
+      successCount: Math.max(0, summary.totalTransitions - summary.failedTransitions),
+      failedTransitions: summary.failedTransitions,
       errorCount: summary.totalErrors,
       averageDuration: summary.averageTransitionTime,
     }

@@ -10,12 +10,17 @@
  * `timestamp: Date.now()` at :97). `recordTransition` / `recordError` are plain
  * integer counters that read NO wall clock.
  *
- * `recordTransition(transitionTime, true)` is the engine's SOLE call site
- * (state_machine.ts:2059-2060 — hardcoded `true`, no context); it is NEVER the
- * capture point for `(from,to)` state writes (that is the Adapter.set seam in
- * capture.ts). The engine-supplied `duration` arg is stored on a NON-hashed
- * latency accumulator so Step 8's perf channel can read it WITHOUT a new engine
- * method and WITHOUT it ever reaching {@link hashTrace} (ADR-1 exclusion).
+ * `recordTransition(duration, success)` is called by the engine on EVERY drained
+ * outcome: `success===true` for a committed transition, and (post-W4)
+ * `success===false` for a REFUSAL — a guard-rejected event, an onExit-abort, or an
+ * errorState recovery (see state_machine.ts `applyMicrostep` / the `enabled.length
+ * === 0` and abort branches). The `success` FLAG — not a hardcoded `true` — is the
+ * discriminator; `recordTransition` is NEVER the capture point for `(from,to)`
+ * state writes (that is the Adapter.set seam in capture.ts). Only the SUCCESS
+ * `duration` values are stored on the NON-hashed latency accumulator (W4.1 LOW —
+ * refusals pass `duration===0` and would dilute the perf channel with zeros), so
+ * Step 8's perf channel reads real transition latencies WITHOUT a new engine
+ * method and WITHOUT ever reaching {@link hashTrace} (ADR-1 exclusion).
  *
  * Source-grep DoD: this file contains ZERO `Date.now` / `performance.now` /
  * `MetricsCollector` / `StateMachineMonitor` / `createDefaultMonitor` / `.start(`.
@@ -43,8 +48,11 @@ export class SimMonitor implements IMonitor {
   private readonly durations: number[] = []
 
   recordTransition(duration: number, success: boolean, _context?: TransitionContext): void {
-    this.durations.push(duration)
     if (success) {
+      // W4.1 LOW: accumulate latency for SUCCESSES only. Refusals arrive with
+      // duration===0 (guard-reject / abort / errorState) and would dilute the
+      // Step-8 perf channel with meaningless zeros. Failure counting stays exact.
+      this.durations.push(duration)
       this.transitionCount += 1
     } else {
       this.failureCount += 1

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { securityLogger } from './logger'
+import { securityLogger, stateMachineLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
 import {
   type SafeSerializedAction,
@@ -90,13 +90,16 @@ function isReservedActionName(name: unknown): boolean {
   return typeof name === 'string' && RESERVED_ACTION_NAMES.has(name)
 }
 
-// ✅ НОВОЕ: Default implementation для Lite режима (No-Op или Console)
-const ConsoleLogger: ILogger = {
-  debug: () => { }, // По умолчанию выключено для Lite
-  info: () => { },
-  warn: (msg, ctx) => console.warn(msg, ctx),
-  error: (msg, ctx, err) => console.error(msg, ctx, err),
-}
+// W4.1 #5 — the engine's DEFAULT logger is the logger.ts `stateMachineLogger`
+// (a `getLogger('StateMachine')` instance), NOT a raw console shim. The old
+// ConsoleLogger bypassed logger.ts entirely, so `setDefaultLogLevel` (which only
+// reconfigures logger.ts consumers) silently failed to silence the engine's
+// warn/error — a no-op control surface. Routing the default through logger.ts
+// makes `setDefaultLogLevel` genuinely govern engine verbosity (level WARN by
+// default → debug/info stay suppressed, warn/error reach the console appender,
+// preserving the previous observable behaviour). An explicitly injected
+// `options.logger` still wins.
+const DefaultEngineLogger: ILogger = stateMachineLogger
 
 interface StateInfo {
   name: string
@@ -223,7 +226,16 @@ export class StateMachine<
   // exit of the leaf. A deterministically-throwing onExit would otherwise loop
   // relaunch→onDone→exit-throw→re-abort→relaunch forever; past the cap the
   // operation is left cancelled and the fact is recorded (observable), not spun.
-  private invokeRestartCount: Map<string, number> = new Map()
+  //
+  // W4.1 #2 — PER-OWNER (WeakMap<owner, Map<leaf,count>>). A single flat
+  // Map<leaf,count> on the machine let multiple owners SHARE one budget for the
+  // same leaf name, and `commitConfiguration`'s global `.clear()` reset EVERY
+  // owner's counters on ANY commit — so owner B's successful commit zeroed owner
+  // A's restart budget, letting A relaunch unboundedly (the livelock bound W3b.1
+  // establishes was silently defeated in the multi-owner case). Now each owner
+  // counts independently and a commit clears ONLY the committing owner's exit-set.
+  private invokeRestartCountByOwner: WeakMap<object, Map<string, number>> =
+    new WeakMap()
   private readonly MAX_INVOKE_RESTARTS = 3
   private stateEntryTimesByOwner: WeakMap<object, Map<string, number>> =
     new WeakMap()
@@ -309,7 +321,7 @@ export class StateMachine<
 
     // ✅ Внедрение зависимостей (Dependency Injection)
     // Если передали - используем, если нет - fallback на легковесные версии
-    this.logger = options?.logger ?? ConsoleLogger
+    this.logger = options?.logger ?? DefaultEngineLogger
     this.monitor = options?.monitor ?? createDefaultMonitor()
     this.schedulerProvided = options?.scheduler !== undefined
     this.scheduler = options?.scheduler ?? createDefaultScheduler()
@@ -494,6 +506,22 @@ export class StateMachine<
     if (!m) {
       m = new Map()
       this.activeInvokesByOwner.set(key, m)
+    }
+    return m
+  }
+
+  /**
+   * W4.1 #2 — the current owner's per-leaf invoke-restart counter map (created on
+   * first access). Keyed by the owner adaptee like every other per-owner map, so
+   * one owner's abort-restart budget is isolated from another's and a commit can
+   * clear ONLY the committing owner's counters (see {@link commitConfiguration}).
+   */
+  private restartCountsFor(obj?: Adapter<any>): Map<string, number> {
+    const key = this.ownerKey(obj)
+    let m = this.invokeRestartCountByOwner.get(key)
+    if (!m) {
+      m = new Map()
+      this.invokeRestartCountByOwner.set(key, m)
     }
     return m
   }
@@ -1114,6 +1142,20 @@ export class StateMachine<
       })
       if (queuedEvent.detailed) {
         queuedEvent.detailResult = { fired: false, reason: 'aborted' }
+      }
+      return false
+    }
+
+    if (committed.kind === 'error-state') {
+      // W4.1 #3: the requested target FAILED (onEnter threw) and the machine
+      // recovered into `errorState`. applyMicrostep already recorded a FAILED
+      // transition on the monitor and committed the errorState. The requested
+      // transition did NOT fire — so the detailed channel MUST report fired:false
+      // (reason 'error-state'), matching the monitor and the observable state.
+      // Reporting fired:true here (the old behaviour) made two public channels
+      // contradict each other.
+      if (queuedEvent.detailed) {
+        queuedEvent.detailResult = { fired: false, reason: 'error-state' }
       }
       return false
     }
@@ -3693,10 +3735,15 @@ export class StateMachine<
 
   /**
    * SPEC §6.3 — execute the Optimal Transition Set (one or many transitions) as
-   * ONE atomic microstep. Returns the committed configuration string, or
-   * `undefined` when the microstep aborted (invalid target / onExit-abort /
-   * transitionTimeout). Throws only to PROPAGATE an unhandled action error (the
-   * caller records+rethrows).
+   * ONE atomic microstep. Returns an OUTCOME discriminator:
+   *   • `{ kind: 'ok' }`          — the requested target was committed (success);
+   *   • `{ kind: 'error-state' }` — the target FAILED (onEnter threw) and the
+   *     machine recovered into the configured `errorState` (W4.1 #3: a FAILED
+   *     transition, NOT a success — the caller reports `fired:false` so the
+   *     detailed channel agrees with the monitor and the observable state);
+   *   • `undefined`               — the microstep aborted (invalid target /
+   *     onExit-abort / transitionTimeout).
+   * Throws only to PROPAGATE an unhandled action error (the caller records+rethrows).
    *
    * П5 (single root): timer teardown and invoke re-arming happen strictly AFTER
    * the point of no return (the configuration write), and the enter-set is
@@ -3717,7 +3764,7 @@ export class StateMachine<
     args: any[],
     eventName: keyof SMConfig['events'],
     event: Event<TOwner, SMConfig['states']>,
-  ): Promise<string | undefined> {
+  ): Promise<{ kind: 'ok' | 'error-state' } | undefined> {
     const label = enabled
       .map((e) => `${e.transition.from} -> ${e.transition.to}`)
       .join(', ')
@@ -3927,17 +3974,21 @@ export class StateMachine<
         } catch {
           /* a monitor sink must never break the drain */
         }
-        this.commitConfiguration(obj, errorConfig)
+        this.commitConfiguration(obj, errorConfig, errSets.exitStates)
         for (const s of errSets.exitStates) this.teardownStateTimers(s, obj)
         for (const s of errSets.enterStates) this.armStateInvoke(obj, s)
-        return errorConfig
+        // W4.1 #3: signal error-state recovery distinctly. The requested target
+        // did NOT fire — the caller reports fired:false so the detailed channel
+        // matches the monitor's recordTransition(false) above and the machine's
+        // now-committed errorState.
+        return { kind: 'error-state' }
       }
 
       // POINT OF NO RETURN — commit the resolved configuration exactly once.
       // Intentional wall-clock telemetry (NOT this.clock()): measures real
       // transition latency for monitor.recordTransition. Do not virtualize.
       const transitionStartTime = Date.now()
-      this.commitConfiguration(obj, finalConfig)
+      this.commitConfiguration(obj, finalConfig, exitStates)
 
       // П5: teardown the timers of leaves that ACTUALLY left the configuration,
       // then arm invoke timers for the entered leaves — from the ACTUALLY-written
@@ -3949,7 +4000,7 @@ export class StateMachine<
       this.checkCompletion(obj as any, currentState, finalConfig)
 
       this.monitor.recordTransition(Date.now() - transitionStartTime, true)
-      return finalConfig
+      return { kind: 'ok' }
     } finally {
       this._isTransitioning = false
       this._targetState = undefined
@@ -3962,7 +4013,11 @@ export class StateMachine<
    * in one operation over all targets. Bypasses {@link setCurrentState}'s history
    * branches because {@link previewCommitState} already applied them.
    */
-  private commitConfiguration(obj: Adapter<TOwner>, config: string): void {
+  private commitConfiguration(
+    obj: Adapter<TOwner>,
+    config: string,
+    exitStates: string[] = [],
+  ): void {
     this.validateCompositeState(config)
     ;(obj as unknown as Adapter<PropertiesOf<TOwner>>).set(
       this.stateAttribute,
@@ -3971,7 +4026,15 @@ export class StateMachine<
     // A committed configuration clears the invoke-restart counters for the
     // leaves that left it — the abort-restart loop is broken, so a later
     // aborted microstep on a fresh entry starts counting from zero (W3b.1).
-    this.invokeRestartCount.clear()
+    //
+    // W4.1 #2: clear ONLY THIS OWNER's counters, and only for the leaves that
+    // ACTUALLY left in this commit (the exit set). The old global `.clear()` wiped
+    // every owner's budget on any commit, so a co-resident owner's successful
+    // transition reset an unrelated owner's abort-restart counter and defeated the
+    // livelock bound. Scoping to the committing owner's exit set keeps each owner
+    // independently bounded.
+    const restarts = this.restartCountsFor(obj)
+    for (const leaf of exitStates) restarts.delete(leaf)
   }
 
   /**
@@ -4307,8 +4370,11 @@ export class StateMachine<
     // Livelock bound (W3b.1): cap consecutive restarts of a leaf whose exit keeps
     // failing. Past the cap, leave the operation cancelled and record it so the
     // failure is observable (W5) instead of an unbounded relaunch loop.
-    const restarts = (this.invokeRestartCount.get(stateName) ?? 0) + 1
-    this.invokeRestartCount.set(stateName, restarts)
+    // W4.1 #2: count restarts in THIS OWNER's map so a co-resident owner neither
+    // shares nor resets this owner's budget.
+    const ownerRestarts = this.restartCountsFor(obj)
+    const restarts = (ownerRestarts.get(stateName) ?? 0) + 1
+    ownerRestarts.set(stateName, restarts)
     if (restarts > this.MAX_INVOKE_RESTARTS) {
       this.reportRuntimeError(
         new StateMachineError(
