@@ -663,16 +663,20 @@ describe('I-4 / I-5 do not false-fire on well-formed composites', () => {
     expect(runSafety(INVARIANTS, trace, ctxFor(cfg, 8))).toBeNull()
   })
 
-  it('I-5 doneDelta with an undeclared / not-done composite stays clean (backstop only)', () => {
-    const cfg = { states: { root: {} }, events: {} }
+  it('I-5 is a documented no-op backstop (A3): stays clean on all doneDelta shapes', () => {
+    // A3 HONEST accounting: the parallel-join miss is not soundly observable from
+    // the current trace plane (internal `done.state.<C>` raise never appears as
+    // `frame.event`; doneDelta is absent on the verdict path), so I-5 is a clean
+    // backstop — the converse done-event gating is enforced by I-12. It must never
+    // fire regardless of the doneDelta shape.
+    const cfgDecl = { states: { root: {} }, events: { 'done.state.root': {} } }
     const inv5 = INVARIANTS.find((i) => i.id === 'I-5') as Invariant
-    // not-done composite, and a done composite the config does not declare → clean.
-    const f = frame({ step: 1, from: 'root', to: 'root', doneDelta: [{ composite: 'other', done: true }, { composite: 'root', done: false }] })
-    expect(inv5.checkStep?.(f, ctxFor(cfg, 8))).toBeNull()
-    // I-5 checkFinal is a backstop that stays clean.
-    expect(inv5.checkFinal?.({ config: 'root', queue: { internal: 0, external: 0 }, quiescent: true }, ctxFor(cfg, 8))).toBeNull()
-    // a frame with no doneDelta is clean.
-    expect(inv5.checkStep?.(frame({ step: 2, to: 'root' }), ctxFor(cfg, 8))).toBeNull()
+    expect(inv5.checkTrace).toBeUndefined()
+    const f = frame({ step: 1, from: 'root', to: 'root', doneDelta: [{ composite: 'root', done: true }] })
+    expect(inv5.checkStep?.(f, ctxFor(cfgDecl, 8))).toBeNull()
+    const notDone = frame({ step: 2, from: 'root', to: 'root', doneDelta: [{ composite: 'root', done: false }] })
+    expect(inv5.checkStep?.(notDone, ctxFor(cfgDecl, 8))).toBeNull()
+    expect(runSafety(INVARIANTS, { header: HEADER, frames: [f] }, ctxFor(cfgDecl, 8))).toBeNull()
   })
 
   it('I-6 NON-synthetic frame carrying contradictory-state errorClass (transition-target throw) is clean', () => {

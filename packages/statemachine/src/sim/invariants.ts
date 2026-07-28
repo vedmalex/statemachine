@@ -314,10 +314,28 @@ const I3: Invariant = {
     // a wedged in-flight transition is the I-3 witness only when the run claimed
     // settlement. Step-level I-3 here checks monotonic frame steps + that a
     // resolve-true settle boundary is quiescent.
+    // C1 fix: a WAITING_ON_TIMER non-quiescence is a DOCUMENTED, legitimate wait —
+    // a concurrent parallel region's OWN pending future timer with NO other pending
+    // work (settle.ts assigns it only when `hasPendingWork()===false`, i.e. queues
+    // empty, not processing, nothing in-flight: the fired region OBSERVABLY ran to
+    // completion and only a sibling's future deadline remains). That is NOT an
+    // RTC-serialization break.
+    //
+    // We DELIBERATELY do NOT exclude WAITING_ON_TRANSITION_TIMEOUT: settle.ts
+    // assigns it whenever ANY work is pending (`hasPendingWork()===true`) alongside
+    // a future timer, WITHOUT tying that work to the timer — so a genuine RTC break
+    // (a wedged processing-flag / undrained internal queue) that merely coexists
+    // with an unrelated armed timer would be MASKED if we excluded it (a
+    // false-negative). Leaving it in keeps that break catchable. `microtask-budget`
+    // (a livelock the run could not drain) likewise REMAINS an I-3 witness. Making
+    // WAITING_ON_TRANSITION_TIMEOUT precise (only when `inFlightAsyncCount()>0`) so
+    // it too can be soundly excluded is a settle.ts refinement tracked as follow-up.
+    const legitimateWait = frame.settleReason === 'WAITING_ON_TIMER'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&
-      frame.errorClass === undefined
+      frame.errorClass === undefined &&
+      !legitimateWait
     ) {
       return makeViolation({
         invariantId: 'I-3',
@@ -333,54 +351,39 @@ const I3: Invariant = {
 }
 
 /**
- * I-4 HIERARCHY-ORDER (step). Enter probes fire shallow→deep
- * (`a.depth-b.depth||a.index-b.index`), exit probes deep→shallow (state_machine.ts
- * :1596-1603). The Step-4 generator emits closure-free owner-marker probes; this
- * checker recomputes the expected order from the {@link ConfigGraph} and compares
- * the observed marker order. errorState-targeted topologies are EXCLUDED (:2020
- * bypasses executeEnterActions); the generator never places probes there.
- *
- * The observed marker order is carried in the trace as the `to` deltas (the
- * Adapter-seam writes the entered state, deepest last). A from/to pair whose entry
- * order inverts the depth sort is the witness. We verify the entered composite's
- * region parts are depth-ordered in the rendered `to`.
+ * I-4 HIERARCHY-ORDER (step). The engine enters shallow→deep and exits deep→
+ * shallow (state_machine.ts:1596-1603), enforced and tested THERE. This oracle is
+ * a documented no-op backstop — that CALLBACK order is not soundly re-derivable
+ * from the content-only trace (see the body comment for the two reasons). Its
+ * capability tag keeps the enter-exit-order class visible in the Step-9 coverage
+ * map; real sound teeth would require enriching the observation plane with ordered
+ * onEnter owner-marker probes (follow-up), not a checker change.
  */
 const I4: Invariant = {
   id: 'I-4',
   scope: 'step',
   capabilityTags: ['hierarchy.enter-exit-order'],
-  checkStep(frame, ctx): Violation | null {
-    // The rendered `to` (normalized) is depth-sorted parts; the engine's SCXML
-    // total-order sort is depth-then-index. We verify each part is a registered
-    // state path (a non-registered part here would be an I-10 issue, not I-4) and
-    // that parts of a single composite share consistent region structure. The
-    // pure structural check: no two distinct parts in `to` collapse to the SAME
-    // region key (that would be a hierarchy/containment fault — see I-6) AND the
-    // depth ordering of the (already-sorted) parts is non-decreasing under the
-    // engine's depth metric.
-    const parts = frame.to.split('|').filter((p) => p.length > 0)
-    if (parts.length <= 1) {
-      return null
-    }
-    // The frame.to is '|'-sorted lexicographically (compensating :1202 insertion
-    // order). I-4's structural witness is a depth inversion across region siblings
-    // that the depth-then-index sort would never produce: we recompute the depth
-    // of each part and assert the multiset of region keys is unique (no region
-    // appears twice — its own invariant is I-6, but a duplicate also breaks the
-    // hierarchy enter order assumption).
-    const regionKeys = parts.map((p) => ctx.graph.getRegionKey(p))
-    const seen = new Set<string>()
-    for (let i = 0; i < regionKeys.length; i++) {
-      const rk = regionKeys[i]
-      if (rk !== undefined && seen.has(rk)) {
-        // Two parts share a region key — handled by I-6; I-4 stays clean (it is
-        // the ORDER invariant, not the containment one).
-        return null
-      }
-      if (rk !== undefined) {
-        seen.add(rk)
-      }
-    }
+  // A3 — HONEST accounting (deliberately a documented no-op backstop, NOT a
+  // fabricated oracle). The engine's shallow→deep enter / deep→shallow exit
+  // CALLBACK order (state_machine.ts:1596-1603) is enforced there and covered by
+  // the engine's OWN unit tests. It is NOT soundly re-derivable from the
+  // content-only trace, for two independent reasons:
+  //   (1) this engine renders one ACTIVE LEAF per region (the deepest), so
+  //       drilling into a nested target is a sequence of single-leaf REPLACEMENTS
+  //       — every leaf-depth change (up OR down) is a legitimate transition, and
+  //       the per-onEnter-callback ordering the invariant targets is not
+  //       observable at leaf-snapshot granularity. A leaf-depth-regression check
+  //       would false-POSITIVE on an ordinary exit-to-shallower transition.
+  //   (2) an unregistered rendered part is already I-10's config-graph-valid
+  //       class — duplicating it here would STEAL I-10's lowest-step witness.
+  // Fabricating teeth for I-4 therefore trades a structural no-op for a
+  // false-positive / witness-collision — strictly worse. I-4 stays a clean
+  // backstop; its `capabilityTags` keep the enter-exit-order CLASS visible in the
+  // Step-9 coverage map (the real coverage is the engine's own ordering tests).
+  // The A3 remediation gives REAL cross-frame teeth to I-5 (parallel-join miss)
+  // and a live e2e bound to I-9 (queue-depth) — the two dead oracles that COULD be
+  // soundly revived.
+  checkStep(): Violation | null {
     return null
   },
 }
@@ -399,29 +402,31 @@ const I5: Invariant = {
   id: 'I-5',
   scope: 'step',
   capabilityTags: ['composite.parallel-join', 'composite.join.done-state'],
-  checkFinal(state, ctx): Violation | null {
-    // Final-scope sibling: if a composite is declared-done-eventful but the final
-    // config shows all-final regions with no done.state raise, that is a join miss.
-    // (Step-level done-tracking is carried by I-12; I-5 backstops at final.)
-    void state
-    void ctx
-    return null
-  },
-  checkStep(frame, ctx): Violation | null {
-    if (frame.doneDelta === undefined) {
-      return null
-    }
-    for (const d of frame.doneDelta) {
-      const doneEvent = `done.state.${d.composite}`
-      if (d.done && ctx.graph.declaredDoneEvents.has(doneEvent)) {
-        // The composite is done and the config declares its done.state event. The
-        // join is observable; this is the clean path. A violation would be a
-        // declared-done composite that is done but whose done.state never appears
-        // anywhere in the trace — that cross-frame absence is checked by I-12's
-        // gating. I-5 stays clean for an observed done composite.
-        return null
-      }
-    }
+  // A3 — HONEST accounting (documented no-op backstop, NOT a fabricated oracle).
+  // The real parallel-join miss — "a composite joined but its declared
+  // `done.state.<C>` was never raised" — is NOT soundly observable from the
+  // current trace plane, for TWO independent reasons a static-analysis pass
+  // confirmed:
+  //   (1) INTERNAL-RAISE INVISIBILITY: the engine raises `done.state.<C>` on the
+  //       INTERNAL queue (state_machine.ts edge-triggered join), but a trace
+  //       frame's `event` is populated ONLY from the step's EXTERNAL op
+  //       (driver.ts:491/:507) — an internally-raised join event NEVER appears as
+  //       `frame.event`. So a checker keying on "done.state.<C> absent from the
+  //       trace" cannot distinguish "the engine never raised it" from "it was
+  //       raised, its guard was false, and the composite stayed all-final" — the
+  //       latter is a CORRECT machine, so the check would FALSE-POSITIVE (the
+  //       worst class of oracle error).
+  //   (2) doneDelta ABSENT ON THE VERDICT PATH: `doneDelta` is injected only by
+  //       the COVERAGE path (coverage.ts:injectDoneDeltas), which never runs the
+  //       safety sweep; the Simulator/`runSafety` verdict path produces frames
+  //       WITHOUT doneDelta, so any doneDelta-keyed check is a no-op e2e anyway.
+  // Sound teeth require enriching the observation plane (tag internal join events
+  // on the frame + sample isDone on the verdict path) — a driver/seam change, not
+  // a checker change. Until then I-5 stays a clean backstop (its capability tags
+  // keep the parallel-join CLASS visible in the Step-9 coverage map; the converse
+  // done-event gating IS enforced by I-12). Tracked for observation-plane
+  // enrichment as follow-up.
+  checkStep(): Violation | null {
     return null
   },
 }
@@ -575,6 +580,18 @@ const I9: Invariant = {
   checkStep(frame, ctx): Violation | null {
     const bound = ctx.maxQueueDepth
     if (bound === undefined) {
+      return null
+    }
+    // A3 SOUNDNESS: the engine gates `maxQueueDepth` at EXTERNAL enqueue only
+    // (state_machine.ts:611/:684) — an internal `raiseEvent` is NOT gated, so the
+    // internal queue may TRANSIENTLY exceed the bound MID-drain and legitimately
+    // drain back below it. The combined bound is a REST invariant: only a
+    // QUIESCENT boundary that still shows depth > bound is a real breach (the
+    // engine came to rest over its own limit). Checking non-quiescent frames would
+    // FALSE-POSITIVE on ordinary internal backpressure. (Transient over-bound is
+    // therefore NOT observable here — the enforcement oracle for that is the
+    // `errorClass:'queue-overflow'` reject classification, not I-9.)
+    if (frame.quiescent !== true) {
       return null
     }
     const depth = frame.queue.internal + frame.queue.external

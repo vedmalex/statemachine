@@ -121,6 +121,13 @@ export interface SimOptions {
    * the settle jump the clock; `'both'` runs safety AND liveness.
    */
   readonly mode?: 'safety' | 'liveness' | 'both'
+  /**
+   * The queue-depth bound to configure on the machine (StateMachineOptions.
+   * maxQueueDepth, types.ts:156). When set, the engine enforces it AND the I-9
+   * queue-depth-bound oracle checks the SAME bound e2e; when absent, I-9 is
+   * vacuous (the engine default 1000 applies but no oracle bound is asserted).
+   */
+  readonly maxQueueDepth?: number
   readonly onTrace?: (frame: TraceFrame) => void
 }
 
@@ -202,15 +209,27 @@ export interface SimResult {
 
 /**
  * The DEFAULT builtin oracle set attached when a `runSimulation`/`Simulator` caller
- * supplies NO `invariants` (A2 fail-open fix). Restricted to the invariants that
- * are sound on a legitimate machine in W5a (the W5b content fixes — I-3/I-5/I-9 —
- * are intentionally EXCLUDED so the default set never false-positives before those
- * land). The always-on engine-error channel (A1) supplements this set.
+ * supplies NO `invariants` (A2 fail-open fix). Every member is SOUND on a
+ * legitimate machine — it can never false-positive on a correct run. The always-on
+ * engine-error channel (A1) supplements this set.
+ *
+ * W5b membership decisions:
+ *  - I-9 is INCLUDED: after the A3 fix it only fires on a QUIESCENT boundary whose
+ *    combined queue exceeds an explicitly-configured `maxQueueDepth`, and it is
+ *    VACUOUS when no bound is set (the default path sets none) — sound and inert.
+ *  - I-3 is still EXCLUDED: the C1 fix makes its WAITING_ON_TIMER exclusion sound,
+ *    but WAITING_ON_TRANSITION_TIMEOUT stays un-excluded (to avoid masking a real
+ *    RTC break), so I-3 could false-positive on a legitimate in-flight-with-timeout
+ *    resolve-true boundary. It stays opt-in (explicit `invariants`) until the
+ *    settle.ts reason-precision follow-up lands.
+ *  - I-5 is EXCLUDED: it is a documented no-op (its class is not soundly observable
+ *    from the current trace plane), so including it would add nothing.
  */
 const DEFAULT_BUILTIN_INVARIANT_IDS: ReadonlySet<string> = new Set([
   'I-2',
   'I-6',
   'I-7',
+  'I-9',
   'I-10',
   'I-11',
   'I-12',
@@ -359,7 +378,8 @@ function emptyHeader(seed: string): CanonicalHeader {
     seed,
     configHash: '',
     engine: '@vedmalex/statemachine',
-    version: '1',
+    // '2': kept in lockstep with the driver's canonical header (C1 settleReason).
+    version: '2',
     runtime: 'node-sim-v1',
     prngVersion: 'splitmix64-bigint-v1',
     errorHandlerEnabled: true,
@@ -419,6 +439,12 @@ export class Simulator<T extends object = object> {
    * live here.
    */
   private readonly faults: FaultPlan
+  /**
+   * The consumer-supplied queue-depth bound (opts.maxQueueDepth). Threaded to the
+   * machine (the engine enforces it) AND the {@link CheckerContext} (I-9 asserts
+   * the SAME bound). Absent ⇒ I-9 vacuous (A3).
+   */
+  private readonly maxQueueDepth: number | undefined
 
   private driver?: SimDriver<T>
   private machine?: StateMachine<T, StateMachineConfig<T>>
@@ -458,6 +484,12 @@ export class Simulator<T extends object = object> {
     // A2 fail-open fix: a caller that supplies NO invariants gets the DEFAULT builtin
     // registry, so a run always executes real oracles (never a rubber structural ok).
     this.invariants = opts.invariants ?? DEFAULT_INVARIANTS
+    // A3 (I-9): the configured queue-depth bound, exposed on SimOptions so the
+    // queue-overflow oracle has a live bound e2e. Threaded to BOTH the machine
+    // (StateMachineOptions.maxQueueDepth — the engine actually enforces it) AND the
+    // CheckerContext (I-9 reads the SAME bound) so a flood past the bound is caught,
+    // not silently accepted. Absent ⇒ I-9 stays vacuous (documented, not fake).
+    this.maxQueueDepth = opts.maxQueueDepth
     if (opts.onTrace) {
       this.onTrace = opts.onTrace
     }
@@ -498,6 +530,8 @@ export class Simulator<T extends object = object> {
       // The frozen public SimOptions.faults field becomes LIVE here: a non-empty
       // plan is threaded into the driver so faults ACTUALLY fire during the run.
       ...(this.faults.faults.length > 0 ? { faults: this.faults } : {}),
+      // A3 (I-9): forward the queue-depth bound so the engine enforces it.
+      ...(this.maxQueueDepth !== undefined ? { maxQueueDepth: this.maxQueueDepth } : {}),
     })
     this.driver = driver
     this.machine = driver.machine
@@ -512,7 +546,12 @@ export class Simulator<T extends object = object> {
     const graph: ConfigGraph = buildConfigGraph(resolved.config)
     this.stateCount = Math.max(1, graph.states.size)
     if (this.invariants.length > 0) {
-      this.checkerCtx = { graph, header: driver.trace().header }
+      this.checkerCtx = {
+        graph,
+        header: driver.trace().header,
+        // A3 (I-9): give the queue-depth oracle the SAME bound the engine enforces.
+        ...(this.maxQueueDepth !== undefined ? { maxQueueDepth: this.maxQueueDepth } : {}),
+      }
     }
 
     // (1) MANDATORY post-construction drain (delegates to settleMacrostep).

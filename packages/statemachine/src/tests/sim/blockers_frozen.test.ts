@@ -376,9 +376,9 @@ describe('sim blockers — W5a verdict-plumbing (A1/A2/A4/A5/C2 unfrozen; C1 fro
     })
   })
 
-  // ── C1 — ЕЩЁ ЗАМОРОЖЕН (W5b): I-3 false-positive на легит WAITING_ON_TIMER ─
-  describe.skip('C1 — I-3 false-positive: a sibling parallel region\'s own pending future timer is misread as an RTC break (FROZEN→W5b)', () => {
-    it('a resolve-true settle boundary in region r1 is flagged I-3 even though the non-quiescence is r2\'s OWN unrelated future invoke timer (WAITING_ON_TIMER, not an RTC violation)', async () => {
+  // ── C1 — РАЗМОРОЖЕН (W5b): I-3 false-positive на легит WAITING_ON_TIMER ────
+  describe('C1 — I-3 false-positive: a sibling parallel region\'s own pending future timer is misread as an RTC break (fixed W5b)', () => {
+    it('a resolve-true settle boundary in region r1 is NOT flagged I-3 when the non-quiescence is r2\'s OWN unrelated future invoke timer (WAITING_ON_TIMER, not an RTC violation)', async () => {
       // ЧТО ФИКСИРУЕТ: composite `root` с параллельными регионами r1/r2. r1
       // имеет только событие 'go' (r1a->r1b), r2's initial state r2a arms an
       // invoke (delay:50) whose completion event ('R2_TICK') is intentionally
@@ -420,28 +420,26 @@ describe('sim blockers — W5a verdict-plumbing (A1/A2/A4/A5/C2 unfrozen; C1 fro
         { seed: '1', steps: 2, invariants: INVARIANTS },
       )
 
-      // HEAD-ФАКТ (прогон на remediation/w1-prep):
-      //   result.ok === false
-      //   result.violation.invariantId === 'I-3'
-      //   result.violation.step === 1
-      //   result.violation.observed === 'quiescent:false'
-      //   the step-1 boundary frame: fireOutcome:'resolve-true', event:'go',
-      //     to:'root.r1.r1b|root.r2.r2a', quiescent:false — a CORRECT,
-      //     non-buggy run flagged as a safety violation.
-      expect(result.ok).toBe(false)
-      expect(result.violation?.invariantId).toBe('I-3')
-      expect(result.violation?.step).toBe(1)
-      expect(result.violation?.observed).toBe('quiescent:false')
+      // HEAD-ФАКТ (прогон на remediation/w1-prep, ДО C1-фикса):
+      //   result.ok === false; result.violation.invariantId === 'I-3';
+      //   step 1; observed 'quiescent:false' — КОРРЕКТНЫЙ прогон помечен
+      //   safety-нарушением (false-positive).
+      //
+      // ПОСЛЕ ФИКСА (C1, W5b #21 — settle-reason проброшен в TraceFrame, I-3
+      // исключает WAITING_ON_*): тот же сценарий чисто проходит. Границу по-
+      // прежнему НЕ квиесцентна (r2 держит свой будущий invoke-таймер), но это
+      // ДОКУМЕНТИРОВАННЫЙ WAITING_ON_TIMER, не RTC-разрыв.
+      expect(result.ok).toBe(true)
+      expect(result.violation).toBeUndefined()
+
+      // Свидетель-якорь: граница step-1 всё ещё resolve-true + !quiescent, но
+      // несёт settleReason='WAITING_ON_TIMER' — ровно то, что фикс использует,
+      // чтобы отличить легитимный конкурентный wait от serialization-break.
       const boundaryFrame = result.trace.find((f) => f.step === 1 && f.event === 'go')
       expect(boundaryFrame?.fireOutcome).toBe('resolve-true')
       expect(boundaryFrame?.quiescent).toBe(false)
       expect(boundaryFrame?.errorClass).toBeUndefined()
-
-      // ПОСЛЕ ФИКСА (C1, W5b #21 — settle-reason threaded into TraceFrame,
-      // I-3 excludes any WAITING_ON_* boundary): the SAME scenario cleanly
-      // passes:
-      //   expect(result.ok).toBe(true)
-      //   expect(result.violation).toBeUndefined()
+      expect(boundaryFrame?.settleReason).toBe('WAITING_ON_TIMER')
     })
   })
 })

@@ -45,7 +45,7 @@ import {
 } from './faults'
 import { type FireResult, type SubmissionEntry, applyQueueFaults, applyThrowFaults, buildOverflowFlood, fireBuffered } from './harness'
 import type { Prng } from './prng'
-import { type SettlePolicy, settleMacrostep } from './settle'
+import { type SettlePolicy, type SettleReason, settleMacrostep } from './settle'
 import type { SimErrorHandler } from './sim-error-handler'
 import type { SimMonitor } from './sim-monitor'
 import {
@@ -236,7 +236,10 @@ export class SimDriver<T extends object> {
       seed: cfg.prng.seed.toString(),
       configHash: configHash(cfg.config),
       engine: '@vedmalex/statemachine',
-      version: '1',
+      // '2' (was '1'): the TraceFrame gained the hashed `settleReason` field (C1),
+      // so per the trace.ts version contract ("bump on hashed-field change") the
+      // schema version advances — a non-quiescent scenario now hashes differently.
+      version: '2',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,
@@ -488,7 +491,7 @@ export class SimDriver<T extends object> {
     const writes = this.sink.drain()
     for (const w of writes) {
       this.frames.push(
-        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied),
+        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied, result.reason),
       )
     }
 
@@ -508,6 +511,9 @@ export class SimDriver<T extends object> {
       ...(fireOutcome ? { fireOutcome } : {}),
       ...(errorClassOnFire ? { errorClass: errorClassOnFire } : {}),
       ...(faultApplied ? { faultApplied } : {}),
+      // C1: record WHY a non-quiescent boundary is non-quiescent so I-3 can exclude
+      // a legitimate WAITING_ON_* (a concurrent region's own future timer).
+      ...(result.reason ? { settleReason: result.reason } : {}),
     }
     this.frames.push(boundaryFrame)
 
@@ -762,6 +768,7 @@ export class SimDriver<T extends object> {
     event?: string,
     fireOutcome?: FireOutcome,
     faultApplied?: FaultKind,
+    settleReason?: SettleReason,
   ): TraceFrame {
     return {
       step: this.stepIndex,
@@ -774,6 +781,7 @@ export class SimDriver<T extends object> {
       ...(event ? { event } : {}),
       ...(fireOutcome ? { fireOutcome } : {}),
       ...(faultApplied ? { faultApplied } : {}),
+      ...(settleReason ? { settleReason } : {}),
     }
   }
 
