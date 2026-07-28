@@ -8,6 +8,7 @@ import {
 } from './serialize-actions'
 import { createDefaultMonitor } from './monitoring'
 import { createDefaultErrorHandler } from './error_handling'
+import { compileModel, type CompiledModel } from './model'
 import {
   type ActionOrString,
   type Adapter,
@@ -131,6 +132,15 @@ export class StateMachine<
 
   // Свойства
   private states: Map<keyof SMConfig['states'], State<TOwner>>
+  /**
+   * W2a: нормализованная модель конфига, скомпилированная ОДИН раз в
+   * конструкторе (см. model.ts). Единый источник детерминированного
+   * `documentIndex` / `depth` — используется для КАНОНИЧЕСКОГО порядка
+   * активной конфигурации (взамен порядка вставки в Map) и для depth-сортировки
+   * в checkCompletion (взамен `split('.').length`). Внутренний API для
+   * валидатора (W2b) и селекции (W3).
+   */
+  private model!: CompiledModel
   private events: Map<
     keyof SMConfig['events'],
     Event<TOwner, SMConfig['states']>
@@ -270,6 +280,11 @@ export class StateMachine<
       ]),
     )
     this.processStates(config.states)
+    // W2a: компилируем конфиг в нормализованную модель ОДИН раз, СРАЗУ после
+    // построения плоской карты состояний и ДО первой активации
+    // (setInitialState). Модель — источник детерминированного documentIndex,
+    // на который опирается канонический порядок активной конфигурации.
+    this.model = compileModel(config.states as any)
     if (adaptee) {
       this.persistenceAdapter = adaptee as unknown as StatePersistenceAdapter
       this.setInitialState(config.initialState as string)
@@ -1741,9 +1756,11 @@ export class StateMachine<
     if (stateConfig?.history === 'deep' && stateConfig.regions) {
       const historyState = this.historyMap.get(state)
       if (historyState && adaptee) {
+        // W2a: канонизируем восстановленную deep-history конфигурацию тем же
+        // documentIndex-порядком, что и прямой путь персистенции.
         adaptee.set(
           this.stateAttribute,
-          historyState as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
+          this.orderComposite(historyState) as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
         )
         return
       }
@@ -1817,7 +1834,12 @@ export class StateMachine<
       }
     }
 
-    const newCompositeState = Array.from(currentStateMap.values()).join('|')
+    // W2a: сериализуем активную конфигурацию в КАНОНИЧЕСКОМ documentIndex-порядке
+    // (взамен порядка вставки в Map), чтобы getCurrentState был детерминирован и
+    // не зависел от пути активации.
+    const newCompositeState = this.orderComposite(
+      Array.from(currentStateMap.values()).join('|'),
+    )
     this.validateCompositeState(newCompositeState)
     adaptee.set(
       this.stateAttribute,
@@ -2128,8 +2150,15 @@ export class StateMachine<
         seen.add(ancestor)
       }
     }
+    // W2a: DEEPEST-first по DEPTH МОДЕЛИ (взамен `split('.').length`). Для
+    // зарегистрированного композита оба метрики монотонны по вложенности, так
+    // что относительный «внутренний-раньше-внешнего» порядок неизменен; модель
+    // делает источник depth единым и детерминированным. Fallback на сегменты —
+    // только для узла вне модели (не должно случаться для композита-кандидата).
+    const depthFor = (id: string): number =>
+      this.model?.depthOf(id) ?? id.split('.').length
     const candidates = Array.from(seen).sort(
-      (a, b) => b.split('.').length - a.split('.').length,
+      (a, b) => depthFor(b) - depthFor(a),
     )
 
     const emitted = new Set<string>()
@@ -2974,7 +3003,9 @@ export class StateMachine<
 
     updatedParts = updatedParts.filter((part) => part !== null) as string[]
 
-    const newCompositeState = updatedParts.join('|')
+    // W2a: канонический documentIndex-порядок для восстановленной из истории
+    // конфигурации — тот же инвариант, что и на прямом пути персистенции.
+    const newCompositeState = this.orderComposite(updatedParts.join('|'))
     this.validateCompositeState(newCompositeState)
 
     return newCompositeState
@@ -3018,7 +3049,13 @@ export class StateMachine<
     // Clean up root states
     this.cleanupRootStates(currentStateMap)
 
-    const newCompositeState = Array.from(currentStateMap.values()).join('|')
+    // W2a: канонический documentIndex-порядок (взамен порядка вставки в Map).
+    // Держит `newState` — который computeEnterExitSets и setCurrentState
+    // потребляют дальше — детерминированным и независимым от порядка целевых
+    // частей transition.to (см. model_determinism часть B).
+    const newCompositeState = this.orderComposite(
+      Array.from(currentStateMap.values()).join('|'),
+    )
     this.validateCompositeState(newCompositeState)
     return newCompositeState
   }
@@ -3107,6 +3144,48 @@ export class StateMachine<
     return lastDotIndex === -1
       ? statePath
       : statePath.substring(0, lastDotIndex)
+  }
+
+  /**
+   * W2a: канонизировать серийный `|`-порядок композитного состояния по
+   * `documentIndex` модели.
+   *
+   * Взамен ПОРЯДКА ВСТАВКИ в Map (который зависит от ПУТИ активации — какой
+   * регион перезаписан последним) активная конфигурация упорядочивается по
+   * ПОЗИЦИИ листа в документе: тот же набор активных листов → тот же серийный
+   * порядок, независимо от пути активации/процесса (см. model_determinism
+   * часть B). Это НЕ смена правила селекции победителя (W3) — только источник
+   * ПОРЯДКА сериализации.
+   *
+   * Стабильна и тотальна: сортировка стабильная (равные documentIndex сохраняют
+   * относительный порядок), а лист, отсутствующий в модели (напр.
+   * root/error-псевдосостояние без регионов), получает документ-индекс +∞ и
+   * уходит в хвост, сохраняя исходный относительный порядок — так граничные
+   * строки не теряются и поведение для не-параллельных состояний неизменно.
+   */
+  private orderComposite(composite: string): string {
+    if (!composite || composite.indexOf('|') === -1) return composite
+    const parts = composite.split('|')
+    return parts
+      .map((part, index) => ({
+        part,
+        index,
+        di: this.model?.documentIndexOf(part) ?? Number.POSITIVE_INFINITY,
+      }))
+      .sort((a, b) => a.di - b.di || a.index - b.index)
+      .map((entry) => entry.part)
+      .join('|')
+  }
+
+  /**
+   * W2a internal API: скомпилированная нормализованная модель конфига.
+   * Потребители — валидатор (W2b) и селекция (W3). Не входит в публичную
+   * поверхность пакета (см. public_surface.test.ts): доступ только через
+   * инстанс, `src/index.ts` модель НЕ реэкспортирует.
+   * @internal
+   */
+  public getCompiledModel(): CompiledModel {
+    return this.model
   }
 
   private resumeTimers() {

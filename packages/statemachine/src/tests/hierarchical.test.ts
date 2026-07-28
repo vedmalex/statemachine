@@ -94,8 +94,15 @@ describe('StateMachine with hierarchical states using regions', () => {
     )
 
     await sm.fireEvent('toChild2')
+    // W2a: активная конфигурация сериализуется в КАНОНИЧЕСКОМ documentIndex-
+    // порядке (region1 раньше region2), а не в порядке вставки в Map. Тот же
+    // набор активных листов, что и в начальной конфигурации выше (строки 92-94,
+    // region1-first) → тот же серийный порядок, независимо от того, что
+    // перезаписан был лист region1. До W2a здесь фиксировался map-insertion
+    // артефакт 'region2|region1' (region1 пере-вставлялся в хвост Map при
+    // removeConflictingStates+set); канонизация по модели его устраняет.
     expect(sm.getCurrentState()).toBe(
-      'parentState.region2.childState1|parentState.region1.childState2',
+      'parentState.region1.childState2|parentState.region2.childState1',
     )
 
     await sm.fireEvent('toState1')
