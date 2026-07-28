@@ -101,6 +101,71 @@ function isReservedActionName(name: unknown): boolean {
 // `options.logger` still wins.
 const DefaultEngineLogger: ILogger = stateMachineLogger
 
+/**
+ * U7 / #15 (MASTER §4б) — TEST-ONLY perf counting probe. Symbol-gated on
+ * `globalThis` so the core public surface, exports, and `.d.ts` declarations
+ * are UNCHANGED: production never registers the probe, so no consumer can see
+ * it. The instrumented hot path ({@link StateMachine.computeInternalWrite})
+ * reads the probe ONCE per call into a local and the conflict-scan inner loop
+ * pays a single truthy check — near-zero overhead in the OFF (production) state.
+ *
+ * When a counting-probe test installs a probe object under
+ * {@link PERF_PROBE_KEY}, each unit of conflict-scan work in the region-write
+ * path increments `internalWriteScan`. This lets the probe ASSERT the write
+ * path grows O(R) (not Θ(R²)) in the region count R deterministically — a
+ * counted metric, not wall-clock ms (MASTER §4б: CI hardware makes ms flaky).
+ * Behaviour is unchanged; this is pure observability. See
+ * `src/tests/perf_counting.test.ts`.
+ */
+const PERF_PROBE_KEY = Symbol.for('@vedmalex/statemachine:perfProbe')
+
+interface SmPerfProbe {
+  /**
+   * Units of conflict-scan work performed by {@link StateMachine.computeInternalWrite}:
+   * incremented once per existing map entry examined while removing the region
+   * conflicts of an incoming composite part. Θ(R²) here would be the PERF-03
+   * regression; the probe asserts it stays O(R).
+   */
+  internalWriteScan: number
+  /**
+   * Units of region-membership work performed by {@link StateMachine.isCompositeDone}:
+   * incremented once per atomic-leaf comparison while locating each region's
+   * active leaf. The per-region full leaf scan made a completing R-region
+   * composite Θ(R²) (PERF-02, reached unconditionally from checkCompletion); the
+   * probe asserts it stays O(R) after the region→leaf index fix.
+   */
+  completionScan: number
+}
+
+/**
+ * Fetch the currently-installed {@link SmPerfProbe}, or `undefined` in the
+ * normal (production) case. One `globalThis` symbol read; callers cache it in a
+ * local so the guarded increment is a single truthy check.
+ */
+function currentPerfProbe(): SmPerfProbe | undefined {
+  // The probe key lives in the GLOBAL Symbol registry, so any code in the process
+  // could set it. Validate the shape: a non-object truthy value (or null) would
+  // make the guarded `probe.field++` throw a TypeError in strict-mode ESM and wedge
+  // the engine on every state write. Only accept an actual object; anything else is
+  // treated as "no probe".
+  const v = (globalThis as Record<symbol, unknown>)[PERF_PROBE_KEY]
+  return typeof v === 'object' && v !== null ? (v as SmPerfProbe) : undefined
+}
+
+/**
+ * Number of `.` segments-boundaries in a region key (allocation-free). Used by
+ * {@link StateMachine.computeInternalWrite} to gate the descendant conflict
+ * scan (PERF-03): a strict descendant of a region key is always deeper, so a
+ * scan is needed only when a key deeper than the incoming one can exist.
+ */
+function countDots(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 46 /* '.' */) n++
+  }
+  return n
+}
+
 interface StateInfo {
   name: string
   display?: string
@@ -196,6 +261,15 @@ export class StateMachine<
     string,
     PreparedTransition<TOwner, SMConfig['states']>[]
   >
+  /**
+   * U7/#15 (PERF-02): `true` iff the config declares at least one
+   * `done.state.<C>` completion event. Precomputed ONCE (the declared event set
+   * is immutable) so {@link checkCompletion} can early-return without touching
+   * the per-write completion machinery when no completion event can ever fire —
+   * the common case. Every `done.state.<C>` emission is already gated on
+   * `this.events.has(...)`, so skipping is behaviour-identical.
+   */
+  private readonly hasCompletionEvents: boolean
   private stateAttribute: KeysOf<PropertiesOf<TOwner>, string>
   private onError?: ErrorHandlerOrString<TOwner>
   private adaptee?: Adapter<PropertiesOf<TOwner>>
@@ -373,6 +447,17 @@ export class StateMachine<
         },
       ]),
     )
+    // U7/#15 (PERF-02): does ANY declared event name denote a completion event?
+    // Computed once so checkCompletion can skip its per-write work when none can
+    // ever be raised.
+    let anyCompletion = false
+    for (const name of this.events.keys()) {
+      if (String(name).startsWith('done.state.')) {
+        anyCompletion = true
+        break
+      }
+    }
+    this.hasCompletionEvents = anyCompletion
     this.processStates(config.states)
     // W2a: компилируем конфиг в нормализованную модель ОДИН раз, СРАЗУ после
     // построения плоской карты состояний и ДО первой активации
@@ -2551,6 +2636,9 @@ export class StateMachine<
   ): string {
     const currentStateMap = this.parseCompositeState(currentState || '')
 
+    // U7/#15: TEST-ONLY perf probe, read ONCE per call (undefined in prod).
+    const perfProbe = currentPerfProbe()
+
     const newStateParts = state.split('|')
     // D1: a bare-root composite that declares regions must NOT short-circuit
     // as a simple root; it falls through to the region-expansion branch below
@@ -2564,6 +2652,22 @@ export class StateMachine<
       currentStateMap.clear()
       currentStateMap.set(state, state)
     } else {
+      // U7/#15 (PERF-03): the per-part conflict removal below previously scanned
+      // the WHOLE (growing) config map for every incoming part, so writing an
+      // R-region composite configuration (R parts × up-to-R entries) was Θ(R²).
+      // It is replaced by two behaviour-identical but cheaper steps: (1)+(3) an
+      // O(depth) exact-match + ancestor prefix-walk, and (2) a strict-descendant
+      // scan GATED on `maxRegionDots` — the monotonic upper bound on any key's
+      // depth. A descendant of `regionKey` is always deeper, so when no key can
+      // be deeper the scan is provably empty and is skipped, which is exactly the
+      // flat sibling-parallel write that dominates. Union of deletions (and thus
+      // the resulting configuration) is identical to the old full scan.
+      let maxRegionDots = 0
+      for (const key of currentStateMap.keys()) {
+        const d = countDots(key)
+        if (d > maxRegionDots) maxRegionDots = d
+      }
+
       for (const newStatePart of newStateParts) {
         if (!this.states.has(newStatePart)) {
           throw new StateMachineError(
@@ -2575,13 +2679,25 @@ export class StateMachine<
         const regionKey = this.getRegionKey(newStatePart)
         const stateConfig = this.states.get(newStatePart)
 
-        for (const [existingRegionKey] of currentStateMap.entries()) {
-          if (
-            existingRegionKey === regionKey ||
-            existingRegionKey.startsWith(regionKey + '.') ||
-            regionKey.startsWith(existingRegionKey + '.')
-          ) {
-            currentStateMap.delete(existingRegionKey)
+        // (1) exact match + (3) every ancestor prefix of regionKey — O(depth).
+        let ancestor: string | undefined = regionKey
+        while (ancestor !== undefined) {
+          if (perfProbe) perfProbe.internalWriteScan++
+          currentStateMap.delete(ancestor)
+          const dot = ancestor.lastIndexOf('.')
+          ancestor = dot === -1 ? undefined : ancestor.substring(0, dot)
+        }
+        // (2) strict descendants of regionKey (existing.startsWith(regionKey+'.')):
+        // only reachable when a deeper key can exist. For the flat write every
+        // key shares regionKey's depth, so the guard is false and the Θ(R²) scan
+        // never runs; genuine hierarchical replacement (small R) still scans.
+        if (maxRegionDots > countDots(regionKey)) {
+          const descPrefix = regionKey + '.'
+          for (const existingRegionKey of currentStateMap.keys()) {
+            if (perfProbe) perfProbe.internalWriteScan++
+            if (existingRegionKey.startsWith(descPrefix)) {
+              currentStateMap.delete(existingRegionKey)
+            }
           }
         }
 
@@ -2597,9 +2713,13 @@ export class StateMachine<
           for (const regionState of regionStates) {
             const regionKeyNested = this.getRegionKey(regionState)
             currentStateMap.set(regionKeyNested, regionState)
+            const nd = countDots(regionKeyNested)
+            if (nd > maxRegionDots) maxRegionDots = nd
           }
         } else {
           currentStateMap.set(regionKey, newStatePart)
+          const nd = countDots(regionKey)
+          if (nd > maxRegionDots) maxRegionDots = nd
         }
       }
 
@@ -2908,11 +3028,28 @@ export class StateMachine<
     const regions = this.states.get(compositeId)?.regions
     if (!regions) return false
 
+    // U7/#15 (PERF-02): the previous per-region `atomicLeaves.find` scanned all R
+    // leaves for each of the R regions, so a completing R-region composite was
+    // Θ(R²) — and checkCompletion reaches this unconditionally on every write.
+    // Instead index the leaves by their region segment in ONE O(R) pass, then
+    // resolve each region in O(1). First-seen-per-region reproduces `find`'s
+    // first-match; a leaf that is not `${compositeId}.<segment>.…` is ignored.
+    const perfProbe = currentPerfProbe()
+    const prefix = `${compositeId}.`
+    const leafByRegion = new Map<string, string>()
+    for (const leaf of atomicLeaves) {
+      if (perfProbe) perfProbe.completionScan++
+      if (!leaf.startsWith(prefix)) continue
+      const rest = leaf.slice(prefix.length)
+      const dot = rest.indexOf('.')
+      if (dot === -1) continue
+      const regionName = rest.slice(0, dot)
+      if (!leafByRegion.has(regionName)) leafByRegion.set(regionName, leaf)
+    }
+
     for (const regionName of Object.keys(regions)) {
       const regionPrefix = `${compositeId}.${regionName}.`
-      const activeLeaf = atomicLeaves.find((leaf) =>
-        leaf.startsWith(regionPrefix),
-      )
+      const activeLeaf = leafByRegion.get(regionName)
       if (!activeLeaf) return false
 
       // Determine whether the region's active sub-configuration is complete.
@@ -3002,6 +3139,12 @@ export class StateMachine<
     oldState: string,
     newState: string,
   ): void {
+    // U7/#15 (PERF-02): every path below exists only to raise a `done.state.<C>`
+    // event, and each raise is already gated on `this.events.has(...)`. When the
+    // config declares NO completion event, the whole scan (incl. the O(R)
+    // isCompositeDone probes) is dead work on every write — skip it wholesale.
+    if (!this.hasCompletionEvents) return
+
     const atomicLeaves = newState.split('|').filter(Boolean)
     if (atomicLeaves.length === 0) return
 
