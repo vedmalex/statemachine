@@ -9,6 +9,7 @@ import {
 import { createDefaultMonitor } from './monitoring'
 import { createDefaultErrorHandler } from './error_handling'
 import { compileModel, type CompiledModel } from './model'
+import { MODEL_ERROR_CODES, validateConfig } from './config_validator'
 import {
   type ActionOrString,
   type Adapter,
@@ -285,6 +286,23 @@ export class StateMachine<
     // (setInitialState). Модель — источник детерминированного documentIndex,
     // на который опирается канонический порядок активной конфигурации.
     this.model = compileModel(config.states as any)
+
+    // SPEC §1а throw policy: MODEL errors (broken paths, unsatisfiable
+    // transitions, a region with no path to final, a region starting final, a
+    // duplicate region id) make the machine UNBUILDABLE — throw at construction
+    // instead of logging "validation failed" and building a broken machine (V6).
+    // Advisory warnings stay non-fatal and remain available via validateConfig.
+    const modelErrors = validateConfig(config as any).errors.filter((e) =>
+      MODEL_ERROR_CODES.has(e.code),
+    )
+    if (modelErrors.length > 0) {
+      throw new StateMachineError(
+        `StateMachine config "${config.name}" has model errors that make it unbuildable: ` +
+          modelErrors.map((e) => `${e.code} (${e.path}): ${e.message}`).join('; '),
+        {},
+      )
+    }
+
     if (adaptee) {
       this.persistenceAdapter = adaptee as unknown as StatePersistenceAdapter
       this.setInitialState(config.initialState as string)

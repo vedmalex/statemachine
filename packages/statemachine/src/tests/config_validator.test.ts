@@ -360,8 +360,11 @@ describe('Configuration Validator', () => {
     })
 
     it('should validate config with custom settings', () => {
+      // NB (W2b/V10): strict mode now PROMOTES warnings to errors, so a
+      // performance advisory like TOO_MANY_STATES would flip isValid under
+      // strictMode. This test's intent is "custom settings surface the advisory
+      // and stay valid", so it uses the (non-strict) custom bound directly.
       const result = validateConfig(validConfig as any, {
-        strictMode: true,
         maxStatesCount: 2,
       })
 
@@ -695,6 +698,12 @@ describe('Configuration Validator', () => {
           aborted: {},
         },
         events: {
+          // W2b: give region r1 a real path to its final leaf so the (new,
+          // model-based) REGION_NO_PATH_TO_FINAL check stays quiet — this fixture
+          // is about the done/parallel-exit AMBIGUITY, not an unreachable final.
+          win: {
+            transitions: [{ from: 'game.r1.playing', to: 'game.r1.won' }],
+          },
           'done.state.game': {
             transitions: [{ from: 'game', to: 'over' }],
           },

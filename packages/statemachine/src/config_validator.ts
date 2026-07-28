@@ -1,9 +1,16 @@
 /**
  * Configuration validation module for StateMachine library
- * Validates StateMachine configurations to prevent runtime errors
+ * Validates StateMachine configurations to prevent runtime errors.
+ *
+ * W2b (SPEC §1а/§1б, defects F10 / П11): the validator CONSUMES the normalized
+ * model (`compileModel`, src/model.ts) instead of re-parsing dotted paths with a
+ * third ad-hoc "valid path" implementation. Every path / initial / reachability /
+ * region question is answered against the SAME model the runtime uses, so a config
+ * the runtime accepts is never spuriously rejected (F10/V1/V2/V4/V11/V12), and the
+ * genuinely-broken configs the runtime throws on are caught up front.
  */
 
-// Removed unused imports from error_handling
+import { type CompiledModel, compileModel, type ModelNode } from './model'
 import { stateMachineLogger } from './logger'
 import type { Event, Events, State, StateMachineConfig, States } from './types'
 
@@ -12,15 +19,20 @@ export interface ValidationResult {
   isValid: boolean
   errors: ValidationError[]
   warnings: ValidationWarning[]
+  /**
+   * Advisory INFO-level notes (severity `'info'`). Never affect `isValid` and are
+   * never promoted by strict mode — purely advisory selection/migration hints
+   * (e.g. WILDCARD_SHADOWED). Additive surface (TASK W2b).
+   */
+  infos: ValidationInfo[]
 }
 
 export interface ValidationError {
   code: string
   message: string
-  severity: 'error' | 'warning'
+  severity: 'error' | 'warning' | 'info'
   path: string
   details?: Record<string, any>
-  // ✅ НОВЫЕ ПОЛЯ
   suggestion?: string // Текстовая подсказка "Как исправить"
   documentationUrl?: string // Ссылка на раздел документации
 }
@@ -29,7 +41,11 @@ export interface ValidationWarning extends ValidationError {
   severity: 'warning'
 }
 
-// ✅ НОВЫЕ ИНТЕРФЕЙСЫ ДЛЯ КАСТОМНЫХ ПРАВИЛ
+export interface ValidationInfo extends ValidationError {
+  severity: 'info'
+}
+
+// Custom-rule extension surface
 interface ValidationContext {
   addError(
     code: string,
@@ -61,7 +77,7 @@ export interface ValidationConfig {
   requireInitialState: boolean
   validateTransitionPaths: boolean
   validateActionReferences: boolean
-  customRules?: CustomRule[] // ✅ Добавлено
+  customRules?: CustomRule[]
 }
 
 export const DEFAULT_VALIDATION_CONFIG: ValidationConfig = {
@@ -73,14 +89,45 @@ export const DEFAULT_VALIDATION_CONFIG: ValidationConfig = {
   maxEventsCount: 1000,
   requireInitialState: true,
   validateTransitionPaths: true,
-  validateActionReferences: false, // Disabled by default as actions might be dynamic
+  validateActionReferences: false,
 }
+
+/**
+ * Error codes that make a machine genuinely UNBUILDABLE — a broken transition
+ * path the runtime cannot honor at all. Per SPEC §1а (V6) these THROW at machine
+ * construction rather than logging "validation failed" and building a broken
+ * machine.
+ *
+ * Scope note: the OTHER model errors (REGION_STARTS_FINAL, REGION_NO_PATH_TO_FINAL,
+ * UNSATISFIABLE_FROM, DUPLICATE_REGION_NAME) are still reported as validateConfig
+ * ERRORS (isValid:false, promoted by strict mode, surfaced programmatically) but
+ * do NOT throw at construction, because the runtime DELIBERATELY supports those
+ * degenerate configurations — a composite with a single `final` leaf that joins
+ * immediately (D12 all-final initial config; the run-away / finite-cascade
+ * suites), a region that never completes (negative all-final join tests), and the
+ * flattened toJSON/fromJSON round-trip form. Throwing on them would delete tested
+ * runtime behavior. Broken PATHS have no such legitimate runtime use, so they
+ * alone are fatal.
+ */
+export const MODEL_ERROR_CODES: ReadonlySet<string> = new Set(['INVALID_STATE_PATH'])
 
 // Configuration validator class
 export class ConfigValidator {
   private config: ValidationConfig
   private errors: ValidationError[] = []
   private warnings: ValidationWarning[] = []
+  private infos: ValidationInfo[] = []
+
+  // ── model index (built once per validate()) ────────────────────────────────
+  private model: CompiledModel | null = null
+  /** Non-region node id → its raw config (for `initial`/`invoke` payloads). */
+  private stateCfgById = new Map<string, any>()
+  /** Region node id → its raw region-states config. */
+  private regionCfgById = new Map<string, any>()
+  /** id → {state,region} mint counts (collision detection). */
+  private idCounts = new Map<string, { state: number; region: number }>()
+  private reachableSet = new Set<string>()
+  private enterMemo = new Set<string>()
 
   constructor(config: Partial<ValidationConfig> = {}) {
     this.config = { ...DEFAULT_VALIDATION_CONFIG, ...config }
@@ -94,22 +141,48 @@ export class ConfigValidator {
   ): ValidationResult {
     this.errors = []
     this.warnings = []
+    this.infos = []
+    this.model = null
+    this.stateCfgById.clear()
+    this.regionCfgById.clear()
+    this.idCounts.clear()
+    this.reachableSet.clear()
+    this.enterMemo.clear()
 
     try {
       // Basic structure validation
       this.validateBasicStructure(smConfig)
 
-      // States validation
-      this.validateStates(smConfig.states, 'states')
+      // Build the normalized model ONCE (only when states is a usable object).
+      const statesOk =
+        smConfig.states && typeof smConfig.states === 'object'
+      if (statesOk) {
+        this.buildModelIndex(smConfig.states as States<T>)
+      }
 
-      // Events validation
-      this.validateEvents(smConfig.events, smConfig.states, 'events')
+      // States validation (structural: names, regions shape, history, invoke)
+      if (smConfig.states && typeof smConfig.states === 'object') {
+        this.validateStates(smConfig.states, 'states')
+      }
 
-      // Initial state validation
+      // Events validation (transition path validity via model)
+      if (
+        smConfig.events &&
+        typeof smConfig.events === 'object' &&
+        this.model
+      ) {
+        this.validateEvents(smConfig.events, smConfig.states, 'events')
+      }
+
+      // Initial state validation (top-level root + composite/region pointers)
       this.validateInitialState(smConfig)
+      if (this.model) this.validateInitialPointers()
 
-      // Cross-references validation
-      this.validateCrossReferences(smConfig)
+      // Cross-references: reachability + unused events (MODEL-based)
+      if (this.model) {
+        this.buildReachable(smConfig)
+        this.validateCrossReferences(smConfig)
+      }
 
       // Performance validation
       this.validatePerformanceConstraints(smConfig)
@@ -117,7 +190,14 @@ export class ConfigValidator {
       // SCXML/UML final-state + done.state join validation
       this.validateFinalStates(smConfig)
 
-      // ✅ Запуск кастомных правил
+      // Model-structural correctness (§1а): collisions, region-starts-final,
+      // region-no-path-to-final, unsatisfiable composite `from`, dead ends.
+      if (this.model) {
+        this.validateModelStructure(smConfig)
+        this.validateSelectionWarnings(smConfig)
+      }
+
+      // Custom rules
       this.runCustomRules(smConfig)
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
@@ -128,13 +208,23 @@ export class ConfigValidator {
       )
     }
 
+    // V10 (SPEC §1а): strict mode PROMOTES advisory warnings to errors so that
+    // validateConfigStrict actually fails (docs previously lied — it did not).
+    // INFO notes stay advisory and are never promoted.
+    if (this.config.strictMode && this.warnings.length > 0) {
+      for (const w of this.warnings) {
+        this.errors.push({ ...w, severity: 'error' })
+      }
+      this.warnings = []
+    }
+
     const result: ValidationResult = {
       isValid: this.errors.length === 0,
       errors: this.errors,
       warnings: this.warnings,
+      infos: this.infos,
     }
 
-    // Log validation results
     if (!result.isValid) {
       stateMachineLogger.error('StateMachine configuration validation failed', {
         errorCount: this.errors.length,
@@ -151,9 +241,170 @@ export class ConfigValidator {
     return result
   }
 
+  // ── model index construction ────────────────────────────────────────────────
+
   /**
-   * Runs custom validation rules
+   * Compile the config into the normalized model and build the auxiliary maps
+   * the validator needs (config-by-id, region-config-by-id) plus a mint-count map
+   * for collision detection. The compiled model is the SINGLE source of truth for
+   * node kind / depth / parent / children / documentIndex / isFinal.
    */
+  private buildModelIndex(states: States<any>): void {
+    this.model = compileModel(states as any)
+
+    const bump = (id: string, kind: 'state' | 'region') => {
+      let c = this.idCounts.get(id)
+      if (!c) {
+        c = { state: 0, region: 0 }
+        this.idCounts.set(id, c)
+      }
+      c[kind] += 1
+    }
+
+    const walkStates = (st: Record<string, any>, parent: string | null) => {
+      if (!st || typeof st !== 'object') return
+      for (const [name, value] of Object.entries(st)) {
+        if (name === 'initial') continue
+        const id = parent ? `${parent}.${name}` : name
+        bump(id, 'state')
+        this.stateCfgById.set(id, value)
+        const regions = value?.regions
+        if (regions && typeof regions === 'object') {
+          for (const [rn, rs] of Object.entries(regions)) {
+            const rid = `${id}.${rn}`
+            bump(rid, 'region')
+            this.regionCfgById.set(rid, rs)
+            walkStates(rs as Record<string, any>, rid)
+          }
+        }
+      }
+    }
+    walkStates(states as Record<string, any>, null)
+  }
+
+  // ── model query helpers ─────────────────────────────────────────────────────
+
+  private nodeOf(id: string): ModelNode | undefined {
+    return this.model?.nodes.get(id)
+  }
+
+  /** True when `id` names a real, addressable state (leaf or composite) — NOT a region container, NOT missing. */
+  private isAddressableState(id: string): boolean {
+    const n = this.nodeOf(id)
+    return !!n && n.kind !== 'region'
+  }
+
+  /**
+   * True when `part` is a runtime wildcard: the bare `'*'` (any state), or a
+   * suffix wildcard `'<prefix>.*'` (any state under prefix). The runtime matches
+   * these dynamically (state_machine.ts isTransitionPossible), so the validator
+   * must NOT reject them as nonexistent paths (V2).
+   */
+  private isWildcardPart(part: string): boolean {
+    return part.includes('*')
+  }
+
+  /** Nearest ancestor of `id` whose kind is 'region', or null. */
+  private nearestRegionAncestor(id: string): string | null {
+    let cur = this.nodeOf(id)?.parent ?? null
+    while (cur) {
+      const n = this.nodeOf(cur)
+      if (!n) break
+      if (n.kind === 'region') return cur
+      cur = n.parent
+    }
+    return null
+  }
+
+  /** True when `a` is a proper ancestor of `b` in the model tree. */
+  private isAncestor(a: string, b: string): boolean {
+    if (a === b) return false
+    let cur = this.nodeOf(b)?.parent ?? null
+    while (cur) {
+      if (cur === a) return true
+      cur = this.nodeOf(cur)?.parent ?? null
+    }
+    return false
+  }
+
+  /** Region entry child id (region.initial || first key), NOT recursively resolved. */
+  private resolveRegionInitialChildId(regionId: string): string | undefined {
+    const rs = this.regionCfgById.get(regionId)
+    if (!rs || typeof rs !== 'object') return undefined
+    const keys = Object.keys(rs).filter((k) => k !== 'initial')
+    const initKey =
+      typeof rs.initial === 'string' && rs.initial ? rs.initial : keys[0]
+    if (!initKey) return undefined
+    return `${regionId}.${initKey}`
+  }
+
+  // ── reachability (model-based) ───────────────────────────────────────────────
+
+  /**
+   * Build the over-approximate reachable set. Seeds with the initial
+   * configuration (initialState expanded through the model — including region
+   * entry leaves, which are NEVER an explicit `to` target and were the F10 source
+   * of false UNREACHABLE) and every transition `to` part (each '|' branch), each
+   * expanded to the full active configuration it enters.
+   */
+  private buildReachable<T extends object>(smConfig: StateMachineConfig<T>): void {
+    this.reachableSet.clear()
+    this.enterMemo.clear()
+    if (!this.model) return
+
+    if (smConfig.initialState) {
+      this.markConfiguration(String(smConfig.initialState))
+    }
+
+    for (const event of Object.values(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+      for (const t of event.transitions) {
+        if (typeof t?.to !== 'string') continue
+        for (const part of t.to.split('|')) {
+          if (!part || this.isWildcardPart(part)) continue
+          if (this.model.nodes.has(part)) this.markConfiguration(part)
+        }
+      }
+    }
+  }
+
+  /** Mark the full active configuration that contains `id` (id + ancestors, and all sibling regions of composite ancestors at their initials). */
+  private markConfiguration(id: string): void {
+    const model = this.model
+    if (!model?.nodes.has(id)) return
+    let cur: string | null = id
+    while (cur) {
+      this.reachableSet.add(cur)
+      const node: ModelNode | undefined = model.nodes.get(cur)
+      if (!node) break
+      if (node.kind === 'composite') this.enterAllRegions(cur)
+      else if (node.kind === 'region') this.enterRegionInitial(cur)
+      cur = node.parent
+    }
+  }
+
+  private enterAllRegions(compositeId: string): void {
+    if (this.enterMemo.has(compositeId)) return
+    this.enterMemo.add(compositeId)
+    const node = this.model!.nodes.get(compositeId)
+    if (!node) return
+    for (const child of node.children) {
+      // children of a composite are region containers
+      this.reachableSet.add(child)
+      this.enterRegionInitial(child)
+    }
+  }
+
+  private enterRegionInitial(regionId: string): void {
+    const childId = this.resolveRegionInitialChildId(regionId)
+    if (!childId || !this.model!.nodes.has(childId)) return
+    this.reachableSet.add(childId)
+    const c = this.model!.nodes.get(childId)!
+    if (c.kind === 'composite') this.enterAllRegions(childId)
+  }
+
+  // ── custom rules ─────────────────────────────────────────────────────────────
+
   private runCustomRules<T extends object>(
     smConfig: StateMachineConfig<T>,
   ): void {
@@ -182,13 +433,8 @@ export class ConfigValidator {
   private validateBasicStructure<T extends object>(
     smConfig: StateMachineConfig<T>,
   ): void {
-    // Required fields
     if (!smConfig.name || typeof smConfig.name !== 'string') {
-      this.addError(
-        'MISSING_NAME',
-        'StateMachine must have a valid name',
-        'name',
-      )
+      this.addError('MISSING_NAME', 'StateMachine must have a valid name', 'name')
     }
 
     if (
@@ -220,7 +466,6 @@ export class ConfigValidator {
       return
     }
 
-    // Empty collections check
     if (
       !this.config.allowEmptyStates &&
       Object.keys(smConfig.states).length === 0
@@ -259,6 +504,7 @@ export class ConfigValidator {
     }
 
     for (const [stateName, stateConfig] of Object.entries(states)) {
+      if (stateName === 'initial') continue
       const statePath = `${basePath}.${stateName}`
       this.validateState(stateConfig, statePath, depth)
     }
@@ -269,12 +515,10 @@ export class ConfigValidator {
     path: string,
     depth: number,
   ): void {
-    // State name validation
     if (!path.split('.').pop()) {
       this.addError('INVALID_STATE_NAME', 'State name cannot be empty', path)
     }
 
-    // Display name validation
     if (state.display && typeof state.display !== 'string') {
       this.addWarning(
         'INVALID_DISPLAY',
@@ -283,7 +527,8 @@ export class ConfigValidator {
       )
     }
 
-    // Regions validation
+    // Regions validation (structure only; INVALID_INITIAL_STATE is now handled
+    // model-side by validateInitialPointers, not by a naive key-membership check).
     if (state.regions) {
       if (typeof state.regions !== 'object') {
         this.addError(
@@ -313,7 +558,6 @@ export class ConfigValidator {
       }
     }
 
-    // History validation
     if (state.history && !['deep', 'shallow'].includes(state.history)) {
       this.addError(
         'INVALID_HISTORY',
@@ -322,21 +566,6 @@ export class ConfigValidator {
       )
     }
 
-    // Initial state validation for regions
-    if (state.regions && state.initial) {
-      const hasInitialState = Object.values(state.regions).some(
-        (regionStates) => Object.keys(regionStates).includes(state.initial!),
-      )
-      if (!hasInitialState) {
-        this.addError(
-          'INVALID_INITIAL_STATE',
-          `Initial state "${state.initial}" not found in any region`,
-          `${path}.initial`,
-        )
-      }
-    }
-
-    // Invoke (StateInvocation) validation
     if (state.invoke) {
       if (!Array.isArray(state.invoke)) {
         this.addError(
@@ -387,9 +616,8 @@ export class ConfigValidator {
   private validateEvent<T extends object>(
     event: Omit<Event<T, States<T>>, 'name'>,
     path: string,
-    states: States<T>,
+    _states: States<T>,
   ): void {
-    // Transitions validation
     if (!event.transitions || !Array.isArray(event.transitions)) {
       this.addError(
         'MISSING_TRANSITIONS',
@@ -407,16 +635,12 @@ export class ConfigValidator {
       )
     }
 
-    // Validate each transition
     event.transitions.forEach((transition, index) => {
-      this.validateTransition(
-        transition,
-        `${path}.transitions[${index}]`,
-        states,
-      )
+      this.validateTransition(transition, `${path}.transitions[${index}]`)
     })
 
-    // Priority validation
+    // Priority validation (MIXED_PRIORITIES — retained; PRIORITY_INVERTS_DOMINANCE
+    // is added alongside in validateSelectionWarnings per SPEC §1а W3 note).
     const priorities = event.transitions
       .map((t) => t.priority)
       .filter((p) => p !== undefined) as number[]
@@ -433,12 +657,7 @@ export class ConfigValidator {
     }
   }
 
-  private validateTransition<T extends object>(
-    transition: any,
-    path: string,
-    states: States<T>,
-  ): void {
-    // From state validation
+  private validateTransition(transition: any, path: string): void {
     if (!transition.from || typeof transition.from !== 'string') {
       this.addError(
         'INVALID_FROM_STATE',
@@ -446,10 +665,9 @@ export class ConfigValidator {
         `${path}.from`,
       )
     } else if (this.config.validateTransitionPaths) {
-      this.validateStatePath(transition.from, states, `${path}.from`)
+      this.validateStatePath(transition.from, `${path}.from`)
     }
 
-    // To state validation
     if (!transition.to || typeof transition.to !== 'string') {
       this.addError(
         'INVALID_TO_STATE',
@@ -457,10 +675,9 @@ export class ConfigValidator {
         `${path}.to`,
       )
     } else if (this.config.validateTransitionPaths) {
-      this.validateStatePath(transition.to, states, `${path}.to`)
+      this.validateStatePath(transition.to, `${path}.to`)
     }
 
-    // Priority validation
     if (
       transition.priority !== undefined &&
       typeof transition.priority !== 'number'
@@ -472,7 +689,6 @@ export class ConfigValidator {
       )
     }
 
-    // Self-transition warning
     if (transition.from === transition.to) {
       this.addWarning(
         'SELF_TRANSITION',
@@ -482,75 +698,33 @@ export class ConfigValidator {
     }
   }
 
-  private validateStatePath<T extends object>(
-    statePath: string,
-    states: States<T>,
-    path: string,
-  ): void {
-    // Handle composite states (separated by |)
-    const stateParts = statePath.split('|')
-
-    for (const part of stateParts) {
-      if (!this.isValidStatePath(part, states)) {
+  /**
+   * Validate a `from`/`to` expression against the model. Splits composite `|`
+   * targets (V11 — same split reachability/UNUSED use). A `'*'` wildcard is
+   * runtime-supported (V2) and always valid. A part that resolves to a REGION
+   * CONTAINER is invalid (V4 — the runtime throws on entering a bare region).
+   */
+  private validateStatePath(expr: string, path: string): void {
+    if (!this.model) return
+    for (const part of expr.split('|')) {
+      if (this.isWildcardPart(part)) continue // '*' or '<prefix>.*' (V2)
+      const node = this.model.nodes.get(part)
+      if (!node) {
         this.addError(
           'INVALID_STATE_PATH',
           `State path "${part}" does not exist`,
           path,
         )
+      } else if (node.kind === 'region') {
+        this.addError(
+          'INVALID_STATE_PATH',
+          `State path "${part}" refers to a region container, not an addressable state`,
+          path,
+          undefined,
+          `Target a concrete leaf/composite inside region "${part}" (e.g. "${part}.<leaf>"), not the region container itself.`,
+        )
       }
     }
-  }
-
-  private isValidStatePath<T extends object>(
-    statePath: string,
-    states: States<T>,
-  ): boolean {
-    const parts = statePath.split('.')
-    let currentStates = states
-
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i]
-      if (part === undefined) return false
-
-      if (i === 0) {
-        // Root state
-        if (!currentStates[part]) {
-          return false
-        }
-        const state = currentStates[part]
-        if (parts.length === 1) {
-          return true // Simple state path
-        }
-        if (!state.regions) {
-          return false // No regions but path continues
-        }
-        // Continue with regions
-      } else if (i === 1) {
-        // Region name
-        const rootStatePart = parts[0]
-        if (rootStatePart === undefined) return false
-        const rootState = currentStates[rootStatePart]
-        if (!rootState || !rootState.regions || !rootState.regions[part]) {
-          return false
-        }
-        currentStates = rootState.regions[part]
-      } else {
-        // Nested state in region
-        if (!currentStates[part]) {
-          return false
-        }
-        const state = currentStates[part]
-        if (i === parts.length - 1) {
-          return true // Last part
-        }
-        if (!state.regions) {
-          return false
-        }
-        // Continue deeper...
-      }
-    }
-
-    return true
   }
 
   private validateInitialState<T extends object>(
@@ -578,63 +752,106 @@ export class ConfigValidator {
     }
   }
 
-  private validateCrossReferences<T extends object>(
-    smConfig: StateMachineConfig<T>,
-  ): void {
-    // Collect all state names (including nested)
-    const allStateNames = new Set<string>()
-    this.collectStateNames(smConfig.states, '', allStateNames)
+  /**
+   * F10 (SPEC §1а): resolve composite/region `initial` pointers THROUGH THE MODEL,
+   * exactly as the runtime does — a region-qualified dotted initial ("a.run"), a
+   * parallel composite initial ("a.run|b.run"), and a bare leaf name shared across
+   * regions ("child1") all resolve to real nodes and must NOT be rejected. Only a
+   * pointer that resolves to no addressable node (a GHOST) is flagged.
+   */
+  private validateInitialPointers(): void {
+    if (!this.model) return
+    for (const [id, node] of this.model.nodes) {
+      if (node.kind !== 'composite') continue
+      const cfg = this.stateCfgById.get(id)
 
-    // Event names are available through Object.keys(smConfig.events)
+      // composite-level initial (may be `|`-joined / dotted / bare)
+      if (cfg && typeof cfg.initial === 'string') {
+        for (const part of cfg.initial.split('|')) {
+          if (!part) continue
+          if (!this.resolveCompositeInitialPart(id, part)) {
+            this.addError(
+              'INVALID_INITIAL_STATE',
+              `Initial state "${part}" of composite "${id}" resolves to no state in any region`,
+              `states.${id}.initial`,
+              undefined,
+              `Point \`initial\` at an existing leaf — a bare leaf name present in every region, or a region-qualified path like "<region>.<leaf>".`,
+            )
+          }
+        }
+      }
 
-    // Check for unreachable states
-    const reachableStates = new Set<string>()
-    if (smConfig.initialState) {
-      reachableStates.add(smConfig.initialState as string)
-    }
-
-    // Add states reachable through transitions
-    for (const event of Object.values(smConfig.events)) {
-      for (const transition of event.transitions) {
-        if (transition.to) {
-          const toParts = transition.to.split('|')
-          toParts.forEach((part) => reachableStates.add(part))
+      // region-level initial (GHOST): region config `initial` must name a real leaf
+      for (const regionId of node.children) {
+        const rs = this.regionCfgById.get(regionId)
+        if (rs && typeof rs.initial === 'string' && rs.initial) {
+          const target = `${regionId}.${rs.initial}`
+          if (!this.isAddressableState(target)) {
+            const regionName = regionId.slice(id.length + 1)
+            this.addError(
+              'INVALID_INITIAL_STATE',
+              `Region initial "${rs.initial}" of region "${regionName}" (composite "${id}") does not exist`,
+              `states.${id}.regions.${regionName}.initial`,
+              undefined,
+              `Set the region's \`initial\` to one of its own leaf keys.`,
+            )
+          }
         }
       }
     }
+  }
 
-    // A `final:true` leaf is entered via region expansion (when its composite is
-    // entered), never as an explicit transition `to`; treat it as reachable so it
-    // does not spuriously trigger UNREACHABLE_STATE.
-    const finalStatePaths = this.collectFinalStatePaths(smConfig.states)
-    for (const finalPath of finalStatePaths) {
-      reachableStates.add(finalPath)
+  /** True when composite-initial `part` resolves to a real addressable descendant of `compositeId`. */
+  private resolveCompositeInitialPart(
+    compositeId: string,
+    part: string,
+  ): boolean {
+    // region-qualified / dotted form: `${compositeId}.${part}` (e.g. proc + "a.run")
+    if (this.isAddressableState(`${compositeId}.${part}`)) return true
+    // bare leaf name present inside some region (e.g. parent + "child1")
+    const node = this.model?.nodes.get(compositeId)
+    if (!node) return false
+    for (const regionId of node.children) {
+      if (this.isAddressableState(`${regionId}.${part}`)) return true
     }
+    return false
+  }
 
-    // Report unreachable states
-    for (const stateName of allStateNames) {
-      if (!reachableStates.has(stateName)) {
+  // ── cross references: reachability + unused events ──────────────────────────
+
+  private validateCrossReferences<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): void {
+    if (!this.model) return
+
+    // UNREACHABLE_STATE — model reachability. Region containers are structural
+    // (never reported); `final` leaves are entered via region expansion and are
+    // treated as reachable (never spuriously flagged).
+    for (const id of this.model.order) {
+      const node = this.model.nodes.get(id)!
+      if (node.kind === 'region') continue
+      if (node.isFinal) continue
+      if (!this.reachableSet.has(id)) {
         this.addWarning(
           'UNREACHABLE_STATE',
-          `State "${stateName}" is not reachable`,
-          `states.${stateName}`,
+          `State "${id}" is not reachable`,
+          `states.${id}`,
         )
       }
     }
 
-    // Check for unused events (events with no valid transitions).
-    // Engine-generated done.state.<C> join events are reachable whenever their
-    // composite C exists, even though C is not an explicit transition target.
-    for (const [eventName, event] of Object.entries(smConfig.events)) {
-      const isDoneStateEvent = eventName.startsWith('done.state.')
-      const hasValidTransitions = event.transitions.some(
+    // UNUSED_EVENT — an event with no transition whose `from` AND `to` are valid
+    // model expressions (V11: both split on '|'; V2: '*' counts as valid).
+    for (const [eventName, event] of Object.entries(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+      const hasValid = event.transitions.some(
         (t) =>
-          (allStateNames.has(t.from) ||
-            (isDoneStateEvent &&
-              allStateNames.has(eventName.slice('done.state.'.length)))) &&
-          allStateNames.has(t.to),
+          typeof t?.from === 'string' &&
+          typeof t?.to === 'string' &&
+          this.isValidPathExpr(t.from) &&
+          this.isValidPathExpr(t.to),
       )
-      if (!hasValidTransitions) {
+      if (!hasValid) {
         this.addWarning(
           'UNUSED_EVENT',
           `Event "${eventName}" has no valid transitions`,
@@ -644,33 +861,261 @@ export class ConfigValidator {
     }
   }
 
-  private collectStateNames<T extends object>(
-    states: States<T>,
-    prefix: string,
-    collector: Set<string>,
-  ): void {
-    for (const [stateName, state] of Object.entries(states)) {
-      const fullName = prefix ? `${prefix}.${stateName}` : stateName
-      collector.add(fullName)
+  /** Every '|' part of `expr` is either '*' or an addressable state. */
+  private isValidPathExpr(expr: string): boolean {
+    for (const part of expr.split('|')) {
+      if (this.isWildcardPart(part)) continue
+      if (!this.isAddressableState(part)) return false
+    }
+    return true
+  }
 
-      if (state.regions) {
-        for (const [regionName, regionStates] of Object.entries(
-          state.regions,
-        )) {
-          this.collectStateNames(
-            regionStates,
-            `${fullName}.${regionName}`,
-            collector,
+  // ── model-structural correctness (§1а) ──────────────────────────────────────
+
+  private validateModelStructure<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): void {
+    if (!this.model) return
+
+    // DUPLICATE_REGION_NAME / DUPLICATE_STATE_ID — an id minted by two structural
+    // sources (the normalized model silently overwrites; we detect it here).
+    for (const [id, counts] of this.idCounts) {
+      const total = counts.state + counts.region
+      if (total <= 1) continue
+      if (counts.region >= 1) {
+        this.addError(
+          'DUPLICATE_REGION_NAME',
+          `Region container id "${id}" collides with another node of the same id — region names must be unique within their composite and must not shadow a state path`,
+          `states.${id}`,
+          undefined,
+          `Rename the region or the colliding state so the model id "${id}" is minted exactly once.`,
+        )
+      } else {
+        this.addError(
+          'DUPLICATE_STATE_ID',
+          `State id "${id}" is defined more than once`,
+          `states.${id}`,
+        )
+      }
+    }
+
+    for (const [rid, node] of this.model.nodes) {
+      if (node.kind !== 'region') continue
+
+      // REGION_STARTS_FINAL — the region's entry leaf is a `final` leaf, so the
+      // join closes immediately and the region never actually runs.
+      const entry = this.resolveRegionInitialChildId(rid)
+      if (entry) {
+        const eln = this.model.nodes.get(entry)
+        if (eln && eln.kind === 'leaf' && eln.isFinal) {
+          this.addError(
+            'REGION_STARTS_FINAL',
+            `Region "${rid}" starts in final leaf "${entry}" — the region joins immediately and never does work`,
+            `states.${rid}`,
+            undefined,
+            `Make the region's entry (its \`initial\` / first leaf) a non-final working state, and mark a later leaf \`final\`.`,
           )
+        }
+      }
+
+      // REGION_NO_PATH_TO_FINAL — the region declares final leaf(s) but NONE are
+      // reachable (strengthens REGION_NO_REACHABLE_FINAL: presence != reachability).
+      const finals: string[] = []
+      const prefix = `${rid}.`
+      for (const [fid, fn] of this.model.nodes) {
+        if (fn.isFinal && fid.startsWith(prefix)) finals.push(fid)
+      }
+      if (finals.length > 0 && !finals.some((f) => this.reachableSet.has(f))) {
+        this.addError(
+          'REGION_NO_PATH_TO_FINAL',
+          `Region "${rid}" has final leaf(s) [${finals.join(', ')}] but none is reachable from its entry — the region can never complete`,
+          `states.${rid}`,
+          undefined,
+          `Add a transition path from the region entry to one of its final leaves, or remove the unreachable final marker.`,
+        )
+      }
+    }
+
+    // UNSATISFIABLE_FROM — a composite `from` names two DISTINCT states of the
+    // SAME region ('P.a.x|P.a.y'); a region can hold only one active leaf.
+    for (const [eventName, event] of Object.entries(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+      event.transitions.forEach((t, index) => {
+        if (typeof t?.from !== 'string' || t.from.indexOf('|') === -1) return
+        const parts = t.from
+          .split('|')
+          .filter((p) => p && !this.isWildcardPart(p))
+        const byRegion = new Map<string, string>()
+        for (const p of parts) {
+          const region = this.nearestRegionAncestor(p)
+          if (!region) continue
+          const prev = byRegion.get(region)
+          if (prev !== undefined && prev !== p) {
+            this.addError(
+              'UNSATISFIABLE_FROM',
+              `Composite from "${t.from}" names two states ("${prev}", "${p}") of the same region "${region}" — a region can hold only one active leaf, so this transition can never be enabled`,
+              `events.${eventName}.transitions[${index}].from`,
+              undefined,
+              `A composite \`from\` must name at most one leaf per region; put states from DIFFERENT parallel regions on each side of '|'.`,
+            )
+            break
+          }
+          byRegion.set(region, p)
+        }
+      })
+    }
+
+    // DEAD_END_STATE (warning) — a non-root, non-final leaf with no way out: no
+    // transition fires from it, from an ancestor of it, or from '*'.
+    const fromParts = this.collectFromParts(smConfig)
+    for (const [id, node] of this.model.nodes) {
+      if (node.kind !== 'leaf') continue
+      if (node.depth === 0) continue // root terminal — legitimate
+      if (node.isFinal) continue
+      if (this.hasExit(id, fromParts)) continue
+      this.addWarning(
+        'DEAD_END_STATE',
+        `State "${id}" is a dead end — it has no outgoing transition (and is not a final leaf)`,
+        `states.${id}`,
+        undefined,
+        `Add an outgoing transition from "${id}", mark it \`final: true\` if it is a completion state, or route an ancestor/wildcard transition through it.`,
+      )
+    }
+
+    // INVOKE_NO_HANDLER — the W3b `invoke.src` form does not exist yet, so this
+    // pass is INERT in W2b (wired-but-no-op to avoid a second-wave dead-code
+    // block). Активируется в W3b.
+    this.validateInvokeHandlers(smConfig)
+  }
+
+  /** All concrete `from` parts across every event (split on '|', wildcard kept as '*'). */
+  private collectFromParts<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): Set<string> {
+    const set = new Set<string>()
+    for (const event of Object.values(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+      for (const t of event.transitions) {
+        if (typeof t?.from !== 'string') continue
+        for (const p of t.from.split('|')) if (p) set.add(p)
+      }
+    }
+    return set
+  }
+
+  /** True when some transition can fire from leaf `id` (direct, ancestor, or wildcard). */
+  private hasExit(id: string, fromParts: Set<string>): boolean {
+    // Collect id + all its ancestors (a transition from any of them exits `id`).
+    const ancestry = new Set<string>()
+    let cur: string | null = id
+    while (cur) {
+      ancestry.add(cur)
+      cur = this.nodeOf(cur)?.parent ?? null
+    }
+    for (const fp of fromParts) {
+      if (fp === '*') return true
+      if (fp.includes('*')) {
+        // suffix wildcard '<prefix>.*' — covers everything under prefix
+        const prefix = fp.endsWith('.*') ? fp.slice(0, -2) : fp.split('*')[0]!.replace(/\.$/, '')
+        if (prefix && ancestry.has(prefix)) return true
+        continue
+      }
+      if (ancestry.has(fp)) return true
+    }
+    return false
+  }
+
+  /**
+   * W3b PLACEHOLDER (inactive in W2b). Will warn `INVOKE_NO_HANDLER` for the new
+   * `invoke` form carrying a `src` with neither `onDone` nor `onError`. Kept as a
+   * declared method (not wired into validate()) so the W3b activation is a
+   * one-line call, avoiding a second-wave dead-code block. Активируется в W3b.
+   */
+  private validateInvokeHandlers<T extends object>(
+    _smConfig: StateMachineConfig<T>,
+  ): void {
+    // Активируется в W3b (форма invoke.src ещё не существует в W2b).
+  }
+
+  // ── selection warnings (help W3 migration) ──────────────────────────────────
+
+  private validateSelectionWarnings<T extends object>(
+    smConfig: StateMachineConfig<T>,
+  ): void {
+    if (!this.model) return
+
+    for (const [eventName, event] of Object.entries(smConfig.events ?? {})) {
+      if (!event || !Array.isArray(event.transitions)) continue
+
+      // Flatten (fromPart, priority) across the event's transitions.
+      const froms: Array<{ part: string; priority: number | undefined }> = []
+      let hasWildcard = false
+      let hasConcrete = false
+      for (const t of event.transitions) {
+        if (typeof t?.from !== 'string') continue
+        for (const p of t.from.split('|')) {
+          if (!p) continue
+          if (p === '*') {
+            hasWildcard = true
+            continue
+          }
+          hasConcrete = true
+          froms.push({ part: p, priority: t.priority })
+        }
+      }
+
+      // WILDCARD_SHADOWED (info): a from:'*' sits next to explicit paths.
+      if (hasWildcard && hasConcrete) {
+        this.addInfo(
+          'WILDCARD_SHADOWED',
+          `Event "${eventName}" mixes a from:'*' wildcard with explicit paths; the explicit transitions may shadow (or be shadowed by) the wildcard depending on selection order`,
+          `events.${eventName}`,
+        )
+      }
+
+      // ANCESTOR_DESCENDANT_OVERLAP / PRIORITY_INVERTS_DOMINANCE
+      const reported = new Set<string>()
+      for (let i = 0; i < froms.length; i++) {
+        for (let j = 0; j < froms.length; j++) {
+          if (i === j) continue
+          const anc = froms[i]!
+          const desc = froms[j]!
+          if (!this.isAncestor(anc.part, desc.part)) continue
+          const key = `${anc.part}>>${desc.part}`
+          if (reported.has(key)) continue
+          reported.add(key)
+
+          const bothPrio =
+            typeof anc.priority === 'number' &&
+            typeof desc.priority === 'number'
+          if (bothPrio && anc.priority! > desc.priority!) {
+            this.addWarning(
+              'PRIORITY_INVERTS_DOMINANCE',
+              `Event "${eventName}": ancestor "${anc.part}" has HIGHER priority (${anc.priority}) than its descendant "${desc.part}" (${desc.priority}) — a deliberate inversion of the descendant-wins default`,
+              `events.${eventName}`,
+              undefined,
+              `Confirm the inversion is intended; after the W3 default (descendant wins) this priority is what keeps the ancestor dominant.`,
+            )
+          } else {
+            this.addWarning(
+              'ANCESTOR_DESCENDANT_OVERLAP',
+              `Event "${eventName}": transitions from ancestor "${anc.part}" and descendant "${desc.part}" overlap on the same event — after W3 the descendant wins; add an explicit \`priority\` if the ancestor should dominate`,
+              `events.${eventName}`,
+              undefined,
+              `If the ancestor should win, give it a higher \`priority\`; otherwise the descendant transition is selected.`,
+            )
+          }
         }
       }
     }
   }
 
+  // ── final states + done.state join validation ───────────────────────────────
+
   /**
    * Collects every state in the tree as {dottedPath, config} entries, walking
-   * region containers (region names are NOT registered states, so they are part
-   * of the path but never emitted as an entry — mirroring runtime expansion).
+   * region containers (region names are part of the path but never emitted as an
+   * entry — mirroring runtime expansion).
    */
   private collectStateEntries<T extends object>(
     states: States<T>,
@@ -678,6 +1123,7 @@ export class ConfigValidator {
     collector: Array<{ path: string; state: Omit<State<T>, 'name'> }>,
   ): void {
     for (const [stateName, state] of Object.entries(states)) {
+      if (stateName === 'initial') continue
       const fullName = prefix ? `${prefix}.${stateName}` : stateName
       collector.push({ path: fullName, state })
 
@@ -697,8 +1143,7 @@ export class ConfigValidator {
 
   /**
    * True when `composite` has at least one `final:true` atomic substate reachable
-   * through its (possibly nested) region tree — i.e. some region of the composite
-   * can become done. Used by REGION_NO_REACHABLE_FINAL.
+   * through its (possibly nested) region tree. Used by REGION_NO_REACHABLE_FINAL.
    */
   private hasReachableFinal<T extends object>(
     composite: Omit<State<T>, 'name'>,
@@ -713,35 +1158,19 @@ export class ConfigValidator {
     return false
   }
 
-  /**
-   * SCXML/UML final-state and all-regions-final (done.state.<C>) join validation.
-   *
-   * - FINAL_STATE_HAS_OUTGOING (error): a `final:true` state is the `from` of a
-   *   transition (a final pseudo-state cannot itself transition out).
-   * - FINAL_ON_COMPOSITE (warning): `final:true` on a state that has regions
-   *   (final is meaningful only on an atomic leaf; ignored at runtime).
-   * - REGION_NO_REACHABLE_FINAL (warning): a `done.state.<C>` transition exists
-   *   but composite C declares no `final` substate, so the join can never fire.
-   * - DONE_VS_PARALLEL_EXIT_AMBIGUITY (warning): the same composite C has BOTH a
-   *   `done.state.C` join AND a plain `from:'C'` user-event parallel-exit, which
-   *   can preempt the all-final join (the user event is eligible on ANY leaf).
-   * - REGION_MISSING_INITIAL (advisory warning, valid:true): a region omits an
-   *   explicit `initial`, so expansion relies on first-key insertion order.
-   */
   private validateFinalStates<T extends object>(
     smConfig: StateMachineConfig<T>,
   ): void {
+    if (!smConfig.states || typeof smConfig.states !== 'object') return
+
     const entries: Array<{ path: string; state: Omit<State<T>, 'name'> }> = []
     this.collectStateEntries(smConfig.states, '', entries)
 
-    // Index final-leaf paths for the outgoing-transition check.
     const finalStatePaths = new Set<string>()
 
     for (const { path, state } of entries) {
       if (!state.final) continue
-
       if (state.regions) {
-        // final on a composite is ignored at runtime — flag it.
         this.addWarning(
           'FINAL_ON_COMPOSITE',
           `Final flag on composite state "${path}" is ignored; mark an atomic leaf inside a region as final instead`,
@@ -754,15 +1183,12 @@ export class ConfigValidator {
       }
     }
 
-    // Collect `from` states used by user transitions and the set of declared
-    // done.state.<C> composite ids.
     const userFromStates = new Set<string>()
     const doneStateComposites = new Set<string>()
 
-    for (const [eventName, event] of Object.entries(smConfig.events)) {
+    for (const [eventName, event] of Object.entries(smConfig.events ?? {})) {
       if (!event.transitions || !Array.isArray(event.transitions)) continue
 
-      // done.state.<C> engine event: extract the composite id suffix.
       if (eventName.startsWith('done.state.')) {
         const compositeId = eventName.slice('done.state.'.length)
         if (compositeId) doneStateComposites.add(compositeId)
@@ -771,7 +1197,6 @@ export class ConfigValidator {
       for (const transition of event.transitions) {
         if (typeof transition.from !== 'string') continue
         for (const fromPart of transition.from.split('|')) {
-          // FINAL_STATE_HAS_OUTGOING: a final leaf must not be a transition source.
           if (finalStatePaths.has(fromPart)) {
             this.addError(
               'FINAL_STATE_HAS_OUTGOING',
@@ -789,15 +1214,10 @@ export class ConfigValidator {
       }
     }
 
-    // REGION_NO_REACHABLE_FINAL: each done.state.<C> needs a final substate under C.
     const entryByPath = new Map(entries.map((e) => [e.path, e.state]))
     for (const compositeId of doneStateComposites) {
       const composite = entryByPath.get(compositeId)
-      if (!composite) {
-        // Unknown composite id is already caught by transition-path validation;
-        // do not double-report here.
-        continue
-      }
+      if (!composite) continue
       if (!this.hasReachableFinal(composite)) {
         this.addWarning(
           'REGION_NO_REACHABLE_FINAL',
@@ -808,8 +1228,6 @@ export class ConfigValidator {
         )
       }
 
-      // DONE_VS_PARALLEL_EXIT_AMBIGUITY: same composite also used as a plain
-      // user-event parallel-exit source.
       if (userFromStates.has(compositeId)) {
         this.addWarning(
           'DONE_VS_PARALLEL_EXIT_AMBIGUITY',
@@ -821,64 +1239,70 @@ export class ConfigValidator {
       }
     }
 
-    // REGION_MISSING_INITIAL (advisory): a region's starting leaf is not pinned
-    // by the composite's `initial`, so runtime expansion falls back to first-key
-    // insertion order (getInitialStatesForRegions uses Object.keys(region)[0]).
-    for (const { path, state } of entries) {
-      if (!state.regions) continue
-      for (const [regionName, regionStates] of Object.entries(state.regions)) {
-        const regionKeys = Object.keys(regionStates)
+    // REGION_MISSING_INITIAL (advisory) — a region whose start leaf is not pinned
+    // (neither by the composite's `initial` — bare or region-qualified — nor by
+    // the region's own `initial`), so runtime expansion falls back to first-key
+    // insertion order. Resolved THROUGH THE MODEL so the F10 dotted/parallel
+    // initial ("a.run|b.run") is recognized as pinning and NOT falsely warned.
+    if (this.model) {
+      for (const [rid, node] of this.model.nodes) {
+        if (node.kind !== 'region') continue
+        const compositeId = node.parent!
+        const regionName = rid.slice(compositeId.length + 1)
+        const rs = this.regionCfgById.get(rid)
+        const regionKeys = rs
+          ? Object.keys(rs).filter((k) => k !== 'initial')
+          : []
         if (regionKeys.length === 0) continue
-        // The only explicit start-selection mechanism is the parent composite's
-        // `initial` pointing at one of this region's leaves.
-        const parentInitialInRegion =
-          state.initial !== undefined && regionKeys.includes(state.initial)
-        if (!parentInitialInRegion) {
-          this.addWarning(
-            'REGION_MISSING_INITIAL',
-            `Region "${regionName}" of composite "${path}" has no explicit initial; expansion falls back to the first key "${regionKeys[0]}" (insertion-order dependent)`,
-            `states.${path}.regions.${regionName}`,
-            undefined,
-            `Set \`initial\` on composite "${path}" to a leaf of region "${regionName}", to make the starting substate explicit and order-independent.`,
-          )
+        const compositeInitial = this.stateCfgById.get(compositeId)?.initial
+        if (
+          this.isRegionPinned(compositeInitial, regionName, regionKeys, rs)
+        ) {
+          continue
         }
+        this.addWarning(
+          'REGION_MISSING_INITIAL',
+          `Region "${regionName}" of composite "${compositeId}" has no explicit initial; expansion falls back to the first key "${regionKeys[0]}" (insertion-order dependent)`,
+          `states.${compositeId}.regions.${regionName}`,
+          undefined,
+          `Set \`initial\` on composite "${compositeId}" to a leaf of region "${regionName}", to make the starting substate explicit and order-independent.`,
+        )
       }
     }
   }
 
-  /**
-   * Collects the dotted paths of every `final:true` atomic leaf in the tree.
-   */
-  private collectFinalStatePaths<T extends object>(
-    states: States<T>,
-    prefix = '',
-    collector: Set<string> = new Set(),
-  ): Set<string> {
-    for (const [stateName, state] of Object.entries(states)) {
-      const fullName = prefix ? `${prefix}.${stateName}` : stateName
-      if (state.final && !state.regions) {
-        collector.add(fullName)
-      }
-      if (state.regions) {
-        for (const [regionName, regionStates] of Object.entries(
-          state.regions,
-        )) {
-          this.collectFinalStatePaths(
-            regionStates,
-            `${fullName}.${regionName}`,
-            collector,
-          )
-        }
-      }
+  /** True when the region's starting leaf is explicitly pinned. */
+  private isRegionPinned(
+    compositeInitial: unknown,
+    regionName: string,
+    regionKeys: string[],
+    regionConfig: any,
+  ): boolean {
+    // region's own `initial`
+    if (
+      regionConfig &&
+      typeof regionConfig.initial === 'string' &&
+      regionConfig.initial
+    ) {
+      return true
     }
-    return collector
+    if (typeof compositeInitial !== 'string') return false
+    for (const part of compositeInitial.split('|')) {
+      if (!part) continue
+      // bare leaf key present in this region (generator / hierarchical form)
+      if (regionKeys.includes(part)) return true
+      // region-qualified dotted form ("a.run" pins region "a")
+      if (part.startsWith(`${regionName}.`)) return true
+    }
+    return false
   }
 
   private validatePerformanceConstraints<T extends object>(
     smConfig: StateMachineConfig<T>,
   ): void {
+    if (!smConfig.states || typeof smConfig.states !== 'object') return
     const stateCount = this.countStates(smConfig.states)
-    const eventCount = Object.keys(smConfig.events).length
+    const eventCount = smConfig.events ? Object.keys(smConfig.events).length : 0
 
     if (stateCount > this.config.maxStatesCount) {
       this.addWarning(
@@ -896,10 +1320,11 @@ export class ConfigValidator {
       )
     }
 
-    // Check for complex transition patterns
     let totalTransitions = 0
-    for (const event of Object.values(smConfig.events)) {
-      totalTransitions += event.transitions.length
+    for (const event of Object.values(smConfig.events ?? {})) {
+      if (event && Array.isArray(event.transitions)) {
+        totalTransitions += event.transitions.length
+      }
     }
 
     if (totalTransitions > stateCount * 3) {
@@ -912,16 +1337,16 @@ export class ConfigValidator {
   }
 
   private countStates<T extends object>(states: States<T>): number {
-    let count = Object.keys(states).length
-
-    for (const state of Object.values(states)) {
+    let count = 0
+    for (const [name, state] of Object.entries(states)) {
+      if (name === 'initial') continue
+      count += 1
       if (state.regions) {
         for (const regionStates of Object.values(state.regions)) {
           count += this.countStates(regionStates)
         }
       }
     }
-
     return count
   }
 
@@ -953,6 +1378,23 @@ export class ConfigValidator {
       code,
       message,
       severity: 'warning',
+      path,
+      ...(details !== undefined ? { details } : {}),
+      ...(suggestion !== undefined ? { suggestion } : {}),
+    })
+  }
+
+  private addInfo(
+    code: string,
+    message: string,
+    path: string,
+    details?: Record<string, any>,
+    suggestion?: string,
+  ): void {
+    this.infos.push({
+      code,
+      message,
+      severity: 'info',
       path,
       ...(details !== undefined ? { details } : {}),
       ...(suggestion !== undefined ? { suggestion } : {}),

@@ -127,6 +127,7 @@ export {
   type ValidationResult,
   type ValidationError,
   type ValidationWarning,
+  type ValidationInfo,
 } from './config_validator'
 
 // === Extension-point interfaces (per TASK-006 EP catalog) — @unstable ===

@@ -26,6 +26,23 @@ map-insertion артефакт `region2|region1`, новое — канонич�
 Advisory (не блокер, verify): `getCompiledModel` объявлен `public` (internal-by-convention,
 `index.ts` не реэкспортит — `public_surface.test.ts` зелёный). Учесть в W2b/чистоте.
 
-## W2b — валидатор на модель (#5) — В РАБОТЕ
+## W2b — валидатор на модель (#5) — verdict CLOSED
+
+| группа | факт | подтверждение (оркестратор-прогон) |
+|---|---|---|
+| чинит ложные (F10/V1/V2/V4/V11/V12/UNREACHABLE) | валидатор потребляет `model.ts`, не парсит пути заново; UNREACHABLE — обход достижимости ПО МОДЕЛИ | README-пример регионов: 0 errors, 0 warnings, isValid:true (было INVALID_INITIAL_STATE + ложные UNREACHABLE) |
+| новые проверки | REGION_STARTS_FINAL, REGION_NO_PATH_TO_FINAL, UNSATISFIABLE_FROM, DUPLICATE_REGION_NAME, DEAD_END_STATE, ANCESTOR_DESCENDANT_OVERLAP, PRIORITY_INVERTS_DOMINANCE, WILDCARD_SHADOWED (в infos[]) | нулевой-ложняк на корректной машине: 0/0 |
+| INVOKE_NO_HANDLER | заготовка инертна (коммент «активируется в W3b») | не мёртвый код 2 волны |
+| политика бросков | **INVALID_STATE_PATH бросает** при конструкции; остальные model-ошибки — репорт + strict (см. дельту) | битый from → throw; валидный → построен; validateConfigStrict бросает (V10) |
+| корпус MB3 | **9 warning вместо 28**, все настоящие (6× REGION_MISSING_INITIAL — реальный совет, 3× SELF_TRANSITION); 0 ложных UNREACHABLE | `validator_corpus_mb3.test.ts` 4/4 |
+
+Итог W2b: **846 passed / 14 skipped; tsc чисто**; гейт характеризации 10/10 (селекция не сдвинута);
+W0/W1/W2a целы (оркестратор-прогон).
+
+**Дельта план→факт (§0.6):** политика бросков СУЖЕНА против буквального SPEC — бросает только
+`INVALID_STATE_PATH`, а REGION_STARTS_FINAL/REGION_NO_PATH_TO_FINAL/UNSATISFIABLE_FROM/
+DUPLICATE_REGION_NAME остаются репорт-ошибками (isValid:false + strict), НЕ бросают при конструкции.
+Причина (verify независимо подтвердил REQUIRED): рантайм сознательно исполняет вырожденные final-only
+регионы, которые строят замороженные тесты; бросок реоткрыл бы гейты. SPEC §1а обновлён под это.
 
 ## W2c — типы путей + README (#16) — ОЖИДАЕТ
