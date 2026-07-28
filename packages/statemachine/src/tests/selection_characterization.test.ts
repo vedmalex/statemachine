@@ -2,27 +2,42 @@ import { describe, expect, it } from 'vitest'
 import { createMachine } from '../index'
 
 /**
- * ФИКСИРУЕТ ТЕКУЩЕЕ (НЕВЕРНОЕ) поведение селекции переходов:
- * getAllowedTransitions выбирает по правилу last-declared-wins
- * (при равном/отсутствующем priority побеждает ПОСЛЕДНИЙ объявленный
- * кандидат в event.transitions — источник порядка = порядок массива).
+ * W3-B REWRITE — ранее эта суита ФИКСИРОВАЛА старое (неверное) правило селекции
+ * `last-declared-wins` (`getAllowedTransitions` с `priority ?? -Infinity` и
+ * eager-гардами) как W2-ДАТЧИК чувствительности. В W3-B правило селекции
+ * ЗАМЕНЕНО на SCXML/UML (SPEC §4): priority(default 0) → специфичность источника
+ * → доминирование потомка → document order, с ЛЕНИВЫМИ гардами (§5). Датчик
+ * больше не может фиксировать старое поведение — движок его не производит.
  *
- * Это ХАРАКТЕРИЗАЦИЯ, не целевое поведение: каждый ассерт — фактический
- * победитель СЕЙЧАС (запущено, посмотрено, зафиксировано). Юнит C2 —
- * единственный ДАТЧИК чувствительности к селекции для W2: у остальной
- * суиты нулевая чувствительность (полная замена правила селекции даёт
- * побайтово тот же прогон), поэтому тихий сдвиг источника порядка в W2
- * (компилятор меняет источник порядка переходов) ловится ТОЛЬКО здесь.
+ * Поэтому КАЖДЫЙ прежний характеризационный ассерт ПЕРЕПИСАН в свой ПАРНЫЙ
+ * целевой SCXML-ассерт (НЕ удалён — переписан, с фиксацией дельты
+ * «было last-declared → стало SCXML» прямо в имени и комментарии теста). Набор
+ * этих дельт — готовый СКЕЛЕТ migration-note (SPEC §9). Companion-суита
+ * `selection_scxml.test.ts` — независимая целевая (RED на HEAD, GREEN после
+ * W3-B) плюс conformance-векторы; эта — «до/после» карта тех же 5 осей.
  *
- * В W3 каждый тест переписывается в ПАРНЫЙ целевой SCXML-ассерт
- * (SCXML/UML: побеждает наиболее вложенный/специфичный источник и
- * приоритет по порядку документа, а не last-declared). ДЕЛЬТА между
- * текущим ассертом и целевым = готовый СКЕЛЕТ migration-note.
+ * Все тесты ЗЕЛЁНЫЕ на движке ПОСЛЕ W3-B и КРАСНЫЕ были бы на HEAD-до-W3-B
+ * (обратное old-правило). owner передаётся как `{} as any` — движок сам ставит
+ * initialState.
  *
- * Все тесты ЗЕЛЁНЫЕ — фиксируют движок КАК ЕСТЬ, ничего не чинят.
- * (owner передаётся как `{} as any` — движок сам ставит initialState.)
+ * ── Карта дельт (migration-note §9 скелет) ────────────────────────────────────
+ *   Ось 1 (предок vs потомок):
+ *     [ancestor, descendant]  было descWon (last-declared) → стало descWon (доминирование) — СОВПАЛО
+ *     [descendant, ancestor]  было ancWon  (last-declared) → стало descWon (доминирование) — ИЗМЕНИЛОСЬ
+ *   Ось 2 (wildcard '*' vs явный):
+ *     [wildcard, explicit]    было explWon (last-declared) → стало explWon (специфичность) — СОВПАЛО
+ *     [explicit, wildcard]    было wildWon (last-declared) → стало explWon (специфичность) — ИЗМЕНИЛОСЬ
+ *   Ось 3 (отсутствующий priority vs отрицательный -5):
+ *     [absent, negative]      было negWon  (absent=-∞)     → стало absWon (absent=0>-5) — ИЗМЕНИЛОСЬ
+ *     [negative, absent]      было negWon  (absent=-∞)     → стало absWon (absent=0>-5) — ИЗМЕНИЛОСЬ
+ *   Ось 4 (равная глубина, ≥2 кандидата, без priority):
+ *     [dA, dB]                было dB (last-declared)      → стало dA (document order) — ИЗМЕНИЛОСЬ
+ *     [dB, dA]                было dA (last-declared)      → стало dB (document order) — ИЗМЕНИЛОСЬ
+ *   Ось 5 (равный ЯВНЫЙ priority 10):
+ *     [dA, dB]                было dB (last-declared tie)  → стало dA (document order) — ИЗМЕНИЛОСЬ
+ *     [dB, dA]                было dA (last-declared tie)  → стало dB (document order) — ИЗМЕНИЛОСЬ
  */
-describe('selection characterization — CURRENT last-declared-wins rule (W2 sensor)', () => {
+describe('selection migration map — was last-declared-wins → now SCXML (SPEC §4)', () => {
   const base = { name: 'SelChar', stateAttribute: 'state' as const }
 
   /** Собирает машину, шлёт `ev` один раз, возвращает достигнутое состояние = победитель. */
@@ -33,12 +48,12 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
   }
 
   // ── Ось 1: предок vs потомок на ОДНОМ событии, ОБА порядка объявления ──
-  // current = parent.r.leaf; кандидаты `from:'parent'` (предок, ancestor-scan)
-  // и `from:'parent.r.leaf'` (потомок, точный) ОБА проходят isTransitionPossible.
-  // ТЕКУЩЕЕ: побеждает ПОСЛЕДНИЙ объявленный, глубина НЕ учитывается.
-  // W3-ЦЕЛЬ (SCXML): потомок (наиболее вложенный источник) должен побеждать
-  // в ОБОИХ порядках → migration-note дельта именно здесь.
-  describe('axis 1 — ancestor vs descendant, both declaration orders', () => {
+  // current = parent.r.leaf; кандидаты `from:'parent'` (предок) и
+  // `from:'parent.r.leaf'` (потомок) ОБА проходят isTransitionPossible.
+  // БЫЛО: last-declared-wins (глубина игнорировалась).
+  // СТАЛО (SPEC §4.3): доминирование потомка — наиболее вложенный источник
+  // побеждает в ОБОИХ порядках.
+  describe('axis 1 — descendant dominates ancestor (was last-declared)', () => {
     const states = {
       parent: { regions: { r: { leaf: {} } }, initial: 'leaf' },
       ancWon: {},
@@ -51,7 +66,7 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       events: { ev: { transitions } },
     })
 
-    it('order [ancestor, descendant] → descendant wins (last declared)', async () => {
+    it('[ancestor, descendant]: было descWon (last-declared) → стало descWon (dominance, СОВПАЛО)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -62,8 +77,7 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       ).toBe('descWon')
     })
 
-    it('order [descendant, ancestor] → ancestor wins (last declared; NOT deepest)', async () => {
-      // W3-ЦЕЛЬ: должно остаться 'descWon' (потомок), а СЕЙЧАС 'ancWon'.
+    it('[descendant, ancestor]: было ancWon (last-declared) → стало descWon (dominance, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -71,16 +85,15 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
             { from: 'parent', to: 'ancWon' },
           ]),
         ),
-      ).toBe('ancWon')
+      ).toBe('descWon')
     })
   })
 
   // ── Ось 2: wildcard from:'*' vs явный from, ОБА порядка ──
-  // Оба кандидата на одном событии проходят isTransitionPossible
-  // (wildcard всегда true; явный совпадает с current). Приоритет отсутствует.
-  // ТЕКУЩЕЕ: last-declared-wins; wildcard НЕ понижен в приоритете.
-  // W3-ЦЕЛЬ (SCXML): явный источник специфичнее wildcard → явный в ОБА порядка.
-  describe('axis 2 — wildcard from:* vs explicit from, both declaration orders', () => {
+  // БЫЛО: last-declared-wins; wildcard НЕ понижен в приоритете.
+  // СТАЛО (SPEC §4.2): явный источник (специфичность 0) бьёт '*' (класс 2)
+  // ВСЕГДА, независимо от порядка объявления.
+  describe('axis 2 — explicit source beats wildcard (was last-declared)', () => {
     const states = { s0: {}, wildWon: {}, explWon: {} }
     const mk = (transitions: any[]) => ({
       ...base,
@@ -89,7 +102,7 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       events: { ev: { transitions } },
     })
 
-    it('order [wildcard, explicit] → explicit wins (last declared)', async () => {
+    it('[wildcard, explicit]: было explWon (last-declared) → стало explWon (specificity, СОВПАЛО)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -100,8 +113,7 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       ).toBe('explWon')
     })
 
-    it('order [explicit, wildcard] → wildcard wins (last declared; NOT least-specific-loses)', async () => {
-      // W3-ЦЕЛЬ: должно остаться 'explWon' (явный специфичнее), а СЕЙЧАС 'wildWon'.
+    it('[explicit, wildcard]: было wildWon (last-declared) → стало explWon (specificity, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -109,16 +121,16 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
             { from: '*', to: 'wildWon' },
           ]),
         ),
-      ).toBe('wildWon')
+      ).toBe('explWon')
     })
   })
 
-  // ── Ось 3: отсутствующий priority vs отрицательный ──
-  // Отсутствующий priority трактуется как Number.NEGATIVE_INFINITY (самый низкий),
-  // поэтому ЯВНЫЙ отрицательный (-5) ВСЕГДА бьёт отсутствующий — приоритет
-  // доминирует над порядком, победитель ОДИН И ТОТ ЖЕ в обоих порядках.
-  // (Осевой контраст с осями 4/5: там priority равен → включается last-declared.)
-  describe('axis 3 — absent priority vs negative priority', () => {
+  // ── Ось 3: отсутствующий priority vs отрицательный (-5) ──
+  // БЫЛО: отсутствующий priority = -Infinity, поэтому ЯВНЫЙ -5 бил отсутствующий
+  // в обоих порядках (F9).
+  // СТАЛО (SPEC §4.1): отсутствующий priority = 0; 0 > -5, поэтому absWon
+  // побеждает в ОБОИХ порядках (отрицательный теперь НИЖЕ неуказанного).
+  describe('axis 3 — absent priority (=0) beats negative (was absent=-Infinity, F9)', () => {
     const states = { s0: {}, absWon: {}, negWon: {} }
     const mk = (transitions: any[]) => ({
       ...base,
@@ -127,7 +139,7 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       events: { ev: { transitions } },
     })
 
-    it('order [absent, negative] → negative wins (absent === -Infinity)', async () => {
+    it('[absent, negative]: было negWon (absent=-∞) → стало absWon (absent=0>-5, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -135,10 +147,10 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
             { from: 's0', to: 'negWon', priority: -5 },
           ]),
         ),
-      ).toBe('negWon')
+      ).toBe('absWon')
     })
 
-    it('order [negative, absent] → negative STILL wins (priority dominates order)', async () => {
+    it('[negative, absent]: было negWon (absent=-∞) → стало absWon (absent=0>-5, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
@@ -146,15 +158,15 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
             { from: 's0', to: 'absWon' },
           ]),
         ),
-      ).toBe('negWon')
+      ).toBe('absWon')
     })
   })
 
-  // ── Ось 4: равная глубина, ≥2 кандидата ──
-  // Два перехода из одного источника s0 (равная глубина), без priority.
-  // ТЕКЁ: чистый last-declared-wins — победитель = ПОСЛЕДНИЙ объявленный,
-  // а не имя цели (реверс порядка меняет победителя).
-  describe('axis 4 — equal depth, >=2 candidates', () => {
+  // ── Ось 4: равная глубина, ≥2 кандидата, без priority ──
+  // БЫЛО: чистый last-declared-wins — победитель = ПОСЛЕДНИЙ объявленный.
+  // СТАЛО (SPEC §4.4): при точном равенстве (priority, специфичность,
+  // несравнимо по доминированию) побеждает ПЕРВЫЙ объявленный (document order).
+  describe('axis 4 — equal depth resolves by document order (was last-declared)', () => {
     const states = { s0: {}, dA: {}, dB: {} }
     const mk = (transitions: any[]) => ({
       ...base,
@@ -163,33 +175,34 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       events: { ev: { transitions } },
     })
 
-    it('order [dA, dB] → dB wins (last declared)', async () => {
+    it('[dA, dB]: было dB (last-declared) → стало dA (document order, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
             { from: 's0', to: 'dA' },
             { from: 's0', to: 'dB' },
-          ]),
-        ),
-      ).toBe('dB')
-    })
-
-    it('order [dB, dA] → dA wins (last declared; order, not target name)', async () => {
-      expect(
-        await winnerOf(
-          mk([
-            { from: 's0', to: 'dB' },
-            { from: 's0', to: 'dA' },
           ]),
         ),
       ).toBe('dA')
     })
+
+    it('[dB, dA]: было dA (last-declared) → стало dB (document order, ИЗМЕНИЛОСЬ)', async () => {
+      expect(
+        await winnerOf(
+          mk([
+            { from: 's0', to: 'dB' },
+            { from: 's0', to: 'dA' },
+          ]),
+        ),
+      ).toBe('dB')
+    })
   })
 
-  // ── Ось 5: равный ЯВНЫЙ priority ──
-  // Два перехода из s0 с ОДИНАКОВЫМ явным priority:10. Равенство (не '<')
-  // → включается tie-break = last-declared-wins.
-  describe('axis 5 — equal explicit priority', () => {
+  // ── Ось 5: равный ЯВНЫЙ priority 10 ──
+  // БЫЛО: равенство priority → tie-break = last-declared-wins.
+  // СТАЛО (SPEC §4.4): равный priority + равная специфичность + несравнимо по
+  // доминированию → document order (первый объявленный).
+  describe('axis 5 — equal explicit priority resolves by document order (was last-declared)', () => {
     const states = { s0: {}, dA: {}, dB: {} }
     const mk = (transitions: any[]) => ({
       ...base,
@@ -198,26 +211,26 @@ describe('selection characterization — CURRENT last-declared-wins rule (W2 sen
       events: { ev: { transitions } },
     })
 
-    it('order [dA, dB] both priority 10 → dB wins (last declared on tie)', async () => {
+    it('[dA, dB] both priority 10: было dB (last-declared tie) → стало dA (document order, ИЗМЕНИЛОСЬ)', async () => {
       expect(
         await winnerOf(
           mk([
             { from: 's0', to: 'dA', priority: 10 },
             { from: 's0', to: 'dB', priority: 10 },
-          ]),
-        ),
-      ).toBe('dB')
-    })
-
-    it('order [dB, dA] both priority 10 → dA wins (last declared on tie)', async () => {
-      expect(
-        await winnerOf(
-          mk([
-            { from: 's0', to: 'dB', priority: 10 },
-            { from: 's0', to: 'dA', priority: 10 },
           ]),
         ),
       ).toBe('dA')
+    })
+
+    it('[dB, dA] both priority 10: было dA (last-declared tie) → стало dB (document order, ИЗМЕНИЛОСЬ)', async () => {
+      expect(
+        await winnerOf(
+          mk([
+            { from: 's0', to: 'dB', priority: 10 },
+            { from: 's0', to: 'dA', priority: 10 },
+          ]),
+        ),
+      ).toBe('dB')
     })
   })
 })

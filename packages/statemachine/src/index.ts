@@ -38,6 +38,12 @@ export type { StateMachineConfig } from './types'
 export type { Transition } from './types'
 
 /**
+ * @stable — discriminated result of `fireEventDetailed` (SPEC §7).
+ * @category Stable
+ */
+export type { FireResult } from './types'
+
+/**
  * @stable — state node shape; consumed by States<T> map.
  * @category Stable
  */

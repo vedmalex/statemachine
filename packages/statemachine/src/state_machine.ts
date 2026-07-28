@@ -19,6 +19,7 @@ import {
   type Event,
   type EventAction,
   type Events,
+  type FireResult,
   type FunctionRegistry,
   type IErrorHandler,
   type ILogger,
@@ -110,6 +111,36 @@ interface QueuedEvent<TOwner extends object = object> {
   reject?: (error: any) => void
   timestamp: number
   type: 'internal' | 'external'
+  /**
+   * SPEC §7: when set, this event was posted via `fireEventDetailed`. The drain
+   * settles the caller through `resolveDetailed` with the {@link FireResult}
+   * `executeQueuedTransition` writes into `detailResult`, and NO-candidate no
+   * longer throws — it resolves `{ fired:false, reason:'no-transition' }`.
+   */
+  detailed?: boolean
+  resolveDetailed?: (result: FireResult) => void
+  detailResult?: FireResult
+}
+
+/**
+ * SPEC §4 / PERF-07 — a transition with its STATIC ordering keys precomputed
+ * ONCE in the constructor (`from` is immutable, so `priority` / `specificity` /
+ * `docIndex` never change). The per-event candidate list is stored pre-sorted by
+ * `(priority ↓, specificity ↑, docIndex ↑)`, so a naive per-event ancestor walk
+ * is avoided on the hot path; only descendant-dominance (which depends on the
+ * live active configuration) and lazy guards run at fire time.
+ */
+interface PreparedTransition<
+  TOwner extends object,
+  S extends States<TOwner>,
+> {
+  transition: Transition<TOwner, S>
+  /** `priority ?? 0` — SPEC §4.1: absent === 0, NOT -Infinity (the F9 fix). */
+  priority: number
+  /** SPEC §4.2 specificity class: 0 explicit `from` · 1 partial `'a|*'` · 2 `'*'`. */
+  specificity: 0 | 1 | 2
+  /** Declaration index in `event.transitions` — the sole document-order source. */
+  docIndex: number
 }
 
 interface QueuedEventInfo {
@@ -145,6 +176,17 @@ export class StateMachine<
   private events: Map<
     keyof SMConfig['events'],
     Event<TOwner, SMConfig['states']>
+  >
+  /**
+   * SPEC §4 / PERF-07: per-event transitions pre-sorted ONCE by the static
+   * ordering keys `(priority ↓, specificity ↑, docIndex ↑)`. Selection filters
+   * this list by the live active configuration (stable — preserves the sorted
+   * order), applies the descendant-dominance filter, then runs guards lazily.
+   * Keyed by event name (includes the `'*'` wildcard event).
+   */
+  private orderedTransitions!: Map<
+    string,
+    PreparedTransition<TOwner, SMConfig['states']>[]
   >
   private stateAttribute: KeysOf<PropertiesOf<TOwner>, string>
   private onError?: ErrorHandlerOrString<TOwner>
@@ -287,6 +329,31 @@ export class StateMachine<
     // на который опирается канонический порядок активной конфигурации.
     this.model = compileModel(config.states as any)
 
+    // SPEC §4 / PERF-07: precompute the per-event ordered candidate lists ONCE.
+    // `from` is immutable, so priority/specificity/document-order are static —
+    // sorting per fireEvent would redo constant work on the hot path. Descendant
+    // dominance stays dynamic (needs the live active configuration) and runs at
+    // fire time; everything sortable is frozen here.
+    this.orderedTransitions = new Map()
+    for (const [name, ev] of this.events) {
+      const prepared = ev.transitions.map((transition, docIndex) => ({
+        transition,
+        priority: transition.priority ?? 0,
+        specificity: this.sourceSpecificity(transition.from as string),
+        docIndex,
+      }))
+      // Stable sort by (priority DESC, specificity ASC, docIndex ASC). docIndex
+      // is the final, total tie-break, so the order is fully deterministic and
+      // document order (first-declared) wins on an otherwise exact tie (§4.4).
+      prepared.sort(
+        (a, b) =>
+          b.priority - a.priority ||
+          a.specificity - b.specificity ||
+          a.docIndex - b.docIndex,
+      )
+      this.orderedTransitions.set(String(name), prepared)
+    }
+
     // SPEC §1а throw policy (M-5: comment synced with MODEL_ERROR_CODES). ONLY
     // the codes in MODEL_ERROR_CODES make the machine UNBUILDABLE and throw at
     // construction — today that set is exactly {INVALID_STATE_PATH} (a broken
@@ -417,6 +484,66 @@ export class StateMachine<
     return Promise.resolve(true)
   }
 
+  /**
+   * SPEC §7: enqueue an external event whose caller wants the detailed
+   * {@link FireResult} rather than a bare boolean. Shares the reentrancy and
+   * overflow preconditions with {@link enqueueEvent} (both are genuine
+   * programming errors and still REJECT), but on the normal path the drain
+   * settles the caller via `resolveDetailed` with the FireResult the transition
+   * computes — including the non-throwing `no-transition` outcome.
+   */
+  private enqueueDetailedEvent(
+    eventName: string,
+    obj: Adapter<PropertiesOf<TOwner>>,
+    args: any[],
+  ): Promise<FireResult> {
+    if (
+      this.activeDrainEpoch !== null &&
+      this.drainContext.getStore() === this.activeDrainEpoch
+    ) {
+      const _sr = this.safeGetCurrentState(obj)
+      return Promise.reject(
+        new StateMachineError(
+          'Reentrant fireEventDetailed from within an action/guard is not ' +
+            'supported; model the follow-up as an internal transition, or ' +
+            'dispatch it from an independent async callback rather than inline',
+          {
+            ...(_sr !== undefined ? { state: _sr } : {}),
+            event: eventName,
+          },
+        ),
+      )
+    }
+    if (
+      this.externalQueue.length + this.internalQueue.length >=
+      this.maxQueueDepth
+    ) {
+      const _s0 = this.getCurrentState(obj)
+      return Promise.reject(
+        new StateMachineError('Event queue overflow — possible infinite loop', {
+          /* c8 ignore next */
+          ...(_s0 !== undefined ? { state: _s0 } : {}),
+          event: eventName,
+        }),
+      )
+    }
+    return new Promise<FireResult>((resolve, reject) => {
+      this.externalQueue.push({
+        id: `ext_${++this.eventIdCounter}`,
+        eventName,
+        obj,
+        args,
+        // `reject` also settles the boolean path if applyTransition throws.
+        reject,
+        resolveDetailed: resolve,
+        detailed: true,
+        timestamp: this.clock(),
+        type: 'external',
+      })
+      this.scheduleProcessing()
+    })
+  }
+
   private raiseEvent(
     eventName: string,
     obj: Adapter<PropertiesOf<TOwner>>,
@@ -534,7 +661,16 @@ export class StateMachine<
             thrownError = error
           }
           if (threw) {
+            // A genuine apply/runtime error rejects BOTH the boolean and the
+            // detailed callers (evt.reject is set on both paths).
             evt.reject?.(thrownError)
+          } else if (evt.detailed) {
+            // SPEC §7: settle `fireEventDetailed` with the FireResult that
+            // executeQueuedTransition wrote (no-candidate/guard cases never
+            // threw, so this branch, not reject, is taken).
+            evt.resolveDetailed?.(
+              evt.detailResult ?? { fired: false, reason: 'no-transition' },
+            )
           } else {
             evt.resolve?.(result as boolean)
           }
@@ -660,11 +796,19 @@ export class StateMachine<
     /* c8 ignore next */
     const currentState: string = currentStateRaw ?? ''
 
+    // PERF-01: parse the active configuration ONCE for this fireEvent and reuse
+    // it across every candidate's eligibility check and for dominance's active
+    // leaves — the naive path re-parsed `currentState` per transition.
+    const parsed = this.parseCompositeState(currentState)
+    const activeLeaves = Array.from(parsed.values())
+
     let event = this.events.get(eventName as keyof SMConfig['events'])
-    let transitions = event
-      ? event.transitions.filter((t) =>
-        this.isTransitionPossible(t, currentState),
-      )
+    // SPEC §4 / PERF-07: candidates come from the pre-sorted per-event list;
+    // filtering by eligibility is stable, so the ordering survives untouched.
+    let candidates = event
+      ? (this.orderedTransitions.get(String(eventName)) ?? []).filter((p) =>
+          this.isTransitionPossible(p.transition, currentState, parsed),
+        )
       : []
 
     // D11: engine-generated `done.state.<id>` completion events must NEVER fall
@@ -672,29 +816,38 @@ export class StateMachine<
     // spurious transition on a machine that uses `*` as a catch-all. They only
     // ever match an explicitly-declared `done.state.<id>` event (handled above).
     const isEngineDoneEvent = String(eventName).startsWith('done.state.')
-    if (!transitions.length && !isEngineDoneEvent) {
+    if (!candidates.length && !isEngineDoneEvent) {
       const wildcardEvent = this.events.get('*' as keyof SMConfig['events'])
       if (wildcardEvent) {
-        const wildcardTransitions = wildcardEvent.transitions.filter((t) =>
-          this.isTransitionPossible(t, currentState),
+        const wildcardCandidates = (
+          this.orderedTransitions.get('*') ?? []
+        ).filter((p) =>
+          this.isTransitionPossible(p.transition, currentState, parsed),
         )
-        if (wildcardTransitions.length > 0) {
+        if (wildcardCandidates.length > 0) {
           event = wildcardEvent
-          transitions = wildcardTransitions
+          candidates = wildcardCandidates
         }
       }
     }
 
-    if (!event || !transitions.length) {
+    if (!event || !candidates.length) {
+      // SPEC §7: `fireEventDetailed` NEVER throws on no candidate — it resolves
+      // `{ fired:false, reason:'no-transition' }`. `fireEvent` keeps throwing.
+      if (queuedEvent.detailed) {
+        queuedEvent.detailResult = { fired: false, reason: 'no-transition' }
+        return false
+      }
       throw new StateMachineError(
         `Invalid event: ${eventName} for state: ${currentState}`,
         { state: currentState, event: eventName },
       )
     }
 
-    const allowedTransition = await this.getAllowedTransitions(
+    const { selected, rejected } = await this.selectTransition(
       targetObj,
-      transitions,
+      candidates,
+      activeLeaves,
       ...args,
     ).catch((error) => {
       this.logger.error(
@@ -703,12 +856,35 @@ export class StateMachine<
         /* c8 ignore next */
         error instanceof Error ? error : new Error(String(error)),
       )
-      return undefined
+      return {
+        selected: undefined as
+          | Transition<TOwner, SMConfig['states']>
+          | undefined,
+        rejected: [] as Array<{
+          transition: string
+          reason: 'guard-rejected' | 'guard-error'
+          error?: Error
+        }>,
+      }
     })
 
-    if (!allowedTransition) {
+    if (!selected) {
+      // SPEC §7: distinguish guard-error from an honest guard-rejected (F4).
+      if (queuedEvent.detailed) {
+        const hadError = rejected.some((r) => r.reason === 'guard-error')
+        queuedEvent.detailResult = {
+          fired: false,
+          reason: hadError
+            ? 'guard-error'
+            : rejected.length > 0
+              ? 'guard-rejected'
+              : 'no-transition',
+          ...(rejected.length > 0 ? { rejected } : {}),
+        }
+      }
       return false
     }
+    const allowedTransition = selected
 
     const toState = await this.applyTransition(
       targetObj as any,
@@ -752,10 +928,28 @@ export class StateMachine<
     })
 
     if (!toState) {
+      if (queuedEvent.detailed) {
+        queuedEvent.detailResult = { fired: false, reason: 'no-transition' }
+      }
       return false
     }
 
     this.setCurrentState(toState.name, targetObj)
+    if (queuedEvent.detailed) {
+      const toName = (
+        allowedTransition.to === '*' ? currentState : allowedTransition.to
+      ) as string
+      queuedEvent.detailResult = {
+        fired: true,
+        transitions: [
+          {
+            event: String(eventName),
+            from: allowedTransition.from as string,
+            to: toName,
+          },
+        ],
+      }
+    }
     return true
   }
 
@@ -799,6 +993,48 @@ export class StateMachine<
     }
 
     return this.enqueueEvent(String(eventName), targetObj, args, 'external')
+  }
+
+  /**
+   * SPEC §7 — additive, NON-throwing counterpart to {@link fireEvent}. Returns a
+   * {@link FireResult} discriminated union: on success `{ fired:true,
+   * transitions }`; otherwise `{ fired:false, reason }` where `reason`
+   * distinguishes `no-transition` (no candidate matched), `guard-rejected` (the
+   * ordered candidates' guards all refused), and `guard-error` (a guard THREW —
+   * now observably distinct from an honest refusal, closing F4).
+   *
+   * `fireEvent` is UNCHANGED and still returns `boolean` (throwing on no
+   * candidate): a `{ fired:false }` object is truthy, so switching the return
+   * shape would silently invert every `if (await sm.fireEvent(e))`.
+   */
+  public async fireEventDetailed(
+    eventName: keyof SMConfig['events'] | '*',
+    ...args: any[]
+  ): Promise<FireResult>
+  public async fireEventDetailed(
+    eventName: keyof SMConfig['events'] | '*',
+    obj?: Adapter<PropertiesOf<TOwner>>,
+    ...args: unknown[]
+  ): Promise<FireResult> {
+    let targetObj: Adapter<PropertiesOf<TOwner>>
+    if (!obj) {
+      if (this.adaptee) targetObj = this.adaptee
+      else
+        throw new StateMachineError('no adaptee or object passed', {
+          event: String(eventName),
+        })
+    } else if (!isAdapter(obj)) {
+      args.unshift(obj)
+      if (this.adaptee) targetObj = this.adaptee
+      else
+        throw new StateMachineError('no adaptee or object passed', {
+          event: String(eventName),
+        })
+    } else {
+      targetObj = obj
+    }
+
+    return this.enqueueDetailedEvent(String(eventName), targetObj, args)
   }
 
   public getQueueDepth(): {
@@ -2594,17 +2830,179 @@ export class StateMachine<
     return executeAction()
   }
 
-  private async getAllowedTransitions(
-    obj: Adapter<PropertiesOf<TOwner>>,
-    transitions: Array<Transition<TOwner, SMConfig['states']>>,
-    ...args: unknown[]
-  ) {
-    let highestPriority = Number.NEGATIVE_INFINITY
-    let selectedTransition: Transition<TOwner, SMConfig['states']> | undefined
+  /**
+   * SPEC §4.2 — specificity class of a transition source: `0` fully-explicit
+   * `from`, `1` partial wildcard (`'a|*'` — some but not all parts are `'*'`),
+   * `2` the full `'*'`. Lower = higher precedence, so an explicit source ALWAYS
+   * beats a wildcard regardless of declaration order (the F9/V2 fix).
+   */
+  private sourceSpecificity(from: string): 0 | 1 | 2 {
+    if (from === '*') return 2
+    return from.split('|').some((part) => part === '*') ? 1 : 0
+  }
 
-    for (const transition of transitions) {
-      if ((transition.priority ?? Number.NEGATIVE_INFINITY) < highestPriority) {
+  /**
+   * SPEC §3 / §4.3 — `matchedSources` for descendant dominance: map each active
+   * atomic leaf this transition's `from` governs to the concrete declared source
+   * part that governs it. Pointwise (per active leaf), NOT a numeric depth, so
+   * only genuine ancestor↔descendant pairs are ranked and sibling regions stay
+   * incomparable. Assumes the transition already passed `isTransitionPossible`.
+   */
+  private computeCoverMap(
+    from: string,
+    activeLeaves: string[],
+  ): Map<string, string> {
+    const map = new Map<string, string>()
+    for (const part of from.split('|')) {
+      if (part === '*') {
+        // A wildcard part governs every active leaf with source '*'. Never
+        // overrides a more specific part that already claimed a leaf.
+        for (const leaf of activeLeaves) {
+          if (!map.has(leaf)) map.set(leaf, '*')
+        }
         continue
+      }
+      let matchedAny = false
+      for (const leaf of activeLeaves) {
+        // `part` is ancestor-or-equal of this active leaf → it governs it.
+        if (leaf === part || leaf.startsWith(part + '.')) {
+          const existing = map.get(leaf)
+          // The DEEPER (more specific) source wins governance of a leaf.
+          if (existing === undefined || part.startsWith(existing + '.')) {
+            map.set(leaf, part)
+          }
+          matchedAny = true
+        }
+      }
+      if (!matchedAny) {
+        // Exotic fast-path: `part` is DEEPER than the active leaf in its region
+        // (isTransitionPossible matched via isParentState(activeLeaf, part)).
+        // Attribute it to that region's active leaf so coverage stays non-empty.
+        const regionKey = this.getRegionKey(part)
+        for (const leaf of activeLeaves) {
+          if (this.getRegionKey(leaf) === regionKey || leaf === regionKey) {
+            if (!map.has(leaf)) map.set(leaf, part)
+          }
+        }
+      }
+    }
+    return map
+  }
+
+  /**
+   * SPEC §4.3 — does `T1` (cover map `m1`) STRICTLY dominate `T2` (`m2`)? True
+   * iff they govern the SAME set of active leaves and, on every leaf, `T1`'s
+   * source equals or is a descendant of `T2`'s, strictly deeper on at least one.
+   * Different coverage (sibling regions/branches) is incomparable → `false`, so
+   * such candidates diverge at document order (§4.4), never by dominance.
+   */
+  private dominates(
+    m1: Map<string, string>,
+    m2: Map<string, string>,
+  ): boolean {
+    if (m1.size !== m2.size) return false
+    let strict = false
+    for (const [leaf, s1] of m1) {
+      const s2 = m2.get(leaf)
+      if (s2 === undefined) return false // incomparable coverage
+      if (s1 === s2) continue
+      if (s1.startsWith(s2 + '.')) {
+        strict = true // s1 is a strict descendant of s2 on this leaf
+        continue
+      }
+      return false // s1 is an ancestor of s2, or unrelated → not dominating
+    }
+    return strict
+  }
+
+  /**
+   * SPEC §4 + §5 — order the already-eligible candidates and run guards LAZILY.
+   *
+   * Candidates arrive pre-sorted by the static keys `(priority ↓, specificity ↑,
+   * docIndex ↑)` (constructor, PERF-07). Here we apply the dynamic descendant-
+   * dominance FILTER (never a comparator branch — dominance is a PARTIAL order,
+   * and branching it would break sort transitivity/stability, §4), then evaluate
+   * guards in that final order up to the FIRST that passes; the remaining
+   * candidates' guards are NOT evaluated. A throwing guard is recorded (F7) and
+   * distinguished as `guard-error` from an honest `guard-rejected` (SPEC §7 / F4).
+   */
+  private async selectTransition(
+    obj: Adapter<PropertiesOf<TOwner>>,
+    candidates: PreparedTransition<TOwner, SMConfig['states']>[],
+    activeLeaves: string[],
+    ...args: unknown[]
+  ): Promise<{
+    selected: Transition<TOwner, SMConfig['states']> | undefined
+    rejected: Array<{
+      transition: string
+      reason: 'guard-rejected' | 'guard-error'
+      error?: Error
+    }>
+  }> {
+    const rejected: Array<{
+      transition: string
+      reason: 'guard-rejected' | 'guard-error'
+      error?: Error
+    }> = []
+
+    // Descendant-dominance FILTER (§4, implementation subtlety): drop T2 when a
+    // T1 of the SAME priority AND specificity strictly dominates it. The sorted
+    // order is otherwise preserved.
+    //
+    // Perf (W3-B residual): dominance only ever applies WITHIN a group of equal
+    // (priority, specificity). On a wide event whose candidates differ in those
+    // cheap integer keys — the common case — no pair qualifies, so a cover map
+    // must never be built. Compute cover maps LAZILY, memoized, and only after
+    // the O(1) key check passes; a candidate that shares its keys with no other
+    // costs zero cover-map work. Fast-paths: ≤1 candidate, or all keys distinct.
+    let survivors = candidates
+    if (candidates.length > 1) {
+      // A group exists only if some (priority, specificity) key repeats.
+      const keyCount = new Map<string, number>()
+      let anyGroup = false
+      for (const c of candidates) {
+        const k = `${c.priority} ${c.specificity}`
+        const n = (keyCount.get(k) ?? 0) + 1
+        keyCount.set(k, n)
+        if (n > 1) anyGroup = true
+      }
+      if (anyGroup) {
+        const coverCache: Array<
+          ReturnType<StateMachine<TOwner, SMConfig>['computeCoverMap']> | undefined
+        > = new Array(candidates.length)
+        const coverOf = (i: number) => {
+          let m = coverCache[i]
+          if (!m) {
+            m = this.computeCoverMap(
+              candidates[i]!.transition.from as string,
+              activeLeaves,
+            )
+            coverCache[i] = m
+          }
+          return m
+        }
+        survivors = candidates.filter((c2, i2) => {
+          for (let i1 = 0; i1 < candidates.length; i1++) {
+            if (i1 === i2) continue
+            const c1 = candidates[i1]!
+            if (
+              c1.priority === c2.priority &&
+              c1.specificity === c2.specificity &&
+              this.dominates(coverOf(i1), coverOf(i2))
+            ) {
+              return false
+            }
+          }
+          return true
+        })
+      }
+    }
+
+    // Lazy guards: first candidate whose guard passes wins; the rest are skipped.
+    for (const { transition } of survivors) {
+      const label = `${transition.from} -> ${transition.to}`
+      if (!transition.guard) {
+        return { selected: transition, rejected }
       }
 
       const _guardState = this.getCurrentState(obj)
@@ -2612,74 +3010,83 @@ export class StateMachine<
         /* c8 ignore next */
         ...(_guardState !== undefined ? { state: _guardState } : {}),
         phase: 'guard',
-        transition: `${transition.from} -> ${transition.to}`,
+        transition: label,
       }
 
-      const guardResult = transition.guard
-        ? await this.callAction(obj as any, transition.guard, ...args).catch(
-          (error: unknown) => {
-            // F7: a guard EXCEPTION must reach the OBSERVABLE monitor.recordError
-            // channel (context phase:'guard'), the same visibility contract W1
-            // gives internal runtime errors (reportRuntimeError). Without it a
-            // guard failure is INVISIBLE to a consumer's monitor and to the
-            // quantitative simulator oracles (A1/W5), and indistinguishable from
-            // an honest guard refusal in the metrics. The transition still stays
-            // DISABLED (fireEvent=false — backward compatible), never a throw;
-            // full guard-error-vs-guard-rejected distinguishability is W3-B.
-            const errObj =
-              error instanceof Error ? error : new Error(String(error))
-            if (this.errorHandler.isEnabled()) {
-              const alreadyReported =
-                typeof errObj === 'object' &&
-                errObj !== null &&
-                (errObj as unknown as Record<symbol, unknown>)[
-                  RUNTIME_ERROR_REPORTED
-                ] === true
-              if (!alreadyReported) {
-                try {
-                  this.monitor.recordError(errObj, context)
-                } catch {
-                  /* a monitor sink must never break selection */
-                }
-              }
-              // П2 dedup (W1 parity): mark so a later surfacing of the SAME
-              // error object does not double-count recordError for the
-              // quantitative oracles (W5).
-              try {
-                ;(errObj as unknown as Record<symbol, unknown>)[
-                  RUNTIME_ERROR_REPORTED
-                ] = true
-              } catch {
-                /* frozen/exotic error object — dedup degrades to prior behavior */
-              }
-            }
-            // Preserve the existing onError + default-rethrow behavior
-            // (channel #2 / the disabled-on-throw fallthrough) unchanged.
-            return this.processError(
-              obj as any,
-              context,
-              transition.onError,
-              this.onError,
-            )(error)
-          },
+      let passed = false
+      let threw = false
+      try {
+        passed = Boolean(
+          await this.callAction(obj as any, transition.guard, ...args),
         )
-        : true
-      if (!guardResult) {
-        continue
+      } catch (error) {
+        threw = true
+        // F7: a guard EXCEPTION must reach the OBSERVABLE monitor.recordError
+        // channel (context phase:'guard') — invisible otherwise to a consumer's
+        // monitor and to the quantitative simulator oracles (A1/W5). The
+        // transition stays DISABLED (never a throw). SPEC §7/F4: the cause is
+        // now distinguishable as `guard-error` vs an honest `guard-rejected`.
+        const errObj = error instanceof Error ? error : new Error(String(error))
+        if (this.errorHandler.isEnabled()) {
+          const alreadyReported =
+            typeof errObj === 'object' &&
+            errObj !== null &&
+            (errObj as unknown as Record<symbol, unknown>)[
+              RUNTIME_ERROR_REPORTED
+            ] === true
+          if (!alreadyReported) {
+            try {
+              this.monitor.recordError(errObj, context)
+            } catch {
+              /* a monitor sink must never break selection */
+            }
+          }
+          // П2 dedup (W1 parity): mark so a later surfacing of the SAME error
+          // object does not double-count recordError for the oracles (W5).
+          try {
+            ;(errObj as unknown as Record<symbol, unknown>)[
+              RUNTIME_ERROR_REPORTED
+            ] = true
+          } catch {
+            /* frozen/exotic error object — dedup degrades to prior behavior */
+          }
+        }
+        // Preserve the config-level onError side effect (best-effort); its
+        // result never re-enables the disabled transition, and a rejection from
+        // it must not escape selection.
+        try {
+          await this.processError(
+            obj as any,
+            context,
+            transition.onError,
+            this.onError,
+          )(error)
+        } catch {
+          /* onError best-effort: a throwing/rejecting handler stays contained */
+        }
+        rejected.push({ transition: label, reason: 'guard-error', error: errObj })
       }
 
-      highestPriority = transition.priority ?? Number.NEGATIVE_INFINITY
-      selectedTransition = transition
+      if (passed) {
+        return { selected: transition, rejected }
+      }
+      if (!threw) {
+        rejected.push({ transition: label, reason: 'guard-rejected' })
+      }
     }
 
-    return selectedTransition
+    return { selected: undefined, rejected }
   }
 
   private isTransitionPossible(
     transition: Transition<TOwner, SMConfig['states']>,
     currentState: string,
+    // PERF-01: callers on the hot path (a single fireEvent over many candidates)
+    // pass the ONE parsed active configuration so it is not re-parsed per
+    // transition. `currentState` stays for the standalone (canFireEvent) callers.
+    parsed?: Map<string, string>,
   ): boolean {
-    const currentStates = this.parseCompositeState(currentState)
+    const currentStates = parsed ?? this.parseCompositeState(currentState)
 
     // Handle wildcard transition
     if (transition.from === '*') {

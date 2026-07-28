@@ -356,6 +356,36 @@ export type Event<T extends object, S extends States<T>> = {
   onError?: ErrorHandlerOrString<T>
 }
 
+/**
+ * SPEC §7 — result of {@link StateMachine.fireEventDetailed}. A discriminated
+ * union that, unlike `fireEvent`'s bare `boolean`, NEVER throws and distinguishes
+ * the three no-fire causes:
+ *  - `no-transition` — no candidate matched the active configuration;
+ *  - `guard-rejected` — the ordered candidates' guards all returned falsy;
+ *  - `guard-error` — a candidate's guard THREW (now observably distinct from an
+ *    honest refusal — closes F4).
+ *
+ * `fireEvent` deliberately keeps returning `boolean`: `{ fired: false }` is a
+ * truthy object, so any `if (await sm.fireEvent(e))` would silently invert.
+ */
+export type FireResult =
+  | {
+      fired: true
+      /** Every transition that fired this microstep (single-transition in W3-B). */
+      transitions: Array<{ event: string; from: string; to: string }>
+    }
+  | {
+      fired: false
+      reason: 'no-transition' | 'guard-rejected' | 'guard-error'
+      /** Per-candidate rejection detail, present for the guard-* reasons. */
+      rejected?: Array<{
+        /** `'from -> to'` label of the rejected transition. */
+        transition: string
+        reason: 'guard-rejected' | 'guard-error'
+        error?: Error
+      }>
+    }
+
 ///Record<StateName, Omit<State<T>, 'name'>>
 export type States<T extends object> = Record<StateName, Omit<State<T>, 'name'>>
 export type Events<T extends object, S extends States<T>> = Record<
