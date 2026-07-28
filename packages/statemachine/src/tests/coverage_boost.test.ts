@@ -2574,10 +2574,12 @@ describe('StateMachine deserializeAction edge cases', () => {
     const adapter = new MemoryAdapter({ state: '' })
     const sm = new StateMachine(config, adapter)
     const json = sm.toJSON()
-    // The JSON will have serialized guard as function string or object
-    // Deserialize back — exercises the deserialization branches
+    // W0: the transition guard serializes as a body-free NAME reference under
+    // its inferred name 'guard'; restoration resolves it from the registry.
     const adapter2 = new MemoryAdapter({ state: '' })
-    const sm2 = StateMachine.fromJSON(json, adapter2)
+    const sm2 = StateMachine.fromJSON(json, adapter2, {
+      actions: { guard: (x: any) => !!x },
+    })
     expect(sm2).toBeInstanceOf(StateMachine)
   })
 })

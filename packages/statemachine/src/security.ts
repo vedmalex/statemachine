@@ -14,18 +14,17 @@
  * Removal trigger: when no in-tree code references the file (currently `src/tests/security.test.ts`
  * does), delete the file plus its test plus all four governance-list entries above.
  *
- * Security module for safe function serialization and validation
- * Replaces unsafe `new Function()` usage with secure alternatives
+ * Security module for safe function serialization and validation.
+ *
+ * W0 (defect П1): this module NO LONGER compiles function bodies. Serialization
+ * emits a body-free NAME reference (`{ type: 'function', name }`); restoration is
+ * performed by name against a consumer-supplied registry in `state_machine.ts`.
+ * There is no `new Function`, no `eval`, and no keyless body+hash path — no
+ * deserialization surface turns an attacker-controlled string into code. The
+ * `FunctionValidator` static analyzer remains for host-application use.
  */
 
-import { securityLogger } from './logger'
-import type {
-  ActionOrString,
-  ErrorHandler,
-  ErrorHandlerOrString,
-  EventAction,
-  KeysOf,
-} from './types'
+import type { ActionOrString, ErrorHandlerOrString } from './types'
 
 // Configuration for function security
 /**
@@ -255,18 +254,17 @@ export const DEFAULT_SECURITY_CONFIG: FunctionSecurityConfig = {
  */
 export type SafeSerializedAction =
   | {
+      // A method-name reference resolved at call time against the owner/context.
       type: 'string'
       name: string
     }
   | {
+      // A function reference stored by NAME only (never its body). Restoration
+      // resolves this name against a consumer-supplied registry
+      // (`StateMachineOptions.actions`). W0 invariant: no serialized form ever
+      // carries a compilable function body.
       type: 'function'
-      body: string
-      hash: string // Security hash for validation
-      metadata: {
-        length: number
-        createdAt: number
-        functionName?: string
-      }
+      name: string
     }
 
 /**
@@ -359,45 +357,6 @@ export class FunctionValidator {
     }
     return result.isValid
   }
-
-  /**
-   * Creates a security hash for function validation
-   */
-  async createSecurityHash(body: string, metadata: any): Promise<string> {
-    // Use Web Crypto API for secure hashing
-    const encoder = new TextEncoder()
-    const data = encoder.encode(body + JSON.stringify(metadata))
-
-    // Check if crypto is available (Browser/Node/Bun)
-    if (typeof crypto !== 'undefined' && crypto.subtle) {
-      const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-      return Array.from(new Uint8Array(hashBuffer))
-        .map((b) => b.toString(16).padStart(2, '0'))
-        .join('')
-    }
-
-    // Fallback for environments without crypto.subtle (should be rare in modern envs)
-    // Using a slightly better non-crypto hash (FNV-1a inspired) than the previous simple shift
-    const str = body + JSON.stringify(metadata)
-    let hash = 0x811c9dc5
-    for (let i = 0; i < str.length; i++) {
-      hash ^= str.charCodeAt(i)
-      hash = Math.imul(hash, 0x01000193)
-    }
-    return (hash >>> 0).toString(16)
-  }
-
-  /**
-   * Validates security hash
-   */
-  async validateSecurityHash(
-    body: string,
-    metadata: any,
-    expectedHash: string,
-  ): Promise<boolean> {
-    const actualHash = await this.createSecurityHash(body, metadata)
-    return actualHash === expectedHash
-  }
 }
 
 /**
@@ -411,277 +370,43 @@ export class SafeFunctionSerializer {
   }
 
   /**
-   * Safely serializes an action with security validation (Async)
+   * Serializes an action into a safe, body-free reference (Async).
+   *
+   * Identical to {@link serializeAction} — there is no hashing or crypto, so no
+   * asynchronous work remains. The async signature is retained for the
+   * `toSecureJSON` call-site.
    */
   async serializeActionAsync<TOwner extends object, R = void>(
     action: ActionOrString<TOwner, R> | ErrorHandlerOrString<TOwner>,
     functionName?: string,
   ): Promise<SafeSerializedAction | undefined> {
-    if (typeof action === 'string') {
-      return { type: 'string', name: action }
-    } else if (typeof action === 'function') {
-      const body = action.toString()
-
-      // Validate function body
-      this.validator.validateFunctionBody(body, functionName)
-
-      const metadata = {
-        length: body.length,
-        createdAt: Date.now(),
-        ...(functionName !== undefined ? { functionName } : {}),
-      }
-
-      const hash = await this.validator.createSecurityHash(body, metadata)
-
-      return {
-        type: 'function',
-        body,
-        hash,
-        metadata,
-      }
-    }
-    return undefined
+    return this.serializeAction(action, functionName)
   }
 
   /**
-   * Legacy synchronous serialization (Uses weak hash, kept for backward compatibility)
-   * @deprecated Use serializeActionAsync instead for better security
+   * Serializes an action into a safe, body-free reference.
+   *
+   * - A string action is a method-name reference, kept verbatim.
+   * - A function action is stored by its NAME only (its own `.name`). W0
+   *   invariant (defect П1): the function BODY is never serialized, so no far
+   *   side can recompile it. Restoration resolves the name against a
+   *   consumer-supplied registry (`StateMachineOptions.actions`); an unknown
+   *   name throws instead of compiling anything.
+   *
+   * The former `functionName` slot label is no longer emitted — it is not a
+   * stable identity (many slots share a label) and would collide in a registry.
    */
   serializeAction<TOwner extends object, R = void>(
     action: ActionOrString<TOwner, R> | ErrorHandlerOrString<TOwner>,
-    functionName?: string,
+    _functionName?: string,
   ): SafeSerializedAction | undefined {
     if (typeof action === 'string') {
       return { type: 'string', name: action }
-    } else if (typeof action === 'function') {
-      const body = action.toString()
-      this.validator.validateFunctionBody(body, functionName)
-
-      const metadata = {
-        length: body.length,
-        createdAt: Date.now(),
-        ...(functionName !== undefined ? { functionName } : {}),
-      }
-
-      // Sync version uses the weak fallback hash logic implicitly or needs a sync version of createHash
-      // We'll implement a sync weak hash here inline to preserve sync behavior
-      const str = body + JSON.stringify(metadata)
-      let hash = 0x811c9dc5
-      for (let i = 0; i < str.length; i++) {
-        hash ^= str.charCodeAt(i)
-        hash = Math.imul(hash, 0x01000193)
-      }
-
-      return {
-        type: 'function',
-        body,
-        hash: (hash >>> 0).toString(16),
-        metadata,
-      }
+    }
+    if (typeof action === 'function') {
+      return { type: 'function', name: action.name ?? '' }
     }
     return undefined
-  }
-
-  /**
-   * Safely deserializes an action with security validation (Async)
-   */
-  async deserializeActionAsync<TOwner extends object, R = void>(
-    serializedAction: SafeSerializedAction | undefined,
-  ): Promise<
-    ActionOrString<TOwner, R> | ErrorHandlerOrString<TOwner> | undefined
-  > {
-    if (!serializedAction) {
-      return undefined
-    }
-
-    if (serializedAction.type === 'string') {
-      return serializedAction.name as KeysOf<TOwner, EventAction<TOwner, R>>
-    } else if (serializedAction.type === 'function') {
-      try {
-        // Validate security hash
-        const isValid = await this.validator.validateSecurityHash(
-          serializedAction.body,
-          serializedAction.metadata,
-          serializedAction.hash,
-        )
-
-        if (!isValid) {
-          // Fallback check for legacy weak hash if crypto hash failed
-          // This allows reading old backups/configs
-          const str =
-            serializedAction.body + JSON.stringify(serializedAction.metadata)
-          let hash = 0x811c9dc5
-          for (let i = 0; i < str.length; i++) {
-            hash ^= str.charCodeAt(i)
-            hash = Math.imul(hash, 0x01000193)
-          }
-          const legacyHash = (hash >>> 0).toString(16)
-
-          if (legacyHash !== serializedAction.hash) {
-            throw new Error('Function security hash validation failed')
-          }
-        }
-
-        // Re-validate function body
-        this.validator.validateFunctionBody(
-          serializedAction.body,
-          serializedAction.metadata.functionName,
-        )
-
-        // Create function using safe method
-        return this.createSafeFunction(serializedAction.body)
-      } catch (e) {
-        securityLogger.error(
-          'Error deserializing function',
-          {
-            functionName: serializedAction.metadata.functionName,
-            bodyLength: serializedAction.body.length,
-            hash: serializedAction.hash,
-          },
-          e instanceof Error ? e : new Error(String(e)),
-        )
-        return undefined
-      }
-    }
-    return undefined
-  }
-
-  /**
-   * Safely deserializes an action (Synchronous - Legacy/Weak)
-   */
-  deserializeAction<TOwner extends object, R = void>(
-    serializedAction: SafeSerializedAction | undefined,
-  ): ActionOrString<TOwner, R> | ErrorHandlerOrString<TOwner> | undefined {
-    if (!serializedAction) {
-      return undefined
-    }
-
-    if (serializedAction.type === 'string') {
-      return serializedAction.name as KeysOf<TOwner, EventAction<TOwner, R>>
-    } else if (serializedAction.type === 'function') {
-      try {
-        // Sync validation only checks weak hash
-        const str =
-          serializedAction.body + JSON.stringify(serializedAction.metadata)
-        let hash = 0x811c9dc5
-        for (let i = 0; i < str.length; i++) {
-          hash ^= str.charCodeAt(i)
-          hash = Math.imul(hash, 0x01000193)
-        }
-        const calculatedHash = (hash >>> 0).toString(16)
-
-        if (calculatedHash !== serializedAction.hash) {
-          // We cannot verify crypto hashes synchronously, so we must fail or skip verification
-          // for crypto hashes. If the hash looks like a weak hash (short hex), we check it.
-          // If it looks like SHA-256 (64 chars), we can't verify it sync.
-          if (serializedAction.hash.length === 64) {
-            console.warn(
-              'Warning: Skipping verification of SHA-256 hash in synchronous deserializeAction. Use deserializeActionAsync for security.',
-            )
-          } else {
-            throw new Error('Function security hash validation failed (Legacy)')
-          }
-        }
-
-        this.validator.validateFunctionBody(
-          serializedAction.body,
-          serializedAction.metadata.functionName,
-        )
-
-        return this.createSafeFunction(serializedAction.body)
-      } catch (e) {
-        securityLogger.error(
-          'Error deserializing function',
-          {
-            functionName: serializedAction.metadata.functionName,
-            bodyLength: serializedAction.body.length,
-            hash: serializedAction.hash,
-          },
-          e instanceof Error ? e : new Error(String(e)),
-        )
-        return undefined
-      }
-    }
-    return undefined
-  }
-
-  /**
-   * Safely deserializes legacy function strings (without security metadata)
-   * This method provides backward compatibility for old string-based function serialization
-   * while maintaining security through validation and sandboxing.
-   */
-  deserializeLegacyString(
-    action: string,
-  ): EventAction<any> | ErrorHandler<any> | undefined {
-    if (!action || typeof action !== 'string') {
-      return undefined
-    }
-
-    try {
-      // Validate function body for security threats
-      this.validator.validateFunctionBody(action, 'legacy_deserialization')
-
-      // Create function using the same safe method as modern serialization
-      return this.createSafeFunction(action)
-    } catch (e) {
-      securityLogger.error(
-        'Blocked unsafe legacy function string',
-        { actionLength: action.length },
-        e instanceof Error ? e : new Error(String(e)),
-      )
-      return undefined
-    }
-  }
-
-  /**
-   * Creates a function safely without using new Function()
-   * Uses a whitelist approach with predefined function templates
-   */
-  private createSafeFunction(
-    body: string,
-  ): EventAction<any> | ErrorHandler<any> {
-    // For now, we'll use a safer approach with Function constructor
-    // but with additional validation and sandboxing.
-    //
-    // Important: we must preserve the original function *signature* (parameter names),
-    // because state machine code calls hooks/conditions with specific arguments
-    // (e.g. invoke.cond(adaptee)). Stripping the wrapper breaks that contract.
-    try {
-      const source = body.trim()
-
-      // Executor runs in a restricted scope and evaluates the provided function source
-      // as an expression, then calls it with (adaptee, ...args).
-      const executor = new Function(
-        'adaptee',
-        'args',
-        `
-        // Block dangerous globals by creating local variables that shadow them
-        var eval = undefined;
-        var Function = undefined;
-        var setTimeout = undefined;
-        var setInterval = undefined;
-        var document = undefined;
-        var window = undefined;
-        var global = undefined;
-        var process = undefined;
-        var require = undefined;
-
-        const __fn = (${source});
-        if (typeof __fn !== 'function') {
-          throw new Error('Deserialized source is not a function');
-        }
-        return __fn(adaptee, ...(Array.isArray(args) ? args : []));
-      `,
-      ) as (adaptee: any, args: any[]) => any
-
-      // Preserve varargs call style used across the codebase.
-      return ((adaptee: any, ...args: any[]) => executor(adaptee, args)) as
-        | EventAction<any>
-        | ErrorHandler<any>
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e)
-      throw new Error(`Failed to create safe function: ${message}`)
-    }
   }
 }
 
@@ -695,12 +420,5 @@ export const safeFunctionSerializer = new SafeFunctionSerializer()
  * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
  */
 export const serializeAction = safeFunctionSerializer.serializeAction.bind(
-  safeFunctionSerializer,
-)
-
-/**
- * @deprecated host-application-level enforcement; this module will be removed in a follow-up task.
- */
-export const deserializeAction = safeFunctionSerializer.deserializeAction.bind(
   safeFunctionSerializer,
 )

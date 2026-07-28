@@ -1,3 +1,4 @@
+import { securityLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
 import { type SafeSerializedAction, safeFunctionSerializer } from './security'
 import { createDefaultMonitor } from './monitoring'
@@ -11,6 +12,7 @@ import {
   type Event,
   type EventAction,
   type Events,
+  type FunctionRegistry,
   type IErrorHandler,
   type ILogger,
   type IMonitor,
@@ -770,11 +772,14 @@ export class StateMachine<
     const parsedData = JSON.parse(jsonData)
     const { config, currentState, historyMap, stateEntryTimes } = parsedData
 
+    const registry = options?.actions
     const deserializedStates = StateMachine.deserializeStates<TOwner>(
       config.states,
+      registry,
     )
     const deserializedEvents = StateMachine.deserializeEvents<TOwner>(
       config.events,
+      registry,
     )
 
     const smConfig: StateMachineConfig<TOwner> = {
@@ -783,10 +788,10 @@ export class StateMachine<
       stateAttribute: config.stateAttribute,
       states: deserializedStates,
       events: deserializedEvents,
-      onError: StateMachine.deserializeAction(config.onError) as KeysOf<
-        TOwner,
-        ErrorHandler<TOwner>
-      >,
+      onError: StateMachine.deserializeAction(
+        config.onError,
+        registry,
+      ) as KeysOf<TOwner, ErrorHandler<TOwner>>,
     }
 
     const sm = new StateMachine<TOwner, StateMachineConfig<TOwner>>(
@@ -822,11 +827,12 @@ export class StateMachine<
     const parsedData = JSON.parse(jsonData)
     const { config, currentState, historyMap, stateEntryTimes } = parsedData
 
+    const registry = options?.actions
     // Async deserialization of states and events
     const deserializedStates =
-      await StateMachine.deserializeStatesAsync<TOwner>(config.states)
+      await StateMachine.deserializeStatesAsync<TOwner>(config.states, registry)
     const deserializedEvents =
-      await StateMachine.deserializeEventsAsync<TOwner>(config.events)
+      await StateMachine.deserializeEventsAsync<TOwner>(config.events, registry)
 
     const smConfig: StateMachineConfig<TOwner> = {
       name: 'DeserializedStateMachine',
@@ -836,6 +842,7 @@ export class StateMachine<
       events: deserializedEvents,
       onError: (await StateMachine.deserializeActionAsync(
         config.onError,
+        registry,
       )) as KeysOf<TOwner, ErrorHandler<TOwner>>,
     }
 
@@ -862,6 +869,7 @@ export class StateMachine<
    */
   private static async deserializeStatesAsync<TOwner extends object>(
     statesConfig: any,
+    registry?: FunctionRegistry,
   ): Promise<States<TOwner>> {
     const result: States<TOwner> = {}
     for (const [name, stateData] of Object.entries(statesConfig) as [
@@ -872,27 +880,43 @@ export class StateMachine<
         ...stateData,
         onBeforeEnter: await StateMachine.deserializeActionAsync(
           stateData.onBeforeEnter,
+          registry,
         ),
-        onEnter: await StateMachine.deserializeActionAsync(stateData.onEnter),
+        onEnter: await StateMachine.deserializeActionAsync(
+          stateData.onEnter,
+          registry,
+        ),
         onAfterEnter: await StateMachine.deserializeActionAsync(
           stateData.onAfterEnter,
+          registry,
         ),
         onBeforeExit: await StateMachine.deserializeActionAsync(
           stateData.onBeforeExit,
+          registry,
         ),
-        onExit: await StateMachine.deserializeActionAsync(stateData.onExit),
+        onExit: await StateMachine.deserializeActionAsync(
+          stateData.onExit,
+          registry,
+        ),
         onAfterExit: await StateMachine.deserializeActionAsync(
           stateData.onAfterExit,
+          registry,
         ),
-        onError: await StateMachine.deserializeActionAsync(stateData.onError),
+        onError: await StateMachine.deserializeActionAsync(
+          stateData.onError,
+          registry,
+        ),
       }
 
       if (stateData.invoke && Array.isArray(stateData.invoke)) {
         deserializedState.invoke = await Promise.all(
           stateData.invoke.map(async (inv: any) => ({
             ...inv,
-            cond: await StateMachine.deserializeActionAsync(inv.cond),
-            action: await StateMachine.deserializeActionAsync(inv.action),
+            cond: await StateMachine.deserializeActionAsync(inv.cond, registry),
+            action: await StateMachine.deserializeActionAsync(
+              inv.action,
+              registry,
+            ),
           })),
         )
       }
@@ -907,6 +931,7 @@ export class StateMachine<
    */
   private static deserializeStates<TOwner extends object>(
     statesConfig: any,
+    registry?: FunctionRegistry,
   ): States<TOwner> {
     return Object.entries(statesConfig).reduce(
       (acc, [name, stateData]: [string, any]) => {
@@ -914,20 +939,30 @@ export class StateMachine<
           ...stateData,
           onBeforeEnter: StateMachine.deserializeAction(
             stateData.onBeforeEnter,
+            registry,
           ),
-          onEnter: StateMachine.deserializeAction(stateData.onEnter),
-          onAfterEnter: StateMachine.deserializeAction(stateData.onAfterEnter),
-          onBeforeExit: StateMachine.deserializeAction(stateData.onBeforeExit),
-          onExit: StateMachine.deserializeAction(stateData.onExit),
-          onAfterExit: StateMachine.deserializeAction(stateData.onAfterExit),
-          onError: StateMachine.deserializeAction(stateData.onError),
+          onEnter: StateMachine.deserializeAction(stateData.onEnter, registry),
+          onAfterEnter: StateMachine.deserializeAction(
+            stateData.onAfterEnter,
+            registry,
+          ),
+          onBeforeExit: StateMachine.deserializeAction(
+            stateData.onBeforeExit,
+            registry,
+          ),
+          onExit: StateMachine.deserializeAction(stateData.onExit, registry),
+          onAfterExit: StateMachine.deserializeAction(
+            stateData.onAfterExit,
+            registry,
+          ),
+          onError: StateMachine.deserializeAction(stateData.onError, registry),
         }
 
         if (stateData.invoke && Array.isArray(stateData.invoke)) {
           deserializedState.invoke = stateData.invoke.map((inv: any) => ({
             ...inv,
-            cond: StateMachine.deserializeAction(inv.cond),
-            action: StateMachine.deserializeAction(inv.action),
+            cond: StateMachine.deserializeAction(inv.cond, registry),
+            action: StateMachine.deserializeAction(inv.action, registry),
           }))
         }
 
@@ -943,6 +978,7 @@ export class StateMachine<
    */
   private static async deserializeEventsAsync<TOwner extends object>(
     eventsConfig: any,
+    registry?: FunctionRegistry,
   ): Promise<Events<TOwner, States<TOwner>>> {
     const result: Events<TOwner, States<TOwner>> = {}
     for (const [name, eventData] of Object.entries(eventsConfig) as [
@@ -951,15 +987,25 @@ export class StateMachine<
     ][]) {
       result[name] = {
         ...eventData,
-        onBefore: await StateMachine.deserializeActionAsync(eventData.onBefore),
-        onAfter: await StateMachine.deserializeActionAsync(eventData.onAfter),
+        onBefore: await StateMachine.deserializeActionAsync(
+          eventData.onBefore,
+          registry,
+        ),
+        onAfter: await StateMachine.deserializeActionAsync(
+          eventData.onAfter,
+          registry,
+        ),
         onSuccess: await StateMachine.deserializeActionAsync(
           eventData.onSuccess,
+          registry,
         ),
-        onError: await StateMachine.deserializeActionAsync(eventData.onError),
+        onError: await StateMachine.deserializeActionAsync(
+          eventData.onError,
+          registry,
+        ),
         transitions: await Promise.all(
           eventData.transitions.map((transitionData: any) =>
-            StateMachine.deserializeTransitionAsync(transitionData),
+            StateMachine.deserializeTransitionAsync(transitionData, registry),
           ),
         ),
       }
@@ -972,17 +1018,21 @@ export class StateMachine<
    */
   private static deserializeEvents<TOwner extends object>(
     eventsConfig: any,
+    registry?: FunctionRegistry,
   ): Events<TOwner, States<TOwner>> {
     return Object.entries(eventsConfig).reduce(
       (acc, [name, eventData]: [string, any]) => {
         acc[name] = {
           ...eventData,
-          onBefore: StateMachine.deserializeAction(eventData.onBefore),
-          onAfter: StateMachine.deserializeAction(eventData.onAfter),
-          onSuccess: StateMachine.deserializeAction(eventData.onSuccess),
-          onError: StateMachine.deserializeAction(eventData.onError),
+          onBefore: StateMachine.deserializeAction(eventData.onBefore, registry),
+          onAfter: StateMachine.deserializeAction(eventData.onAfter, registry),
+          onSuccess: StateMachine.deserializeAction(
+            eventData.onSuccess,
+            registry,
+          ),
+          onError: StateMachine.deserializeAction(eventData.onError, registry),
           transitions: eventData.transitions.map((transitionData: any) =>
-            StateMachine.deserializeTransition(transitionData),
+            StateMachine.deserializeTransition(transitionData, registry),
           ),
         }
         return acc
@@ -996,16 +1046,22 @@ export class StateMachine<
    */
   private static async deserializeTransitionAsync(
     transitionData: any,
+    registry?: FunctionRegistry,
   ): Promise<any> {
     return {
       ...transitionData,
-      guard: await StateMachine.deserializeActionAsync(transitionData.guard),
+      guard: await StateMachine.deserializeActionAsync(
+        transitionData.guard,
+        registry,
+      ),
       // Support 'action' alias for 'onTransition'
       onTransition: await StateMachine.deserializeActionAsync(
         transitionData.onTransition || transitionData.action,
+        registry,
       ),
       onError: await StateMachine.deserializeActionAsync(
         transitionData.onError,
+        registry,
       ),
     }
   }
@@ -1013,63 +1069,122 @@ export class StateMachine<
   /**
    * Deserialize transition configuration
    */
-  private static deserializeTransition(transitionData: any): any {
+  private static deserializeTransition(
+    transitionData: any,
+    registry?: FunctionRegistry,
+  ): any {
     return {
       ...transitionData,
-      guard: StateMachine.deserializeAction(transitionData.guard),
+      guard: StateMachine.deserializeAction(transitionData.guard, registry),
       // Support 'action' alias for 'onTransition' for compatibility
       onTransition: StateMachine.deserializeAction(
-        transitionData.onTransition || transitionData.action
+        transitionData.onTransition || transitionData.action,
+        registry,
       ),
-      onError: StateMachine.deserializeAction(transitionData.onError),
+      onError: StateMachine.deserializeAction(transitionData.onError, registry),
     }
   }
 
   /**
-   * Static method for deserializing actions (Async)
+   * Static method for deserializing actions (Async).
+   *
+   * Identical resolution to the sync path — restoration is registry-based and
+   * never compiles a body, so no asynchronous work remains. Retained async for
+   * the `fromSecureJSON` call-site.
    */
-  private static async deserializeActionAsync(action: any): Promise<any> {
-    if (!action) return action
-
-    if (typeof action === 'object' && action.type === 'function') {
-      return safeFunctionSerializer.deserializeActionAsync(action)
-    }
-
-    return StateMachine.deserializeAction(action)
+  private static async deserializeActionAsync(
+    action: any,
+    registry?: FunctionRegistry,
+  ): Promise<any> {
+    return StateMachine.deserializeAction(action, registry)
   }
 
   /**
-   * Static method for deserializing actions (now using safe deserializer)
+   * Restores a serialized action reference WITHOUT ever compiling a string.
+   *
+   * W0 security invariant (defect П1): no deserialization path turns an
+   * attacker-controlled string into executable code.
+   *
+   *  - `{ type: 'function', name }` — a function reference. Resolved by NAME
+   *    against the consumer-supplied registry (`options.actions`). An unknown
+   *    (present but unregistered) name THROWS {@link StateMachineError} — never
+   *    a silent no-op, never a compile. A nameless entry (an anonymous function
+   *    that could not be given a stable identity, or a poisoned legacy
+   *    body-carrying form) cannot be resolved: its body is IGNORED, it is
+   *    loudly logged, and it restores to `undefined` — it is never compiled.
+   *  - `{ type: 'string', name }` — a method-name reference; returned as the
+   *    bare name and resolved lazily at call time against the owner/context.
+   *  - a bare string — a method-name reference; returned verbatim. A
+   *    code-looking string is NOT compiled; it is simply an action name that
+   *    fails to resolve and throws at call time.
    */
-  private static deserializeAction(action: any): any {
+  private static deserializeAction(
+    action: any,
+    registry?: FunctionRegistry,
+  ): any {
     if (!action) return action
 
-    // 1. Modern secure format with type and hash validation
-    if (typeof action === 'object' && action.type === 'function') {
-      return safeFunctionSerializer.deserializeAction(action)
-    }
-
-    // 2. Legacy string format (function or arrow function)
-    if (typeof action === 'string') {
-      const trimmed = action.trim()
-
-      // Check if it looks like function code (not just a function name)
-      if (
-        trimmed.startsWith('function') ||
-        trimmed.startsWith('(') ||
-        trimmed.includes('=>')
-      ) {
-        // Use secure deserializer for legacy strings
-        const safeFn = safeFunctionSerializer.deserializeLegacyString(action)
-        if (safeFn) {
-          return safeFn
-        }
-        // If validation failed, return undefined to prevent execution
-        return undefined
+    if (typeof action === 'object') {
+      if (action.type === 'string') {
+        return action.name
       }
+
+      if (action.type === 'function') {
+        const name = typeof action.name === 'string' ? action.name : ''
+
+        if (name.length === 0) {
+          // Nameless reference: an anonymous function (no stable identity to
+          // key a registry on) or a poisoned legacy `{ body, hash }` form.
+          // The body — if any — is NEVER compiled. Fail closed to undefined,
+          // but do so loudly rather than silently.
+          if (
+            Object.prototype.hasOwnProperty.call(action, 'body') ||
+            Object.prototype.hasOwnProperty.call(action, 'hash')
+          ) {
+            securityLogger.warn(
+              'Refused to restore a body-carrying serialized function; function bodies are never compiled (W0). Restoring as undefined.',
+              { keys: Object.keys(action) },
+            )
+          } else {
+            securityLogger.warn(
+              'Serialized function reference has no name and cannot be resolved from the registry; restoring as undefined.',
+              {},
+            )
+          }
+          return undefined
+        }
+
+        // OWN-key lookup only. A bracket index (`registry[name]`) walks the
+        // prototype chain, so a serialized name of 'constructor' / 'toString' /
+        // 'valueOf' / 'hasOwnProperty' would resolve to an Object.prototype
+        // builtin (the Object constructor is itself `typeof 'function'`) and
+        // slip past the unknown-name throw. Object.hasOwn confines resolution to
+        // the registry's OWN entries, so any inherited name fails closed to the
+        // throw below (W0 defense-in-depth; not RCE — a leaked builtin cannot
+        // compile code — but the 'unknown name → throw' contract must hold).
+        const fn =
+          registry && Object.hasOwn(registry, name) ? registry[name] : undefined
+        if (typeof fn !== 'function') {
+          throw new StateMachineError(
+            `Cannot restore function '${name}': it is not present in the provided function registry (options.actions). ` +
+              'Serialized state machines restore functions by name from a consumer-supplied registry; function bodies are never compiled.',
+            { action: name },
+          )
+        }
+        return fn
+      }
+
+      // Any other object shape passes through untouched.
+      return action
     }
 
-    // 3. Action name reference (regular string like 'onEnter')
+    // Bare string: a method-name reference resolved lazily at call time. Never
+    // compiled — a code-looking string is just a name that will fail to resolve.
+    if (typeof action === 'string') {
+      return action
+    }
+
+    // Anything else (already a function, etc.) passes through untouched.
     return action
   }
 

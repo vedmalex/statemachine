@@ -222,7 +222,11 @@ describe('StateMachine Performance Tests', () => {
 
       // Deserialization performance
       const deserializeStart = performance.now()
-      const deserialized = StateMachine.fromJSON(serialized, adapter)
+      // W0: each generated state's onEnter/onExit serialize as body-free NAME
+      // references; restoration resolves them from the registry.
+      const deserialized = StateMachine.fromJSON(serialized, adapter, {
+        actions: { onEnter: () => {}, onExit: () => {} },
+      })
       const deserializeTime = performance.now() - deserializeStart
 
       metrics.recordMetric('deserialization_time', deserializeTime)
@@ -253,7 +257,10 @@ describe('StateMachine Performance Tests', () => {
 
         // Serialize/deserialize
         const serialized = sm.toJSON()
-        StateMachine.fromJSON(serialized, adapter)
+        // W0: onEnter/onExit restore by NAME from the registry, never a body.
+        StateMachine.fromJSON(serialized, adapter, {
+          actions: { onEnter: () => {}, onExit: () => {} },
+        })
 
         // Force garbage collection periodically
         if (iteration % 10 === 0 && global.gc) {

@@ -346,8 +346,12 @@ describe('Advanced Features: Wildcards & Timers', () => {
 
     // Восстанавливаем с ДРУГИМ контекстом (valid=false)
     // Условие должно провериться заново при восстановлении
+    // W0: the invoke `cond` serializes under its inferred name 'cond'; supply
+    // it via the registry so restoration resolves the reference (never a
+    // recompiled body). The restored cond re-reads the new context's `valid`.
+    const condRegistry = { actions: { cond: (ctx: any) => ctx.valid === true } }
     const adapter2 = new MemoryAdapter({ state: '', valid: false })
-    const sm2 = StateMachine.fromJSON(json, adapter2)
+    const sm2 = StateMachine.fromJSON(json, adapter2, condRegistry)
 
     expect(sm2.getCurrentState()).toBe('start')
 
@@ -359,7 +363,7 @@ describe('Advanced Features: Wildcards & Timers', () => {
 
     // Теперь восстанавливаем с valid=true
     const adapter3 = new MemoryAdapter({ state: '', valid: true })
-    const sm3 = StateMachine.fromJSON(json, adapter3)
+    const sm3 = StateMachine.fromJSON(json, adapter3, condRegistry)
 
     // Ждем > 100мс
     await new Promise((r) => setTimeout(r, 150))

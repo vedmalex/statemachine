@@ -144,7 +144,29 @@ export interface StateMachineOptions {
    * Default: 1000
    */
   maxQueueDepth?: number
+  /**
+   * Named-function registry consulted by `fromJSON` / `fromSecureJSON` to
+   * restore serialized function references (guards / actions / onError / …).
+   *
+   * Security invariant (W0 / defect П1): NO deserialization path turns an
+   * attacker-controlled STRING into executable code. Serialized machines store
+   * a function's NAME only — never its body — and restoration resolves that
+   * name against THIS registry. A serialized function reference whose name is
+   * not present here throws {@link StateMachineError}; a body is never compiled.
+   *
+   * Keys are function identities (a function's own `.name`, i.e. what
+   * `serializeAction` recorded); values are the actual functions supplied by
+   * the consumer.
+   */
+  actions?: FunctionRegistry
 }
+
+/**
+ * Consumer-supplied map of function identity name → function, used by
+ * `StateMachine.fromJSON` / `fromSecureJSON` to restore serialized function
+ * references. See {@link StateMachineOptions.actions}.
+ */
+export type FunctionRegistry = Record<string, (...args: any[]) => any>
 
 // Simplified and composable StatePaths types for better TypeScript performance
 type StringKey = string & {}

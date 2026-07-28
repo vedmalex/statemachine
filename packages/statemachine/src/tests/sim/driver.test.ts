@@ -362,7 +362,7 @@ describe('driver/settle: all 12 dst.test.ts behaviors via settleMacrostep (DoD 1
     const { scheduler: scheduler2, view: view2 } = makeObservableScheduler(clock)
     const env2 = makeEnv(makeAsyncCounter(), view2)
     const adapter2 = new MemoryAdapter<Box>({ state: '', count: 0 })
-    const sm2 = StateMachine.fromJSON<Box, typeof config>(json, adapter2, { clock: clock.now, scheduler: scheduler2 })
+    const sm2 = StateMachine.fromJSON<Box, typeof config>(json, adapter2, { clock: clock.now, scheduler: scheduler2, actions: { onEnter: (o: Box) => { o.count++ } } })
     await settleMacrostep({ sm: sm2, scheduler: scheduler2, clock, env: env2, policy: 'safety' })
     expect(sm2.getCurrentState()).toBe('start')
     clock.set(999)
@@ -437,7 +437,7 @@ describe('driver/settle: all 12 dst.test.ts behaviors via settleMacrostep (DoD 1
 
     const { scheduler: scheduler2, view: view2 } = makeObservableScheduler(clock)
     const env2 = makeEnv(makeAsyncCounter(), view2)
-    const sm2 = StateMachine.fromJSON<Box, typeof config>(json, new MemoryAdapter<Box>({ state: '', count: 0 }), { clock: clock.now, scheduler: scheduler2 })
+    const sm2 = StateMachine.fromJSON<Box, typeof config>(json, new MemoryAdapter<Box>({ state: '', count: 0 }), { clock: clock.now, scheduler: scheduler2, actions: { onEnter: (o: Box) => { o.count++ } } })
     await settleMacrostep({ sm: sm2, scheduler: scheduler2, clock, env: env2, policy: 'safety' })
     clock.set(1122)
     await settleMacrostep({ sm: sm2, scheduler: scheduler2, clock, env: env2, policy: 'safety' })
