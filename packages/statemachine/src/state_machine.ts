@@ -197,6 +197,15 @@ export class StateMachine<
   private persistenceAdapter?: StatePersistenceAdapter
   private activeTimers: Map<string, any[]> = new Map()
   private stateEntryTimes: Map<string, number> = new Map()
+  // OTS (SPEC §6.1): per-microstep guard-result memo so a candidate governing
+  // several active leaves has its guard evaluated at most once. Set/cleared by
+  // computeEnabledSet; undefined outside an OTS selection.
+  private microstepGuardCache:
+    | Map<
+        Transition<TOwner, SMConfig['states']>,
+        { passed: boolean; threw: boolean }
+      >
+    | undefined
 
   // Event Queue Infrastructure (SCXML Run-to-Completion)
   private externalQueue: QueuedEvent<TOwner>[] = []
@@ -844,11 +853,18 @@ export class StateMachine<
       )
     }
 
-    const { selected, rejected } = await this.selectTransition(
+    // SPEC §6.1 (OTS) — build the OPTIMAL TRANSITION SET: for each active atomic
+    // leaf (documentIndex order, W2a) climb its ancestor chain and pick the first
+    // guard-passing candidate governing it (via {@link selectTransition}: W3-B
+    // descendant-dominance + W3-B.1 lazy guard ancestor fallback), claiming the
+    // leaves it covers so each region contributes at most one transition. The
+    // single-region case (exactly one active leaf) collapses to the previous
+    // single `selectTransition` call — selection stays characterization-stable.
+    const { enabled, rejected } = await this.computeEnabledSet(
       targetObj,
       candidates,
       activeLeaves,
-      ...args,
+      args,
     ).catch((error) => {
       this.logger.error(
         'Error determining allowed transition',
@@ -857,9 +873,12 @@ export class StateMachine<
         error instanceof Error ? error : new Error(String(error)),
       )
       return {
-        selected: undefined as
-          | Transition<TOwner, SMConfig['states']>
-          | undefined,
+        enabled: [] as Array<{
+          transition: Transition<TOwner, SMConfig['states']>
+          source: string
+          coveredLeaves: string[]
+          order: number
+        }>,
         rejected: [] as Array<{
           transition: string
           reason: 'guard-rejected' | 'guard-error'
@@ -868,7 +887,7 @@ export class StateMachine<
       }
     })
 
-    if (!selected) {
+    if (enabled.length === 0) {
       // SPEC §7: distinguish guard-error from an honest guard-rejected (F4).
       if (queuedEvent.detailed) {
         const hadError = rejected.some((r) => r.reason === 'guard-error')
@@ -884,12 +903,19 @@ export class StateMachine<
       }
       return false
     }
-    const allowedTransition = selected
 
-    const toState = await this.applyTransition(
+    // SPEC §6.2 — remove conflicting transitions (overlapping exit sets): a
+    // descendant source preempts its ancestor, otherwise the earlier leaf
+    // (documentIndex) wins.
+    const fired = this.resolveConflicts(currentState, enabled)
+
+    // SPEC §6.3 — execute the whole set as ONE atomic microstep (unified exit /
+    // enter / commit / timer teardown+arm / done.state), with timer teardown and
+    // re-arm strictly AFTER the point of no return (П5).
+    const committed = await this.applyMicrostep(
       targetObj as any,
       currentState,
-      allowedTransition,
+      fired,
       args,
       eventName as keyof SMConfig['events'],
       event,
@@ -899,7 +925,9 @@ export class StateMachine<
         {
           event: eventName,
           state: currentState,
-          transition: `${allowedTransition.from} -> ${allowedTransition.to}`,
+          transition: fired
+            .map((f) => `${f.transition.from} -> ${f.transition.to}`)
+            .join(', '),
         },
         /* c8 ignore next */
         error instanceof Error ? error : new Error(String(error)),
@@ -927,30 +955,227 @@ export class StateMachine<
       throw error // Propagate error to caller (e.g. fireEvent rejection)
     })
 
-    if (!toState) {
+    if (!committed) {
       if (queuedEvent.detailed) {
         queuedEvent.detailResult = { fired: false, reason: 'no-transition' }
       }
       return false
     }
 
-    this.setCurrentState(toState.name, targetObj)
+    // applyMicrostep already committed the configuration (history-resolved) as
+    // the single point of no return — do NOT re-write it here.
     if (queuedEvent.detailed) {
-      const toName = (
-        allowedTransition.to === '*' ? currentState : allowedTransition.to
-      ) as string
+      // CONTRACT: fireEvent boolean = "at least one transition fired";
+      // fireEventDetailed.transitions = EVERY fired transition (SPEC §7).
       queuedEvent.detailResult = {
         fired: true,
-        transitions: [
-          {
-            event: String(eventName),
-            from: allowedTransition.from as string,
-            to: toName,
-          },
-        ],
+        transitions: fired.map((f) => ({
+          event: String(eventName),
+          from: f.transition.from as string,
+          to: (f.transition.to === '*' ? currentState : f.transition.to) as string,
+        })),
       }
     }
     return true
+  }
+
+  /**
+   * SPEC §6.1 (OTS) — compute the Optimal Transition Set for one event over the
+   * active configuration. Iterates the active atomic leaves in documentIndex
+   * order (W2a); for each still-UNCLAIMED leaf it selects the first guard-passing
+   * candidate that GOVERNS the leaf (its {@link computeCoverMap} covers it),
+   * ordered/guarded by {@link selectTransition} (W3-B descendant dominance +
+   * W3-B.1 lazy ancestor fallback — the per-node ancestor climb collapses into
+   * selectTransition, which already tries a governing descendant before the
+   * ancestor it dominates). The chosen transition's covered leaves are marked
+   * claimed so each orthogonal region yields at most one transition.
+   */
+  private async computeEnabledSet(
+    obj: Adapter<PropertiesOf<TOwner>>,
+    candidates: PreparedTransition<TOwner, SMConfig['states']>[],
+    activeLeaves: string[],
+    args: unknown[],
+  ): Promise<{
+    enabled: Array<{
+      transition: Transition<TOwner, SMConfig['states']>
+      source: string
+      coveredLeaves: string[]
+      order: number
+    }>
+    rejected: Array<{
+      transition: string
+      reason: 'guard-rejected' | 'guard-error'
+      error?: Error
+    }>
+  }> {
+    const enabled: Array<{
+      transition: Transition<TOwner, SMConfig['states']>
+      source: string
+      coveredLeaves: string[]
+      order: number
+    }> = []
+    const rejected: Array<{
+      transition: string
+      reason: 'guard-rejected' | 'guard-error'
+      error?: Error
+    }> = []
+    const claimed = new Set<string>()
+    // Per-microstep guard memo (see field docs): each candidate's guard runs at
+    // most once even when it governs several leaves.
+    this.microstepGuardCache = new Map()
+
+    // Active leaves in canonical documentIndex order (W2a) so region priority
+    // is deterministic and independent of the activation path.
+    const leaves = [...activeLeaves].sort(
+      (a, b) =>
+        (this.model?.documentIndexOf(a) ?? Number.POSITIVE_INFINITY) -
+        (this.model?.documentIndexOf(b) ?? Number.POSITIVE_INFINITY),
+    )
+
+    // Memoize cover maps: the same candidate is inspected for several leaves.
+    const coverCache = new Map<
+      PreparedTransition<TOwner, SMConfig['states']>,
+      Map<string, string>
+    >()
+    const coverOf = (c: PreparedTransition<TOwner, SMConfig['states']>) => {
+      let m = coverCache.get(c)
+      if (!m) {
+        m = this.computeCoverMap(c.transition.from as string, activeLeaves)
+        coverCache.set(c, m)
+      }
+      return m
+    }
+
+    try {
+      for (const leaf of leaves) {
+        if (claimed.has(leaf)) continue
+        const governing = candidates.filter((c) => coverOf(c).has(leaf))
+        if (governing.length === 0) continue
+        const { selected, rejected: rej } = await this.selectTransition(
+          obj,
+          governing,
+          activeLeaves,
+          ...args,
+        )
+        for (const r of rej) rejected.push(r)
+        if (!selected) continue
+        const cover = this.computeCoverMap(selected.from as string, activeLeaves)
+        const coveredLeaves = Array.from(cover.keys())
+        // Selection precedence: the candidate's index in the pre-sorted
+        // (priority ↓, specificity ↑, docIndex ↑) list — the same order
+        // {@link selectTransition} would pick a single winner by. Used as the
+        // conflict tiebreak between incomparable sources (SPEC §4.4).
+        const order = candidates.findIndex((c) => c.transition === selected)
+        enabled.push({
+          transition: selected,
+          source: selected.from as string,
+          coveredLeaves,
+          order: order < 0 ? Number.POSITIVE_INFINITY : order,
+        })
+        for (const l of coveredLeaves) claimed.add(l)
+      }
+    } finally {
+      this.microstepGuardCache = undefined
+    }
+
+    return { enabled, rejected }
+  }
+
+  /**
+   * SPEC §6.2 — conflict removal over an enabled set. Two transitions conflict
+   * when their exit-sets ({@link exitSetForTransition}) intersect. On a conflict:
+   * if one source is a STRICT DESCENDANT of the other, the descendant preempts
+   * the ancestor (drop the ancestor — SCXML descendant preemption); otherwise the
+   * sources are incomparable (sibling regions both targeting a common ancestor's
+   * exterior) and the WINNER is the one selection would have picked as a single
+   * transition — lower `order` (priority ↓, specificity ↑, DECLARATION docIndex
+   * ↑, §4.4). Using declaration order (not leaf documentIndex) keeps the
+   * single-selection semantics the selection_scxml/characterization gates pin:
+   * two cross-region transitions whose targets both exit the shared parent still
+   * resolve to the FIRST-DECLARED. Disjoint-exit transitions (the OTS common
+   * case — one per region, targets stay inside each region) never intersect, so
+   * they all survive and fire together. Resolves one conflict at a time and
+   * restarts — deterministic and total for the tiny per-event set.
+   */
+  private resolveConflicts(
+    currentState: string,
+    enabled: Array<{
+      transition: Transition<TOwner, SMConfig['states']>
+      source: string
+      coveredLeaves: string[]
+      order: number
+    }>,
+  ): Array<{
+    transition: Transition<TOwner, SMConfig['states']>
+    source: string
+    coveredLeaves: string[]
+    order: number
+  }> {
+    if (enabled.length <= 1) return enabled
+
+    const exitSetOf = new Map<(typeof enabled)[number], Set<string>>()
+    for (const item of enabled) {
+      exitSetOf.set(
+        item,
+        new Set(this.exitSetForTransition(currentState, item.transition)),
+      )
+    }
+    const intersects = (a: Set<string>, b: Set<string>): boolean => {
+      for (const x of a) if (b.has(x)) return true
+      return false
+    }
+    const strictDescendant = (child: string, parent: string): boolean =>
+      child !== parent && child.startsWith(parent + '.')
+
+    const items = enabled.slice()
+    let changed = true
+    while (changed) {
+      changed = false
+      outer: for (let i = 0; i < items.length; i++) {
+        for (let j = i + 1; j < items.length; j++) {
+          const A = items[i]!
+          const B = items[j]!
+          if (!intersects(exitSetOf.get(A)!, exitSetOf.get(B)!)) continue
+          if (strictDescendant(A.source, B.source)) {
+            // A's source is a descendant of B's → A preempts B.
+            items.splice(j, 1)
+          } else if (strictDescendant(B.source, A.source)) {
+            // B's source is a descendant of A's → B preempts A.
+            items.splice(i, 1)
+          } else {
+            // Incomparable sources: keep the one selection would pick first.
+            if (A.order <= B.order) items.splice(j, 1)
+            else items.splice(i, 1)
+          }
+          changed = true
+          break outer
+        }
+      }
+    }
+    return items
+  }
+
+  /**
+   * SPEC §6.2 — the active states a single transition would EXIT: the exit
+   * portion of the enter/exit delta between the current configuration and the
+   * configuration produced by applying only this transition (history-aware). A
+   * `to:'*'` self-transition exits nothing.
+   */
+  private exitSetForTransition(
+    currentState: string,
+    transition: Transition<TOwner, SMConfig['states']>,
+  ): string[] {
+    const raw = transition.to as string
+    if (raw === '*') return []
+    let afterT: string
+    try {
+      afterT = this.orderComposite(
+        this.previewCommitState(currentState, raw as StateName),
+      )
+    } catch {
+      return []
+    }
+    return this.computeEnterExitSets(currentState, afterT).exitStates
   }
 
   /**
@@ -2035,7 +2260,27 @@ export class StateMachine<
     adaptee: Adapter<PropertiesOf<TOwner>>,
   ) {
     const currentState = this.getCurrentState(adaptee) || ''
-    const currentStateMap = this.parseCompositeState(currentState)
+    const newCompositeState = this.computeInternalWrite(currentState, state)
+    adaptee.set(
+      this.stateAttribute,
+      newCompositeState as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
+    )
+  }
+
+  /**
+   * OTS/П5 — pure (non-writing) counterpart of {@link setCurrentStateInternal}:
+   * given an explicit `currentState` string, compute the canonical composite
+   * configuration that entering `state` produces (region expansion + conflict
+   * removal + documentIndex ordering), WITHOUT touching the adaptee. Consumed by
+   * {@link previewCommitState} so the microstep can resolve the fully-committed
+   * target configuration (incl. history) BEFORE it runs enter/exit actions and
+   * arms timers, then write it exactly once (SPEC §6.3 point-of-no-return).
+   */
+  private computeInternalWrite(
+    currentState: string,
+    state: StateName,
+  ): string {
+    const currentStateMap = this.parseCompositeState(currentState || '')
 
     const newStateParts = state.split('|')
     // D1: a bare-root composite that declares regions must NOT short-circuit
@@ -2103,10 +2348,46 @@ export class StateMachine<
       Array.from(currentStateMap.values()).join('|'),
     )
     this.validateCompositeState(newCompositeState)
-    adaptee.set(
-      this.stateAttribute,
-      newCompositeState as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
-    )
+    return newCompositeState
+  }
+
+  /**
+   * OTS/П5 (SPEC §6.3, T3 deep/shallow-history fix) — pure preview of the
+   * committed configuration that entering `state` from `currentStateStr`
+   * produces, INCLUDING history restoration. Mirrors {@link setCurrentState}'s
+   * history branches so the microstep can compute the enter-set from the
+   * ACTUALLY-committed (restored) configuration, not the regional default —
+   * closing T3 where onEnter/invoke previously armed the default leaf while the
+   * real committed leaf was the restored one.
+   */
+  private previewCommitState(
+    currentStateStr: string,
+    state: StateName,
+  ): string {
+    // Compute the default (non-history) expansion FIRST — mirroring the historic
+    // two-step write (updateState default-expansion → setCurrentState history
+    // overlay): the base strips conflicting/root states (e.g. a `stopped` root
+    // that the target replaces) so a shallow-history overlay restores onto the
+    // already-cleaned configuration rather than leaking the source root.
+    const base = this.computeInternalWrite(currentStateStr, state)
+    const stateConfig = this.states.get(state)
+    if (
+      stateConfig?.history &&
+      stateConfig.history !== 'deep' &&
+      stateConfig.regions
+    ) {
+      const historyState = this.historyMap.get(state)
+      if (historyState) {
+        return this.updatePartialState(base, state, historyState)
+      }
+    }
+    if (stateConfig?.history === 'deep' && stateConfig.regions) {
+      const historyState = this.historyMap.get(state)
+      if (historyState) {
+        return this.orderComposite(historyState)
+      }
+    }
+    return base
   }
 
   /**
@@ -3027,6 +3308,24 @@ export class StateMachine<
         return { selected: transition, rejected }
       }
 
+      // OTS (SPEC §6.1) — a candidate can GOVERN several active leaves, so the
+      // per-leaf climb would otherwise evaluate its guard once per governed leaf.
+      // A guard is deterministic for the microstep, so its result is cached
+      // (keyed by transition reference) and reused: each guard runs AT MOST ONCE
+      // per microstep, preserving the single-region "guard called exactly once"
+      // contract even when firing across regions (side-effecting done.state
+      // guards must not double-count).
+      const cache = this.microstepGuardCache
+      const cached = cache?.get(transition)
+      if (cached) {
+        if (cached.passed) return { selected: transition, rejected }
+        rejected.push({
+          transition: label,
+          reason: cached.threw ? 'guard-error' : 'guard-rejected',
+        })
+        continue
+      }
+
       const _guardState = this.getCurrentState(obj)
       const context: ErrorContext = {
         /* c8 ignore next */
@@ -3089,6 +3388,8 @@ export class StateMachine<
         rejected.push({ transition: label, reason: 'guard-error', error: errObj })
       }
 
+      this.microstepGuardCache?.set(transition, { passed, threw })
+
       if (passed) {
         return { selected: transition, rejected }
       }
@@ -3149,171 +3450,243 @@ export class StateMachine<
     )
   }
 
-  private async applyTransition(
+  /**
+   * SPEC §6.3 — execute the Optimal Transition Set (one or many transitions) as
+   * ONE atomic microstep. Returns the committed configuration string, or
+   * `undefined` when the microstep aborted (invalid target / onExit-abort /
+   * transitionTimeout). Throws only to PROPAGATE an unhandled action error (the
+   * caller records+rethrows).
+   *
+   * П5 (single root): timer teardown and invoke re-arming happen strictly AFTER
+   * the point of no return (the configuration write), and the enter-set is
+   * computed from the ACTUALLY-committed configuration — so an aborted or
+   * timed-out microstep never destroys the source's still-live timers, a throw
+   * in `onAfter`/`onEnter` never orphans a target timer, and a history restore
+   * arms the RESTORED leaves rather than the regional default.
+   */
+  private async applyMicrostep(
     obj: Adapter<TOwner>,
     currentState: string,
-    transition: Transition<TOwner, SMConfig['states']>,
+    enabled: Array<{
+      transition: Transition<TOwner, SMConfig['states']>
+      source: string
+      coveredLeaves: string[]
+      order: number
+    }>,
     args: any[],
     eventName: keyof SMConfig['events'],
     event: Event<TOwner, SMConfig['states']>,
-  ): Promise<State<TOwner> | undefined> {
+  ): Promise<string | undefined> {
+    const label = enabled
+      .map((e) => `${e.transition.from} -> ${e.transition.to}`)
+      .join(', ')
     const context: ErrorContext = {
       state: currentState,
       event: String(eventName),
-      transition: `${transition.from} -> ${transition.to}`,
+      transition: label,
       phase: 'transition',
     }
 
-    const targetState = transition.to === '*' ? currentState : transition.to
-    this._isTransitioning = true
-    this._targetState = targetState as string
-
-    // D7: compute the immutable new configuration together with its SCXML
-    // ancestor-first enter / descendant-first exit sets ONCE, BEFORE any exit
-    // or enter action runs, so Phase 6 enters know the expanded leaves and
-    // Phase 8 reuses the same `newState` (no recompute). `updateState` calls
-    // `validateCompositeState`, which can throw on a contradictory target; we
-    // wrap the early compute so such a throw aborts cleanly with NO half-run
-    // exit/enter set rather than after Phase 3 has already exited states.
-    let newState: string
+    // Resolve the fully-committed target configuration (region expansion +
+    // conflict removal + HISTORY restoration) BEFORE any action runs, and derive
+    // the enter/exit sets from it. Folding each fired transition's target over a
+    // working copy generalises `updateState` to the whole set (updateState /
+    // previewCommitState are side-effect free). A contradictory target throws
+    // here and aborts cleanly with no half-run action.
+    let finalConfig: string
     let enterStates: string[]
     let exitStates: string[]
     try {
-      newState = this.updateState(currentState, targetState as string)
-      const sets = this.computeEnterExitSets(currentState, newState)
+      let working = currentState
+      for (const { transition } of enabled) {
+        const raw = transition.to as string
+        // T1: a `to:'*'` self-transition resolves to the CURRENT configuration —
+        // no state change, onEnter is not lost (nothing to enter/exit), only the
+        // transition action runs. (Never the old broken `enterFireOrder:['*']`.)
+        if (raw === '*') continue
+        working = this.previewCommitState(working, raw as StateName)
+      }
+      finalConfig = this.orderComposite(working)
+      const sets = this.computeEnterExitSets(currentState, finalConfig)
       enterStates = sets.enterStates
       exitStates = sets.exitStates
     } catch (error) {
       this.logger.warn('Transition aborted: invalid target configuration', {
         state: currentState,
-        target: String(targetState),
+        target: label,
         error,
       })
-      this._isTransitioning = false
-      this._targetState = undefined
       return undefined
     }
-    // Fallbacks: a flat (non-composite) transition has no registered ancestor
-    // chain delta, so drive a single onExit/onEnter for the literal
-    // from/to names, preserving prior behaviour for flat states.
-    const exitFireOrder =
-      exitStates.length > 0 ? exitStates : [transition.from as string]
-    const enterFireOrder =
-      enterStates.length > 0 ? enterStates : [transition.to as string]
 
-    try {
-      // Phase 1 (guard re-check) REMOVED — F8: the winning transition's guard
-      // is already evaluated EXACTLY ONCE in getAllowedTransitions. Re-running
-      // it here double-invoked the winner's guard per fireEvent (calls===2) and
-      // let a non-deterministic guard (true on selection, false on the re-check)
-      // silently CANCEL an already-selected transition on the second evaluation.
-      // abort/errorState handling lives in Phase 3 (onExit → abortOnExitError)
-      // and Phase 6 (onEnter → errorState), NOT in the removed re-check, so this
-      // removal weakens no abort logic. Transition SELECTION is unchanged
-      // (selection characterization gate stays 10/10).
+    this._isTransitioning = true
+    this._targetState = finalConfig
 
-      // Phase 2: Before event action
+    // SPEC §11 — transitionTimeout is enforced per-action inside {@link callAction}
+    // (a `Promise.race` against a scheduler-driven deadline that REJECTS with a
+    // StateMachineError). A microstep is atomic under RTC, so a hung action
+    // surfaces as a normal action throw here and aborts the whole microstep
+    // BEFORE the point of no return — no extra race is needed at this level.
+    type Outcome =
+      | { kind: 'ok' }
+      | { kind: 'abort-exit' }
+      | { kind: 'error-state' }
+      | { kind: 'throw'; error: unknown }
+
+    const risky = async (): Promise<Outcome> => {
+      // Phase 2: before-event action.
       if (event.onBefore) {
         await this.callAction(obj, event.onBefore, ...args).catch(
-          this.processError(
-            obj,
-            { ...context },
-            transition.onError,
-            this.onError,
-          ),
+          this.processError(obj, { ...context }, undefined, this.onError),
         )
       }
 
-      // Phase 3: Exit actions — descendant-first (leaf-to-root) over the
-      // computed exit set (D2). Each exited leaf clears its own per-leaf
-      // invoke timers inside executeExitActions, so no timer leaks.
+      // Phase 3: exit ACTIONS — descendant-first over the combined exit set. NO
+      // timer teardown here (П5); timers are torn down post-commit only.
       try {
-        for (const exitStateName of exitFireOrder) {
+        for (const exitStateName of exitStates) {
           await this.executeExitActions(obj, exitStateName, args, context)
         }
       } catch (error) {
-        if (this.abortOnExitError) {
-          this.logger.warn('Transition aborted due to onExit error', { state: currentState, error })
-          return undefined // Stay in source state
+        if (this.abortOnExitError) return { kind: 'abort-exit' }
+        return { kind: 'throw', error }
+      }
+
+      // Phase 4: history — record for every fired transition's source.
+      for (const { transition } of enabled) {
+        this.manageStateHistory(transition.from, currentState, obj)
+      }
+
+      // Phase 5: transition actions — one per fired transition.
+      for (const { transition } of enabled) {
+        if (transition.onTransition) {
+          await this.callAction(obj, transition.onTransition, ...args).catch(
+            this.processError(
+              obj,
+              { ...context },
+              transition.onError,
+              this.onError,
+            ),
+          )
         }
-        throw error // Propagate error (likely stopping transition but potentially leaving inconsistent state if not handled by caller)
       }
 
-      // Phase 4: History management
-      this.manageStateHistory(transition.from, currentState, obj)
-
-      // Phase 5: Transition action
-      if (transition.onTransition) {
-        await this.callAction(obj, transition.onTransition, ...args).catch(
-          this.processError(
-            obj,
-            { ...context },
-            transition.onError,
-            this.onError,
-          ),
-        )
-      }
-
-      // Phase 6: Enter actions — ancestor-first (root-to-leaf) over the
-      // computed enter set (D2), so a composite parent's onEnter fires before
-      // each of its region children and each region leaf arms its own invoke
-      // timers.
+      // Phase 6: enter ACTIONS — ancestor-first over the combined enter set.
+      // Invoke arming is DEFERRED to post-commit (armTimers=false) so a later
+      // throw / timeout aborts before any target timer is armed (EO-4).
       try {
-        for (const enterStateName of enterFireOrder) {
-          await this.executeEnterActions(obj, enterStateName, args, context)
+        for (const enterStateName of enterStates) {
+          await this.executeEnterActions(obj, enterStateName, args, context, false)
         }
       } catch (error) {
-        // ZOMBIE STATE PREVENTION
-        if (this.errorState) {
-          this.logger.error(`Failed to enter state '${targetState}'. Fallback to error state '${this.errorState}'`, { error })
-          const errorNewState = this.updateState(currentState, this.errorState)
-          this.setCurrentState(errorNewState, obj as any)
-          return this.states.get(this.errorState)
-        }
-        throw error
+        if (this.errorState) return { kind: 'error-state' }
+        return { kind: 'throw', error }
       }
 
-      // Phase 7: After event action
+      // Phase 7: after-event action — BEFORE the commit so a throw aborts the
+      // microstep cleanly with NO committed state and NO orphan timer (EO-4).
       if (event.onAfter) {
         try {
           await this.callAction(obj, event.onAfter, ...args)
         } catch (error) {
-          const errorHandler = this.processError(
-            obj,
-            { ...context },
-            event.onError,
-            this.onError,
-          )
-          errorHandler(this.resolveCallbackOwner(obj), error)
+          try {
+            const errorHandler = this.processError(
+              obj,
+              { ...context },
+              event.onError,
+              this.onError,
+            )
+            errorHandler(this.resolveCallbackOwner(obj), error)
+          } catch (rethrown) {
+            return { kind: 'throw', error: rethrown }
+          }
         }
       }
 
-      // Phase 8: State update — reuse the immutable `newState` computed once
-      // before Phase 3 (D7); never recompute. updateState is side-effect-free,
-      // so only the setCurrentState write stays late.
+      return { kind: 'ok' }
+    }
+
+    try {
+      const result = await risky()
+
+      if (result.kind === 'abort-exit') {
+        // EO-5: an aborted (onExit-failed) microstep returns to the source with
+        // its timers INTACT — never a silent torn-down zombie. Because teardown
+        // is post-commit only, the source's invoke/watchdog timers were never
+        // touched, so no re-arm is required (re-arming here would DUPLICATE a
+        // still-live source timer, and re-create a one-shot invoke timer that
+        // already fired — the reentrancy double-fire trap).
+        this.logger.warn('Transition aborted due to onExit error', {
+          state: currentState,
+        })
+        return undefined
+      }
+
+      if (result.kind === 'throw') {
+        // An unhandled action error propagates. The microstep never committed
+        // and teardown is post-commit, so the source timers stand as-is (the
+        // invoke that fired the event was already consumed by the scheduler and
+        // must NOT be re-armed — that would re-trigger the failing event in a
+        // loop). Just rethrow for the caller to record exactly once.
+        throw result.error
+      }
+
+      if (result.kind === 'error-state') {
+        // ZOMBIE STATE PREVENTION: onEnter failed → commit the configured error
+        // state rather than a half-entered zombie. Teardown/arm from the error
+        // configuration, after the write (П5).
+        const errorConfig = this.previewCommitState(
+          currentState,
+          this.errorState as StateName,
+        )
+        const errSets = this.computeEnterExitSets(currentState, errorConfig)
+        this.logger.error(
+          `Failed to enter target '${finalConfig}'. Fallback to error state '${this.errorState}'`,
+        )
+        // The errorState fallback intentionally BYPASSES recordTransition (parity
+        // with the historic zombie-prevention path — it is a recovery write, not
+        // a successful transition).
+        this.commitConfiguration(obj, errorConfig)
+        for (const s of errSets.exitStates) this.teardownStateTimers(s)
+        for (const s of errSets.enterStates) this.armStateInvoke(obj, s)
+        return errorConfig
+      }
+
+      // POINT OF NO RETURN — commit the resolved configuration exactly once.
       // Intentional wall-clock telemetry (NOT this.clock()): measures real
-      // transition latency for monitor.recordTransition. Must stay Date.now() —
-      // a virtual clock would report meaningless ~0ms durations. Do not virtualize.
+      // transition latency for monitor.recordTransition. Do not virtualize.
       const transitionStartTime = Date.now()
-      this.setCurrentState(newState, obj as any)
+      this.commitConfiguration(obj, finalConfig)
 
-      // D10/D11: after the new configuration is written, raise `done.state.<C>`
-      // for every composite that just became all-regions-final (innermost-first,
-      // only when a matching event is declared). Consumes the immutable R1
-      // `newState`; edge-triggered against `currentState` so a composite that
-      // merely STAYS all-final is not re-signalled. Gated internally so an
-      // undeclared join cannot crash.
-      this.checkCompletion(obj as any, currentState, newState)
+      // П5: teardown the timers of leaves that ACTUALLY left the configuration,
+      // then arm invoke timers for the entered leaves — from the ACTUALLY-written
+      // configuration (never the regional default — T3 deep/shallow history).
+      for (const s of exitStates) this.teardownStateTimers(s)
+      for (const s of enterStates) this.armStateInvoke(obj, s)
 
-      // Record successful transition
-      const transitionTime = Date.now() - transitionStartTime
-      this.monitor.recordTransition(transitionTime, true)
+      // done.state.<C> innermost-first for composites that just became all-final.
+      this.checkCompletion(obj as any, currentState, finalConfig)
 
-      return this.states.get(targetState)
+      this.monitor.recordTransition(Date.now() - transitionStartTime, true)
+      return finalConfig
     } finally {
       this._isTransitioning = false
       this._targetState = undefined
     }
+  }
+
+  /**
+   * SPEC §6.3 point of no return — write an ALREADY-RESOLVED configuration
+   * string (region-expanded, history-restored, documentIndex-ordered) directly,
+   * in one operation over all targets. Bypasses {@link setCurrentState}'s history
+   * branches because {@link previewCommitState} already applied them.
+   */
+  private commitConfiguration(obj: Adapter<TOwner>, config: string): void {
+    this.validateCompositeState(config)
+    ;(obj as unknown as Adapter<PropertiesOf<TOwner>>).set(
+      this.stateAttribute,
+      config as TOwner[KeysOf<PropertiesOf<TOwner>, string>],
+    )
   }
 
   /**
@@ -3327,18 +3700,13 @@ export class StateMachine<
   ): Promise<void> {
     const fromState = this.states.get(fromStateName)
 
-    // Clear timers when exiting the state
-    if (this.activeTimers.has(fromStateName)) {
-      const timers = this.activeTimers.get(fromStateName) || []
-      for (const timerId of timers) {
-        this.clearTimer(timerId)
-      }
-      this.activeTimers.delete(fromStateName)
-    }
-
-    // Clear entry time
-    this.stateEntryTimes.delete(fromStateName)
-
+    // П5 (SPEC §6.3): exit ACTIONS only — the per-leaf invoke-timer teardown and
+    // stateEntryTimes cleanup were REMOVED from here and moved AFTER the
+    // point of no return ({@link teardownStateTimers}, called post-commit). Doing
+    // teardown here unconditionally destroyed the SOURCE watchdog/invoke timers
+    // BEFORE the transition committed, so an aborted/timed-out transition (Q4)
+    // lost them forever. Timers are now torn down only for states that ACTUALLY
+    // left the committed configuration.
     if (!fromState) return
 
     const exitContext = { ...context, phase: 'exit' as const }
@@ -3367,6 +3735,14 @@ export class StateMachine<
     toStateName: string,
     args: any[],
     context: ErrorContext,
+    // П5 (SPEC §6.3): when false, run enter ACTIONS only and DEFER invoke-timer
+    // arming to {@link armStateInvoke} (called post-commit, from the actually
+    // written configuration). The microstep path passes false so a throw in a
+    // later phase (onAfter/onEnter of a sibling) or a transitionTimeout aborts
+    // BEFORE any target timer is armed — no orphan timer (EO-4). The construction
+    // / reset / resume paths keep the default (true): the configuration is
+    // already committed when they enter, so arming inline stays correct.
+    armTimers = true,
   ): Promise<void> {
     const toState = this.states.get(toStateName)
     if (!toState) return
@@ -3388,54 +3764,90 @@ export class StateMachine<
       }
     }
 
-    // Handle time-based transitions (invoke)
-    if (toState.invoke && toState.invoke.length > 0) {
-      // Record entry time if not already recorded (e.g. from resumeTimers)
-      if (!this.stateEntryTimes.has(toStateName)) {
-        this.stateEntryTimes.set(toStateName, this.clock())
-      }
-
-      const timers: any[] = []
-      for (const invocation of toState.invoke) {
-        // Check condition (cond) before starting the timer
-        if (invocation.cond) {
-          try {
-            const shouldInvoke = invocation.cond(obj.adaptee)
-            if (!shouldInvoke) continue
-          } catch (e) {
-            this.logger.error(
-              'Error in invoke condition',
-              { state: toStateName },
-              e as Error,
-            )
-            continue
-          }
-        }
-
-        const callback = async () => {
-          const currentState = this.getCurrentState(obj as any)
-          if (currentState?.split('|').includes(toStateName)) {
-            try {
-              if (invocation.action) {
-                await this.callAction(obj, invocation.action)
-              }
-              this.raiseEvent(invocation.event as string, obj as any)
-              this.scheduleProcessing()
-            } catch (err) {
-              this.logger.error(
-                'Invocation error',
-                { state: toStateName, event: invocation.event },
-                err as Error,
-              )
-            }
-          }
-        }
-
-        const timerId = this.setTimer(callback, invocation.delay)
-        timers.push(timerId)
-      }
-      this.activeTimers.set(toStateName, timers)
+    if (armTimers) {
+      this.armStateInvoke(obj, toStateName)
     }
+  }
+
+  /**
+   * П5/EO-4 (SPEC §6.3) — arm the per-leaf invoke timers for a state that has
+   * just (or already) entered the COMMITTED configuration. Any handles left over
+   * for this state are cleared FIRST ("activeTimers.set clears the old handle"),
+   * so a re-entry never orphans a prior attempt's timer. Extracted from
+   * {@link executeEnterActions} so the microstep can arm strictly AFTER the point
+   * of no return, while enter ACTIONS still run before it.
+   */
+  private armStateInvoke(obj: Adapter<TOwner>, toStateName: string): void {
+    const toState = this.states.get(toStateName)
+    if (!toState || !toState.invoke || toState.invoke.length === 0) return
+
+    // Clear any stale handles for this state before re-arming (EO-4).
+    const existing = this.activeTimers.get(toStateName)
+    if (existing) {
+      for (const timerId of existing) this.clearTimer(timerId)
+      this.activeTimers.delete(toStateName)
+    }
+
+    // Record entry time if not already recorded (e.g. from resumeTimers)
+    if (!this.stateEntryTimes.has(toStateName)) {
+      this.stateEntryTimes.set(toStateName, this.clock())
+    }
+
+    const timers: any[] = []
+    for (const invocation of toState.invoke) {
+      // Check condition (cond) before starting the timer
+      if (invocation.cond) {
+        try {
+          const shouldInvoke = invocation.cond(obj.adaptee)
+          if (!shouldInvoke) continue
+        } catch (e) {
+          this.logger.error(
+            'Error in invoke condition',
+            { state: toStateName },
+            e as Error,
+          )
+          continue
+        }
+      }
+
+      const callback = async () => {
+        const currentState = this.getCurrentState(obj as any)
+        if (currentState?.split('|').includes(toStateName)) {
+          try {
+            if (invocation.action) {
+              await this.callAction(obj, invocation.action)
+            }
+            this.raiseEvent(invocation.event as string, obj as any)
+            this.scheduleProcessing()
+          } catch (err) {
+            this.logger.error(
+              'Invocation error',
+              { state: toStateName, event: invocation.event },
+              err as Error,
+            )
+          }
+        }
+      }
+
+      const timerId = this.setTimer(callback, invocation.delay)
+      timers.push(timerId)
+    }
+    this.activeTimers.set(toStateName, timers)
+  }
+
+  /**
+   * П5 (SPEC §6.3) — tear down a state's per-leaf invoke timers and entry time.
+   * Called AFTER the point of no return for every state that ACTUALLY left the
+   * committed configuration (the microstep's exit set), so an aborted transition
+   * never destroys a source state's still-live timers.
+   */
+  private teardownStateTimers(stateName: string): void {
+    const timers = this.activeTimers.get(stateName)
+    if (timers) {
+      for (const timerId of timers) this.clearTimer(timerId)
+      this.activeTimers.delete(stateName)
+    }
+    this.stateEntryTimes.delete(stateName)
   }
 
   /**
@@ -3561,120 +3973,6 @@ export class StateMachine<
     this.validateCompositeState(newCompositeState)
 
     return newCompositeState
-  }
-
-  private updateState(currentState: string, toState: string): string {
-    const currentStateMap = this.parseCompositeState(currentState)
-    const toStateParts = toState.split('|')
-
-    // Handle simple root state transition (region-LESS roots only).
-    // D1: a bare-root composite that declares regions must NOT short-circuit
-    // here; it falls through to the addRegionStates expansion loop so its
-    // regions expand identically to initialState/dotted entry. A genuine
-    // non-region leaf root still short-circuits byte-for-byte.
-    if (
-      toStateParts.length === 1 &&
-      !toState.includes('.') &&
-      !this.states.get(toState)?.regions
-    ) {
-      currentStateMap.clear()
-      currentStateMap.set(toState, toState)
-      return toState
-    }
-
-    // Handle complex state transitions with regions
-    for (const toStatePart of toStateParts) {
-      const regionKey = this.getRegionKey(toStatePart)
-      const stateConfig = this.states.get(toStatePart)
-
-      // Remove conflicting states efficiently
-      this.removeConflictingStates(currentStateMap, regionKey)
-
-      // Add new state or region states
-      if (stateConfig?.regions) {
-        this.addRegionStates(currentStateMap, stateConfig, toStatePart)
-      } else {
-        currentStateMap.set(regionKey, toStatePart)
-      }
-    }
-
-    // Clean up root states
-    this.cleanupRootStates(currentStateMap)
-
-    // W2a: канонический documentIndex-порядок (взамен порядка вставки в Map).
-    // Держит `newState` — который computeEnterExitSets и setCurrentState
-    // потребляют дальше — детерминированным и независимым от порядка целевых
-    // частей transition.to (см. model_determinism часть B).
-    const newCompositeState = this.orderComposite(
-      Array.from(currentStateMap.values()).join('|'),
-    )
-    this.validateCompositeState(newCompositeState)
-    return newCompositeState
-  }
-
-  /**
-   * Remove conflicting states from the state map
-   */
-  private removeConflictingStates(
-    currentStateMap: Map<string, string>,
-    regionKey: string,
-  ): void {
-    const keysToDelete: string[] = []
-
-    for (const [key, value] of currentStateMap.entries()) {
-      const existingRegionKey = this.getRegionKey(value)
-      if (
-        existingRegionKey === regionKey ||
-        existingRegionKey.startsWith(`${regionKey}.`)
-      ) {
-        keysToDelete.push(key)
-      }
-    }
-
-    // Batch delete for better performance
-    for (const key of keysToDelete) {
-      currentStateMap.delete(key)
-    }
-  }
-
-  /**
-   * Add region states to the state map
-   */
-  private addRegionStates(
-    currentStateMap: Map<string, string>,
-    stateConfig: State<TOwner>,
-    toStatePart: string,
-  ): void {
-    const initialStatesForRegions = this.getInitialStatesForRegions(
-      stateConfig.regions!,
-      toStatePart,
-      // M-1: composite `initial` is the single source of truth for region entry.
-      stateConfig.initial,
-    )
-    const regionStates = initialStatesForRegions.split('|')
-
-    for (const regionState of regionStates) {
-      const regionKeyNested = this.getRegionKey(regionState)
-      currentStateMap.set(regionKeyNested, regionState)
-    }
-  }
-
-  /**
-   * Clean up root states from the state map
-   */
-  private cleanupRootStates(currentStateMap: Map<string, string>): void {
-    const keysToDelete: string[] = []
-
-    for (const [key, value] of currentStateMap.entries()) {
-      if (!value.includes('.')) {
-        keysToDelete.push(key)
-      }
-    }
-
-    // Batch delete for better performance
-    for (const key of keysToDelete) {
-      currentStateMap.delete(key)
-    }
   }
 
   private parseCompositeState(compositeState: string): Map<string, string> {

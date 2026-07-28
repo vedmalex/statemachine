@@ -60,6 +60,35 @@ Red проверен откатом (возврат size-check краснит м
 Итог W3-B.1: **882 passed / 14 skipped; оба tsc чисты**; W0/W1/W2 регресс 28/28. Согласовано с §6.1
 (подъём от листа с гард-фолбэком) — OTS в W3-C наследует корректную семантику.
 
-## W3-C — optimal transition set + порядок фаз applyTransition (П5) — ОЖИДАЕТ
+## W3-C — optimal transition set + порядок фаз applyTransition (П5) — verdict CLOSED
+
+Архитектурная переработка `applyTransition`/`updateState`. Проверено оркестратором ЗАПУСКОМ:
+
+| часть | факт | подтверждение |
+|---|---|---|
+| OTS §6.1 | per-leaf выбор подъёмом (selectTransition W3-B/B.1 как per-node); каждый регион ≤1 переход | событие в 3 региона → **3 перехода** (был 1); fireEventDetailed.transitions = все |
+| OTS §6.2 | removeConflicting по пересечению exit-set; преемпция потомком; несравнимые — precedence order | disjoint-регионы все срабатывают; конфликтующие — потомок |
+| OTS §6.3 | объединённые exit (descendant-first) / enter (ancestor-first); commit одной операцией; done.state innermost-first | оба региона к final за микрошаг → COMPLETE (done.state после микрошага, не в середине) |
+| П5 единый корень | teardown таймеров + invoke-arm СТРОГО после точки невозврата; enter-set из записанной конфигурации | — |
+| Q4 watchdog | timeout per-action; exit-teardown post-commit → source watchdog жив | active→safe (был потерян) |
+| T3 deep-restore | previewCommitState резолвит restore ДО enter/exit → onEnter восстановленного листа + invoke взведён | timer-driven машина ОЖИВАЕТ (был мёртв) |
+| EO-4 onAfter | arming post-commit → onAfter throw до arming → нет осиротевшего таймера | ✓ |
+| T1 to:'*' | резолвится в текущую конфигурацию → onEnter не потерян | ✓ |
+| EO-5 abort | abort не коммитит → source timers целы (no zombie); наблюдаемо через logger.warn | таймеры целы |
+| единичный выбор | 1 регион = частный случай OTS = byte-identical | selection_scxml/характеризация зелёные |
+
+Итог W3-C: **888 passed / 14 skipped; оба tsc чисты**; W0/W1/W2/W3-A/W3-B регресс 31/31. Мёртвый
+кластер updateState/removeConflictingStates/addRegionStates удалён (заменён computeInternalWrite).
+
+**Residual (non-blocking, §0.6):** EO-5 abort наблюдаем только через logger.warn — recordError отнесён
+в W4 (verify обосновал: re-arm таймеров дублировал бы, ломая П2). Cross-composite-root leaf→leaf —
+pre-existing на baseline, не регресс W3-C.
+
+## Вывод W3 (A + B + B.1 + C)
+
+Семантика ядра переписана: правило выбора перехода SCXML/UML, optimal transition set (несколько
+переходов за микрошаг), корректный порядок фаз с живыми таймерами. Гарды наблюдаемы и ленивы.
+Комбинационные сценарии (история+таймеры+abort, мультиобъект+история) проверены. Осталось W3b
+(invoke-операции + ExitContext — новая фича, ответ на вопрос про abort лэйнов).
 
 ## W3b — invoke-операции + ExitContext (новая фича) — ОЖИДАЕТ
