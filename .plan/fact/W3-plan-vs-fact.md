@@ -84,7 +84,21 @@ Red проверен откатом (возврат size-check краснит м
 в W4 (verify обосновал: re-arm таймеров дублировал бы, ломая П2). Cross-composite-root leaf→leaf —
 pre-existing на baseline, не регресс W3-C.
 
-## Вывод W3 (A + B + B.1 + C)
+## W3-C.1 — доработка по critic-приёмке W3-C — CLOSED
+
+Критик (статический, без Bash) нашёл 2 подтверждённых запуском + дыры покрытия:
+
+| id | что | подтверждение |
+|---|---|---|
+| NUL-байт [MEDIUM] | сырой `\x00` в `state_machine.ts` (моя опечатка W3-B: `${priority}\x00${spec}` вместо пробела) — rg считал файл бинарным, ломал grep-тулинг | заменён на пробел; NUL:0 |
+| дубликаты rejected [MEDIUM] | `computeEnabledSet` пушил rejected по разу на лист → кандидат governing N листьев давал N записей; кэш guard-error терял `error` | дедуп по transition-label; кэш хранит `error`; guard-rejected в 3 региона → 1 запись, guard-error несёт error |
+| тесты взаимодействий | частичный OTS, guard-error в одном регионе, дедуп — не покрыты | добавлены (10 тестов ots_microstep): partial→1, guard-error не глушит другие регионы, дедуп, error через кэш |
+| transitionTimeout [сверка] | SPEC §11 рекомендовал per-microstep, реализовано per-action | SPEC §11 обновлён: **per-action принят** (соответствует «максимум на действие», прежнее поведение) |
+| abort-наблюдаемость | abort маскируется под no-transition; recordTransition(_,false) мёртв | → задача #14 (W4): `reason:'aborted'` + monitor-канал |
+
+Итог W3-C.1: **892 passed / 14 skipped; оба tsc чисты**; W0-W3 регресс 58/58.
+
+## Вывод W3 (A + B + B.1 + C + C.1)
 
 Семантика ядра переписана: правило выбора перехода SCXML/UML, optimal transition set (несколько
 переходов за микрошаг), корректный порядок фаз с живыми таймерами. Гарды наблюдаемы и ленивы.

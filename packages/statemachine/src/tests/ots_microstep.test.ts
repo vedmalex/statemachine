@@ -349,3 +349,70 @@ describe('W3-C Part 2 — phase order: teardown/re-arm AFTER commit (SPEC §6.3)
     expect(sm.getCurrentState()).toBe('beyond')
   })
 })
+
+// W3-C.1 (critic-приёмка W3-C): interaction/dedup coverage the isolated OTS
+// tests missed — partial OTS, exit-set conflict, guard-error in one region,
+// and rejected[] dedup across regions (§7).
+describe('W3-C.1 — OTS interactions + rejected dedup', () => {
+  const mk = (transitions: any[]) =>
+    new StateMachine(
+      {
+        name: 'i',
+        stateAttribute: 'state',
+        initialState: 'sys',
+        states: {
+          sys: {
+            initial: 'a.run|b.run|c.run',
+            regions: {
+              a: { run: {}, stop: {} },
+              b: { run: {}, stop: {} },
+              c: { run: {}, stop: {} },
+            },
+          },
+        },
+        events: { ev: { transitions } },
+      } as any,
+      { state: 'sys' } as any,
+    )
+
+  it('partial OTS: event enabled in 1 of 3 regions fires ONLY that region', async () => {
+    const sm = mk([{ from: 'sys.b.run', to: 'sys.b.stop' }])
+    const r = await sm.fireEventDetailed('ev')
+    expect(r.fired).toBe(true)
+    expect(r.fired && r.transitions.length).toBe(1)
+    expect(sm.getCurrentState()).toBe('sys.a.run|sys.b.stop|sys.c.run')
+  })
+
+  it('guard-error in one region does NOT stop the others firing', async () => {
+    const sm = mk([
+      { from: 'sys.a.run', to: 'sys.a.stop', guard: () => { throw new Error('boom') } },
+      { from: 'sys.b.run', to: 'sys.b.stop' },
+      { from: 'sys.c.run', to: 'sys.c.stop' },
+    ])
+    const r = await sm.fireEventDetailed('ev')
+    // b and c fired; a's guard threw so region a stays. fired:true because ≥1 fired.
+    expect(r.fired).toBe(true)
+    expect(sm.getCurrentState()).toContain('sys.a.run')
+    expect(sm.getCurrentState()).toContain('sys.b.stop')
+    expect(sm.getCurrentState()).toContain('sys.c.stop')
+  })
+
+  it('rejected[] is deduped by transition across regions (§7)', async () => {
+    // A from:'*' candidate governs all 3 lanes; a single guard-rejection must
+    // appear ONCE in rejected[], not once per governed leaf.
+    const sm = mk([{ from: '*', to: 'sys.a.stop', guard: () => false }])
+    const r = await sm.fireEventDetailed('ev')
+    expect(r.fired).toBe(false)
+    expect(r.fired === false && r.reason).toBe('guard-rejected')
+    expect(r.fired === false && r.rejected?.length).toBe(1)
+  })
+
+  it('guard-error rejected carries its error across a cross-region cache re-offer', async () => {
+    const sm = mk([{ from: '*', to: 'sys.a.stop', guard: () => { throw new Error('X') } }])
+    const r = await sm.fireEventDetailed('ev')
+    expect(r.fired).toBe(false)
+    expect(r.fired === false && r.rejected?.length).toBe(1)
+    expect(r.fired === false && r.rejected?.[0]?.reason).toBe('guard-error')
+    expect(r.fired === false && r.rejected?.[0]?.error).toBeInstanceOf(Error)
+  })
+})

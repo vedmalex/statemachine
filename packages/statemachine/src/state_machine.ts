@@ -203,7 +203,7 @@ export class StateMachine<
   private microstepGuardCache:
     | Map<
         Transition<TOwner, SMConfig['states']>,
-        { passed: boolean; threw: boolean }
+        { passed: boolean; threw: boolean; error?: Error }
       >
     | undefined
 
@@ -1057,7 +1057,20 @@ export class StateMachine<
           activeLeaves,
           ...args,
         )
-        for (const r of rej) rejected.push(r)
+        // Dedup rejected by transition label: a candidate governing several
+        // leaves is offered to selectTransition once per leaf, so the same
+        // rejection would otherwise appear once per governed leaf (§7 contract:
+        // one entry per transition). Prefer a record that carries `error`
+        // (guard-error) over a bare guard-rejected for the same transition.
+        for (const r of rej) {
+          const prev = rejected.find((p) => p.transition === r.transition)
+          if (!prev) {
+            rejected.push(r)
+          } else if (prev.error === undefined && r.error !== undefined) {
+            prev.reason = r.reason
+            prev.error = r.error
+          }
+        }
         if (!selected) continue
         const cover = this.computeCoverMap(selected.from as string, activeLeaves)
         const coveredLeaves = Array.from(cover.keys())
@@ -3252,7 +3265,7 @@ export class StateMachine<
       const keyCount = new Map<string, number>()
       let anyGroup = false
       for (const c of candidates) {
-        const k = `${c.priority} ${c.specificity}`
+        const k = `${c.priority} ${c.specificity}`
         const n = (keyCount.get(k) ?? 0) + 1
         keyCount.set(k, n)
         if (n > 1) anyGroup = true
@@ -3322,6 +3335,10 @@ export class StateMachine<
         rejected.push({
           transition: label,
           reason: cached.threw ? 'guard-error' : 'guard-rejected',
+          // The cache carries the guard error so a cross-region re-offer of the
+          // same transition reports guard-error WITH its `error` (§7), not a
+          // bare label — the earlier cache dropped it.
+          ...(cached.error !== undefined ? { error: cached.error } : {}),
         })
         continue
       }
@@ -3336,6 +3353,7 @@ export class StateMachine<
 
       let passed = false
       let threw = false
+      let guardError: Error | undefined
       try {
         passed = Boolean(
           await this.callAction(obj as any, transition.guard, ...args),
@@ -3348,6 +3366,7 @@ export class StateMachine<
         // transition stays DISABLED (never a throw). SPEC §7/F4: the cause is
         // now distinguishable as `guard-error` vs an honest `guard-rejected`.
         const errObj = error instanceof Error ? error : new Error(String(error))
+        guardError = errObj
         if (this.errorHandler.isEnabled()) {
           const alreadyReported =
             typeof errObj === 'object' &&
@@ -3388,7 +3407,11 @@ export class StateMachine<
         rejected.push({ transition: label, reason: 'guard-error', error: errObj })
       }
 
-      this.microstepGuardCache?.set(transition, { passed, threw })
+      this.microstepGuardCache?.set(transition, {
+        passed,
+        threw,
+        ...(guardError !== undefined ? { error: guardError } : {}),
+      })
 
       if (passed) {
         return { selected: transition, rejected }
