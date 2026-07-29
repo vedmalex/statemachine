@@ -250,6 +250,25 @@ export { createVirtualScheduler } from './scheduler'
 
 /**
  * @category Unstable
+ * @unstable — async-context tracking injection contract, backing PRECISE
+ * reentrancy detection. Implement (and pass via
+ * `StateMachineOptions.contextTracker`) to restore precise detection on a
+ * runtime that has an equivalent primitive but exposes it under neither
+ * `AsyncLocalStorage` nor `AsyncContext.Variable`.
+ *
+ * @see StateMachine#contextTrackerKind
+ */
+export type { IContextTracker } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — the primitive backing a machine's reentrancy detection, as
+ * reported by `StateMachine#contextTrackerKind`.
+ */
+export type { ContextTrackerKind } from './context_tracker'
+
+/**
+ * @category Unstable
  * @unstable — error-handler injection contract; implement to replace built-in recovery.
  */
 export type { IErrorHandler } from './types'

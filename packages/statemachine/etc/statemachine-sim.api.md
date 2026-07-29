@@ -1692,6 +1692,8 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     }): void;
     canFireEvent(eventName: keyof SMConfig['events'] | '*', adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
     canFireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*'): boolean;
+    // Warning: (ae-forgotten-export) The symbol "ContextTrackerKind" needs to be exported by the entry point index.d.ts
+    get contextTrackerKind(): ContextTrackerKind;
     // Warning: (ae-forgotten-export) The symbol "StateName" needs to be exported by the entry point index.d.ts
     set currentState(state: StateName);
     // (undocumented)
@@ -1794,6 +1796,8 @@ export interface StateMachineOptions {
     // Warning: (ae-forgotten-export) The symbol "FunctionRegistry" needs to be exported by the entry point index.d.ts
     actions?: FunctionRegistry;
     clock?: () => number;
+    // Warning: (ae-forgotten-export) The symbol "IContextTracker" needs to be exported by the entry point index.d.ts
+    contextTracker?: IContextTracker;
     // (undocumented)
     errorHandler?: IErrorHandler;
     errorState?: string;

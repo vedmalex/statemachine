@@ -20,6 +20,17 @@ export interface Adapter<T extends object> {
 // @public
 export type Clock = () => number;
 
+// @public
+export type ContextTrackerKind =
+/** Node/Deno `AsyncLocalStorage` — precise detection. */
+'async-local-storage'
+/** A global `AsyncContext.Variable` — precise detection. */
+| 'async-context'
+/** No primitive available — detection DEGRADED to no-op. */
+| 'none'
+/** Supplied via `StateMachineOptions.contextTracker` — capability is the caller's. */
+| 'injected';
+
 // Warning: (ae-internal-missing-underscore) The name "createDefaultMonitor" should be prefixed with an underscore because the declaration is marked as @internal
 //
 // @internal
@@ -286,6 +297,13 @@ export const HealthStatus: {
 
 // @public (undocumented)
 export type HealthStatus = (typeof HealthStatus)[keyof typeof HealthStatus];
+
+// @public
+export interface IContextTracker {
+    exit<R>(fn: () => R): R;
+    getStore(): number | undefined;
+    run<R>(store: number, fn: () => R): R;
+}
 
 // @public
 export interface IErrorHandler {
@@ -656,6 +674,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     }): void;
     canFireEvent(eventName: keyof SMConfig['events'] | '*', adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
     canFireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*'): boolean;
+    get contextTrackerKind(): ContextTrackerKind;
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
@@ -776,6 +795,7 @@ export interface StateMachineOptions {
     // Warning: (ae-forgotten-export) The symbol "FunctionRegistry" needs to be exported by the entry point index.d.ts
     actions?: FunctionRegistry;
     clock?: () => number;
+    contextTracker?: IContextTracker;
     // (undocumented)
     errorHandler?: IErrorHandler;
     errorState?: string;
@@ -914,6 +934,6 @@ export interface ValidationWarning extends ValidationError {
 // types/monitoring.d.ts:207:9 - (ae-forgotten-export) The symbol "HealthCheckResult" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:208:9 - (ae-forgotten-export) The symbol "PerformanceMonitor" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:209:9 - (ae-forgotten-export) The symbol "MetricsCollector" needs to be exported by the entry point index.d.ts
-// types/types.d.ts:540:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
+// types/types.d.ts:608:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
 
 ```

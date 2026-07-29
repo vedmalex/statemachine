@@ -1,4 +1,7 @@
-import { AsyncLocalStorage } from 'node:async_hooks'
+import {
+  type ContextTrackerKind,
+  createDefaultContextTracker,
+} from './context_tracker'
 import { securityLogger, stateMachineLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
 import {
@@ -26,6 +29,7 @@ import {
   type InvokeTimer,
   type StateInvocation,
   type FunctionRegistry,
+  type IContextTracker,
   type IErrorHandler,
   type ILogger,
   type IMonitor,
@@ -419,7 +423,18 @@ export class StateMachine<
   // boolean) guards against a context that leaked into a timer set INSIDE an action
   // but fires AFTER the drain has ended: its stale epoch no longer matches the
   // active one, so it is not misread as reentrant.
-  private readonly drainContext = new AsyncLocalStorage<number>()
+  //
+  // The tracker is INJECTED (options.contextTracker) or resolved from the
+  // runtime at construction — never hard-imported. `node:async_hooks` is emitted
+  // by the bundler as the BARE specifier `async_hooks`, which a browser cannot
+  // resolve and Deno rejects, making the entire core bundle unloadable there.
+  // See src/context_tracker.ts. Where no primitive exists the tracker degrades
+  // to a no-op: `getStore()` is then permanently `undefined`, which can never
+  // equal the numeric `activeDrainEpoch`, so the reject conditions below become
+  // UNREACHABLE — legitimate fires are never falsely rejected, and the only loss
+  // is missed detection of a TRUE reentrant (which parks that drain).
+  private readonly drainContext: IContextTracker
+  private readonly _contextTrackerKind: ContextTrackerKind
   private drainEpoch = 0
   private activeDrainEpoch: number | null = null
 
@@ -439,6 +454,25 @@ export class StateMachine<
 
   public get targetState() {
     return this._targetState
+  }
+
+  /**
+   * @unstable — WHICH async-context primitive backs this machine's reentrancy
+   * detection, so a host or test can assert the mode instead of inferring it.
+   *
+   * - `'async-local-storage'` / `'async-context'` — PRECISE detection: a true
+   *   reentrant `fireEvent` from inside an action/guard rejects with a clear
+   *   error.
+   * - `'none'` — DEGRADED: no primitive in this runtime (a browser, typically).
+   *   Legitimate concurrent fires still queue and resolve — they are never
+   *   falsely rejected — but a true reentrant one is NOT detected and parks that
+   *   drain unless {@link StateMachineOptions.transitionTimeout} bounds it. One
+   *   WARN is logged at construction when this branch is taken.
+   * - `'injected'` — a tracker came from {@link StateMachineOptions.contextTracker};
+   *   its capability is the injector's to state (it may itself be a no-op).
+   */
+  public get contextTrackerKind(): ContextTrackerKind {
+    return this._contextTrackerKind
   }
 
   // Геттеры и сеттеры
@@ -477,6 +511,35 @@ export class StateMachine<
     this.scheduler = options?.scheduler ?? createDefaultScheduler()
     this.clock = options?.clock ?? Date.now
     this.errorHandler = options?.errorHandler ?? createDefaultErrorHandler()
+
+    // П3 / runtime portability: resolve the async-context tracker that backs
+    // precise reentrancy detection. An injected tracker is taken on trust (the
+    // capability is then the caller's to state); otherwise the runtime is probed.
+    if (options?.contextTracker !== undefined) {
+      this.drainContext = options.contextTracker
+      this._contextTrackerKind = 'injected'
+    } else {
+      const resolved = createDefaultContextTracker()
+      this.drainContext = resolved.tracker
+      this._contextTrackerKind = resolved.kind
+      if (resolved.kind === 'none') {
+        // DISCLOSE the degradation exactly once, at construction. WARN is the
+        // default logger level, so this is visible with no consumer setup and
+        // silenceable through `setDefaultLogLevel`. Deliberately NOT routed
+        // through `monitor.recordError`: a construction-time environment
+        // capability is not a runtime error, and counting it as one would
+        // pollute the sim's quantitative oracles.
+        this.logger.warn(
+          'Precise reentrancy detection is unavailable in this runtime (no ' +
+            'AsyncLocalStorage, no AsyncContext.Variable). The machine works and ' +
+            'legitimate concurrent fireEvent calls are never falsely rejected, but a ' +
+            'TRUE reentrant fireEvent issued from inside an action/guard will PARK ' +
+            'that drain instead of rejecting with a clear error. Set ' +
+            '`transitionTimeout` to bound it, or inject `options.contextTracker`.',
+          { name: config.name, contextTracker: 'none' },
+        )
+      }
+    }
 
     if (adaptee) {
       if (!isAdapter<TOwner>(adaptee)) {

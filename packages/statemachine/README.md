@@ -359,6 +359,43 @@ The **set** of callbacks invoked and the **reached configuration** are unchanged
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 
+## Runtime support
+
+The core entry point (`@vedmalex/statemachine`) contains **no Node built-in imports** and loads in any ES2022 runtime. One capability, however, is not uniformly available, and the package degrades on it rather than refusing to load.
+
+That capability is **precise reentrancy detection**. Each drain tags the actions and guards it runs with an epoch held in an async-context primitive. A `fireEvent` whose async context carries the currently active epoch was issued from *inside* that drain — a true reentrant call that can never be drained — so it is rejected with a clear error instead of parking forever. The primitive is `AsyncLocalStorage` where the runtime has it; there is no portable equivalent everywhere.
+
+| Runtime | `sm.contextTrackerKind` | Reentrancy detection | Measured on |
+|---|---|---|---|
+| Node | `'async-local-storage'` | **Precise** — unchanged | Node 24.18.0 |
+| Deno | `'async-local-storage'` | **Precise** — same tier as Node | Deno 2.2.12 |
+| Browser | `'none'` | **Degraded** — see below | Chromium 147 (headless) |
+| Any other tracker-less runtime | `'none'` | **Degraded** — see below | — |
+
+Detection is by feature probe, not a runtime name: the engine tries `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global `AsyncContext.Variable`, and verifies each with a live round-trip before accepting it. Deno lands in the precise tier because its Node-compat layer provides the first. A browser that ships `AsyncContext.Variable` will report `'async-context'` and get the precise tier automatically.
+
+### What "degraded" means, exactly
+
+On a runtime reporting `'none'`, the machine **loads and works** — states, transitions, hierarchy, regions, timers, invoke, persistence and the queue are all unaffected. Precisely two things change:
+
+- **A true reentrant `fireEvent` is not detected.** Calling `await sm.fireEvent(...)` from inside an `onEnter` / `onExit` / `onTransition` / guard no longer rejects with a diagnostic error. The event is queued behind the very action awaiting it, so **that drain parks and never settles**, and the awaiting caller never resolves. This is a real loss of capability, not a cosmetic one. Bound it by setting [`transitionTimeout`](#action-timeouts-transitiontimeout), which settles the caller with an action-timeout error instead of hanging — a less precise diagnosis, but not a deadlock. The structural fix is the same as on Node: do not fire events inline from an action; model the follow-up as an internal transition (an `invoke` timer or a `done.state.*` completion), or dispatch from an independent async callback.
+- **One `WARN` is logged at construction**, disclosing the above. `WARN` is the default log level, so it appears with no setup; silence it with `setDefaultLogLevel` or by injecting your own `logger`.
+
+**Legitimate concurrency is never affected.** The degraded tracker reports an empty store, which can never equal the numeric active epoch, so the reject condition is *unreachable* — a `fireEvent` from an independent timer/IO callback, a chained `await fireEvent(A); await fireEvent(B)`, an `onError` recovery, or an event for a second adaptee mid-drain all queue and resolve exactly as they do on Node. The degradation is strictly missed detection; **false rejection is impossible by construction**. Both halves are pinned by `src/tests/reentrancy_degradation.test.ts`.
+
+### Restoring precision on a custom host
+
+If your runtime has an equivalent primitive under some other name, implement [`IContextTracker`](./etc/statemachine.api.md) (`run` / `exit` / `getStore`) and pass it as `contextTracker`. Each machine needs its **own** instance — the store is a per-machine drain epoch, and a shared instance can collide across machines.
+
+```ts
+const sm = createMachine(config, owner, { contextTracker: myTracker })
+sm.contextTrackerKind // 'injected' — you own the capability statement
+```
+
+### `./sim` is Node-only
+
+The `@vedmalex/statemachine/sim` entry point is **deliberately** Node-bound — it uses `process`, `fs` and `path` for scenario I/O, CLI wiring and signal handling. It is not intended to load in a browser or a bare runtime and no portability is claimed for it. The core entry point above carries none of that.
+
 ## Performance
 
 The composite-write hot path (`setCurrentState` region-conflict scan and the

@@ -80,6 +80,57 @@ export interface ITimerScheduler {
   process?(now?: number): void
 }
 
+/**
+ * @unstable — async-context tracking injection contract; consumed by StateMachine
+ * to power PRECISE reentrancy detection.
+ *
+ * ## What it is for
+ * The drain tags every action/guard it runs with a numeric EPOCH. A `fireEvent`
+ * whose async context carries the CURRENTLY-active epoch was issued from WITHIN
+ * that drain's logical stack — a TRUE reentrant call that can never be drained,
+ * so it is rejected with a clear error instead of parking forever. A `fireEvent`
+ * from an INDEPENDENT async callback (timer/IO continuation, an `onError`
+ * recovery, a caller woken by `resolve()`) carries NO epoch and queues normally.
+ * This is exactly the shape of Node's `AsyncLocalStorage<number>`, which is the
+ * default implementation where the runtime provides it.
+ *
+ * ## Why it is injectable
+ * `AsyncLocalStorage` does not exist in browsers and other non-Node runtimes.
+ * Rather than hard-import it (which makes the whole bundle unloadable outside
+ * Node), the engine resolves a tracker at construction and DEGRADES to a no-op
+ * where none is available. Inject your own to restore precise detection on a
+ * host that has an equivalent primitive.
+ *
+ * ## Degradation contract of a no-op implementation
+ * A tracker whose `getStore()` always returns `undefined` is SAFE IN THE
+ * FALSE-ACCUSATION DIRECTION: the reject condition is
+ * `activeDrainEpoch !== null && getStore() === activeDrainEpoch`, and `undefined`
+ * never equals a number, so NO legitimate `fireEvent` is ever wrongly rejected.
+ * The loss is strictly MISSED DETECTION of true reentrancy, which then PARKS
+ * that drain (the reentrant event sits behind the action awaiting it, forever)
+ * unless {@link StateMachineOptions.transitionTimeout} bounds the action.
+ *
+ * @see StateMachineOptions.contextTracker
+ * @see StateMachine#contextTrackerKind
+ */
+export interface IContextTracker {
+  /**
+   * Run `fn` with `store` bound as the current async-context value, and return
+   * whatever `fn` returns. The binding must survive `await` inside `fn`.
+   */
+  run<R>(store: number, fn: () => R): R
+  /**
+   * Run `fn` OUTSIDE any bound store — `getStore()` must observe `undefined`
+   * for the duration — and return whatever `fn` returns. Used so an `onError`
+   * recovery handler can issue a fresh `fireEvent` without inheriting (and being
+   * falsely rejected under) the drain's epoch. It must NOT catch: a throw from
+   * `fn` propagates unchanged.
+   */
+  exit<R>(fn: () => R): R
+  /** The store bound by the innermost enclosing `run`, or `undefined`. */
+  getStore(): number | undefined
+}
+
 /** @unstable — transition observability context (additive on IMonitor). */
 export interface TransitionContext {
   fromState: string
@@ -336,6 +387,24 @@ export interface StateMachineOptions {
   monitor?: IMonitor        // EXISTING; element type evolves additively per TD-T4-2
   scheduler?: ITimerScheduler   // NEW per TD-T4-2a
   errorHandler?: IErrorHandler  // NEW per TD-T4-2b
+  /**
+   * Async-context tracker backing PRECISE reentrancy detection.
+   *
+   * Default: resolved from the runtime WITHOUT any import — Node/Deno-style
+   * `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage` first, then
+   * a global `AsyncContext.Variable`, then a NO-OP tracker. Inject one to
+   * restore precise detection on a host that has an equivalent primitive but
+   * exposes it under neither name.
+   *
+   * A no-op tracker never causes a FALSE rejection; it only stops TRUE
+   * reentrancy from being detected, which parks that drain unless
+   * {@link StateMachineOptions.transitionTimeout} is set. Read
+   * {@link StateMachine#contextTrackerKind} to see which mode is active.
+   *
+   * Each machine needs its OWN tracker instance — the store is a per-machine
+   * drain epoch, and sharing one instance across machines can collide.
+   */
+  contextTracker?: IContextTracker
   /**
    * Clock function returning the current time in milliseconds.
    * Default: `Date.now`. Inject a virtual clock together with a

@@ -23,6 +23,34 @@ interface Box {
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms))
 
+/**
+ * Wait until `predicate` holds, or fail loudly at `timeoutMs`.
+ *
+ * These probes assert on a record that ARRIVES on a real timer, so a fixed
+ * `await sleep(n)` is a race against wall-clock: on a loaded machine the deadline
+ * can land after the window and the assertion reads an empty array — a flake that
+ * looks exactly like the defect the test exists to catch. Polling for the ARRIVAL
+ * makes the test wait for the event rather than for a duration; the timeout is a
+ * generous upper bound, not the expected wait, so the fast path stays fast.
+ *
+ * It cannot be used for the ABSENCE assertions (no unhandled rejection) — there is
+ * no arrival to wait for, so those keep a fixed settle window by necessity.
+ */
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 2000,
+  what = 'condition',
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return
+    }
+    await sleep(5)
+  }
+  throw new Error(`waitFor: ${what} did not hold within ${timeoutMs}ms`)
+}
+
 function quietLogger(): ILogger & { errors: string[] } {
   const errors: string[] = []
   return {
@@ -268,7 +296,7 @@ describe('invoke action failure is observable', () => {
   it('surfaces an EXPIRED invoke action on recordError and config onError', async () => {
     const probe = invokeProbe(() => sleep(200), { transitionTimeout: 40 })
 
-    await sleep(150)
+    await waitFor(() => probe.recorded.length > 0, 2000, 'the expiry to be recorded')
 
     expect(probe.recorded).toHaveLength(1)
     expect(probe.recorded[0]?.message).toBe('Transition timeout')
@@ -286,7 +314,7 @@ describe('invoke action failure is observable', () => {
       throw new Error('boom')
     })
 
-    await sleep(120)
+    await waitFor(() => thrower.recorded.length > 0, 2000, 'the throw to be recorded')
 
     expect(thrower.recorded).toHaveLength(1)
     expect(thrower.recorded[0]?.phase).toBe('action')

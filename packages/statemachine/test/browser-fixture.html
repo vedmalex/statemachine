@@ -4,6 +4,16 @@
   The relative import `../dist/index.js` resolves from this file's URL.
   If relocating this file, update the import path accordingly OR switch
   to a static-server fixture with absolute paths.
+
+  WHAT THIS PROVES (and why merely constructing was not enough):
+  the previous fixture only CONSTRUCTED a machine, so a bundle that loads but
+  DEADLOCKS on the first transition would have passed — it could not catch the
+  class of defect it exists to catch. It now drives a REAL transition and
+  asserts the resulting state before setting the pass flag. Loading is
+  necessary; working is the actual contract.
+
+  It also records `contextTrackerKind` on `window` so the spec can MEASURE the
+  browser's runtime-support tier rather than assume it.
 -->
 <html>
 <head><meta charset="utf-8"><title>statemachine browser smoke</title></head>
@@ -11,8 +21,33 @@
 <script type="module">
   import { createMachine } from '../dist/index.js'
   try {
-    const m = createMachine({ name: 'browser-smoke', initialState: 's', states: { s: {} }, events: {} })
+    const owner = { state: 'idle' }
+    const m = createMachine({
+      name: 'browser-smoke',
+      stateAttribute: 'state',
+      initialState: 'idle',
+      states: {
+        idle: {},
+        ready: { onEnter: (o) => { o.entered = true } },
+      },
+      events: { go: { transitions: [{ from: 'idle', to: 'ready' }] } },
+    }, owner)
+
     if (typeof m !== 'object' || m === null) throw new Error('createMachine returned non-object')
+
+    // Capability read: which async-context primitive this browser resolved.
+    window.__statemachineTrackerKind = m.contextTrackerKind
+
+    // Drive a REAL transition. If the drain deadlocks this await never settles,
+    // the pass flag is never set, and the spec's waitForFunction times out —
+    // which is exactly the signal the old construct-only fixture could not give.
+    const fired = await m.fireEvent('go')
+    if (fired !== true) throw new Error(`fireEvent('go') returned ${fired}, expected true`)
+
+    const state = m.getCurrentState()
+    if (state !== 'ready') throw new Error(`expected state 'ready' after transition, got '${state}'`)
+    if (owner.entered !== true) throw new Error('onEnter of `ready` did not run')
+
     window.__statemachineSmokePassed = true
   } catch (e) {
     console.error('Browser smoke:', e.message)

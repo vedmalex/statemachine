@@ -5,7 +5,7 @@
     "node": "v24.18.0"
   },
   "hashes": {
-    "dist/index.js": "25452de03b0a131b382d58fe449cfd8d62b3c52600b1849cbf9a4395c5fe83a0",
-    "dist/index.cjs": "06457dcc0bef42b25cc6fb3649367b9a5089f3efcd86b9fe3ced306c0d20e7d9"
+    "dist/index.js": "bea1924577372d6c67493ba937540a5a6b1d736094b4ddb6d5e433967aa800b0",
+    "dist/index.cjs": "835da6d398a3c96604e4c25a2518029ee5879fced380804ec5e03154ad732e6d"
   }
 }
