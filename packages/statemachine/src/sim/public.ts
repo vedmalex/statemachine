@@ -58,6 +58,7 @@ import {
   type CheckerContext,
   type ConfigGraph,
   type Invariant,
+  type RtcStallObservation,
   type Violation,
   INVARIANTS,
   buildConfigGraph,
@@ -71,7 +72,7 @@ import type { PerfSample } from './metrics'
 import { NoopLogger } from './noop-logger'
 import { type Prng, makePrng } from './prng'
 import { type DriverOp, SimDriver } from './driver'
-import { settleMacrostep } from './settle'
+import { makeRtcStallRecorder, settleMacrostep } from './settle'
 import { SimErrorHandler } from './sim-error-handler'
 import { SimMonitor } from './sim-monitor'
 import { type CanonicalHeader, type CanonicalTrace, type TraceFrame, hashTrace, normalizeParts } from './trace'
@@ -836,6 +837,16 @@ export class Simulator<T extends object = object> {
    * violation is observed.
    */
   private firstViolation?: Violation
+  /**
+   * The I-13 RTC-stall observation plane: a live accumulator over the settle
+   * pump's per-turn samples, wired into EVERY drain the DRIVER makes.
+   *
+   * Deliberately NOT wired into {@link runSentinelProbe}, on exactly the reasoning
+   * that keeps `maxTurns` out of it: that probe is a one-shot harness-owned
+   * assertion about the injected scheduler over a throwaway machine, not a drain
+   * of consumer work, and its samples say nothing about the machine under test.
+   */
+  private readonly rtcStallRecorder = makeRtcStallRecorder()
 
   constructor(
     private readonly setup: SimSetup<T>,
@@ -924,6 +935,8 @@ export class Simulator<T extends object = object> {
       ...(this.maxQueueDepth !== undefined ? { maxQueueDepth: this.maxQueueDepth } : {}),
       // Forward the settle budget to EVERY drain the driver makes.
       ...(this.maxTurns !== undefined ? { maxTurns: this.maxTurns } : {}),
+      // I-13: the per-pump-turn sample sink, on every DRIVER drain.
+      onSample: this.rtcStallRecorder.onSample,
     })
     this.driver = driver
     this.machine = driver.machine
@@ -938,6 +951,7 @@ export class Simulator<T extends object = object> {
     const graph: ConfigGraph = buildConfigGraph(resolved.config)
     this.stateCount = Math.max(1, graph.states.size)
     const simMonitor = this._env.monitor as SimMonitor
+    const rtcStallRecorder = this.rtcStallRecorder
     if (this.invariants.length > 0) {
       this.checkerCtx = {
         graph,
@@ -958,6 +972,13 @@ export class Simulator<T extends object = object> {
         // vacuity signal into a false-positive licence.
         get raisesTruncated(): boolean {
           return simMonitor.isRaisesTruncated()
+        },
+        // I-13: a GETTER for the same reason `raisesTruncated` is one — this
+        // context is built ONCE, BEFORE `driver.init()` runs, so a captured
+        // snapshot would hand every checker the empty pre-run observation and
+        // make the oracle silently inert for the whole run.
+        get rtcStall(): RtcStallObservation {
+          return rtcStallRecorder.observation()
         },
       }
     }

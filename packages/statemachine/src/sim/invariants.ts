@@ -106,6 +106,34 @@ export interface LifecycleObservation {
   readonly transition?: string
 }
 
+/**
+ * The RTC-stall observation the I-13 oracle reads, as the SAFETY plane states it.
+ *
+ * This is a LOCAL STRUCTURAL restatement of what `settle.ts`'s sample recorder
+ * produces, NOT an import of it — the same discipline as {@link ConfigGraph}
+ * replicating the engine's `getRegionKey` and {@link LifecycleObservation}
+ * restating the engine's `LifecycleEvent`. It is also MECHANICALLY required: this
+ * module may not import from the settle plane at all (the checker-purity grep in
+ * `invariants.test.ts` forbids `from './settle'` here, so that no checker can
+ * acquire a settle/drain call by accident). The recorder's return type is
+ * structurally assignable to this, so the two cannot silently drift.
+ *
+ * Reading it is not a live engine read: the samples were CAPTURED by the settle
+ * pump during the drain, exactly like the `doneDelta` projection.
+ */
+export interface RtcStallObservation {
+  /** Total pump samples taken across the run. */
+  readonly samples: number
+  /**
+   * Longest run of MICROTASK-ADJACENT samples for which the stall predicate
+   * (`queue > 0`, not processing, no in-flight async) held. `>= 2` is the I-13
+   * witness; `1` is a reading a CORRECT machine legitimately produces.
+   */
+  readonly maxRun: number
+  /** Queue total observed at the sample that set {@link maxRun} (0 when none). */
+  readonly witnessQueueTotal: number
+}
+
 /** The pure context every checker receives (graph + header; NO live engine). */
 export interface CheckerContext {
   readonly graph: ConfigGraph
@@ -161,6 +189,22 @@ export interface CheckerContext {
    * ADJACENT boundary frames), and a per-frame hook cannot see its predecessor.
    */
   readonly frames?: readonly TraceFrame[]
+  /**
+   * The CAPTURED per-pump-turn RTC-stall observation of this run (settle.ts
+   * `makeRtcStallRecorder`), supplied by the harness as a LIVE VIEW — the
+   * sole input of the I-13 oracle.
+   *
+   * Like {@link lifecycle} and {@link raises} it lives on the CONTEXT, never on
+   * {@link TraceFrame}: the pump turn is a sub-frame structure with no 1:1 frame
+   * mapping, and adding a hashed frame field would move every corpus hash for an
+   * observation that is not part of the content plane. Nothing here is a live
+   * engine read — the samples were recorded by the settle pump during the drain,
+   * exactly like the `doneDelta` projection.
+   *
+   * ABSENT when the run wired no sample sink ⇒ I-13 is VACUOUS (the I-4
+   * convention: a missing observation plane must never manufacture a violation).
+   */
+  readonly rtcStall?: RtcStallObservation
 }
 
 /**
@@ -1139,7 +1183,115 @@ const I12: Invariant = {
 }
 
 /**
- * The FROZEN I-1..I-12 registry. `runSafety` (in invariants.runner.ts) iterates
+ * I-13 ENQUEUE-SCHEDULED (final, OPT-IN). The machine never sits on queued work
+ * with no drain scheduled to consume it.
+ *
+ * ## The predicate
+ * At a MICROTASK CHECKPOINT inside the settle pump (settle.ts `SettleSample` —
+ * the observation taken immediately after `await Promise.resolve()`, exactly one
+ * per turn):
+ *
+ *     queueTotal > 0 && isProcessingEvents() === false && inFlightAsyncCount() === 0
+ *
+ * The witness is that predicate holding across **>= 2 MICROTASK-ADJACENT samples**
+ * (`b.turn === a.turn + 1` within ONE settle). One positive sample is NOT a
+ * finding.
+ *
+ * ## Why this is not a fifth truncation
+ * Four RTC oracles have now been withdrawn from this file, all with the same
+ * defect: a proxy for "the engine has no scheduled continuation" (`stuck >=
+ * QUIET_FLUSH`, `microtask-budget`, `budget-progressing`, `WAITING_ON_INTERNAL`)
+ * was read as a POSITIVE observation, when its real content was "a fixed window
+ * elapsed and we stopped looking". Each was refuted by a CORRECT machine whose
+ * legitimate frozen chain was one turn longer than the window, and in every case
+ * the deciding variable was a HARNESS CONSTANT (`DEFAULT_MAX_TURNS`, `QUIET_FLUSH`)
+ * rather than anything about the machine.
+ *
+ * This predicate is not a window at all. It has exactly two possible causes, and
+ * the second is the bug by definition:
+ *
+ *  (a) A `queueMicrotask(processQueues)` is PENDING. `scheduleProcessing`
+ *      (state_machine.ts) queues exactly that, and the microtask queue is FIFO.
+ *  (b) Nothing is scheduled while the queue is non-empty — nothing will drain it.
+ *
+ * ## Why the threshold is 2, and why 2 is enough
+ * Case (a) is self-clearing WITHIN ONE TURN, and the reason it is bounded is
+ * structural: `processQueues` sets `isProcessing = true` SYNCHRONOUSLY, before its
+ * first `await`. Concretely, let sample n be positive:
+ *
+ *  - The pump's continuation for sample n+1 is queued at the `await
+ *    Promise.resolve()` that follows sample n — i.e. STRICTLY AFTER n.
+ *  - So any microtask already queued at sample n, including a pending
+ *    `processQueues`, runs BEFORE sample n+1.
+ *  - When it runs it sets `isProcessing = true` and then suspends at its first
+ *    `await` (the drain's `executeQueuedTransition`), which cannot complete ahead
+ *    of a continuation that is already queued in front of it.
+ *  - Therefore sample n+1 observes `processing === true` and the run ends at 1.
+ *
+ * A correct machine really does produce that single positive: whenever the
+ * enqueue happens in a floating microtask that was queued AHEAD of the pump's own
+ * continuation, the continuation runs before the freshly-queued `processQueues`
+ * and sees `queue > 0 && !processing` once. MEASURED at HEAD on
+ * `a -(invoke delay:0, async action)-> b`: the sample stream is
+ * `... 20:0|false|0  21:1|false|0  22:0|true|0 ...` — one positive at turn 21,
+ * `processing` true at 22. maxRun = 1. Deleting ONLY the `scheduleProcessing()`
+ * that follows that `raiseEvent` in a copy of the engine leaves turns 1..21
+ * byte-identical and turns 22+ pinned at `1|false|0` — maxRun 44 within a 64-turn
+ * budget. The threshold separates the two by a structural argument, not by a
+ * measured constant, and the measurement merely confirms it.
+ *
+ * ## What the bound rests on (each pinned by a test)
+ *  1. `processQueues` writes `isProcessing = true` synchronously before any
+ *     `await`. Moving that write past an await converts this one-turn window into
+ *     an unbounded one and makes the oracle unsound.
+ *  2. The run-away (`maxTransitionDepth`) break clears BOTH queues before
+ *     breaking, so it leaves no persistent `queue > 0 && !processing` state.
+ *  3. Every enqueue is paired with a schedule. Two external pushes pair inside
+ *     `enqueueEvent` / `enqueueDetailedEvent`; the internal push lives in
+ *     `raiseEvent`, which does NOT schedule — its five call sites do, by
+ *     CONVENTION rather than by construction. That convention is what this oracle
+ *     guards.
+ *
+ * ## Honest framing
+ * At HEAD no reachable violating state exists — this is a REGRESSION witness, not
+ * a bug detector for today's engine. It is OPT-IN and deliberately NOT in
+ * `DEFAULT_BUILTIN_INVARIANT_IDS`: an oracle that cannot fire on any current
+ * machine must not inflate `oraclesRun` on a default run. Its value is realized in
+ * the test suite, where a mutated engine proves it has teeth.
+ *
+ * VACUOUS when `ctx.rtcStall` is absent (no sample plane wired) — a missing
+ * observation plane never manufactures a violation (the I-4 convention).
+ */
+const I13: Invariant = {
+  id: 'I-13',
+  scope: 'final',
+  capabilityTags: ['rtc.enqueue-scheduled'],
+  checkFinal(state, ctx): Violation | null {
+    const obs = ctx.rtcStall
+    if (obs === undefined) {
+      return null // no sample plane wired ⇒ vacuous, never a violation
+    }
+    // A single positive sample is a reading a CORRECT machine produces (see the
+    // one-turn argument above); only an ADJACENT PAIR is the witness.
+    if (obs.maxRun < 2) {
+      return null
+    }
+    return makeViolation({
+      invariantId: 'I-13',
+      step: Number.MAX_SAFE_INTEGER,
+      witness: state.config,
+      message:
+        `queued work with no drain scheduled: the settle predicate ` +
+        `(queue>0, not processing, no in-flight async) held across ` +
+        `${obs.maxRun} consecutive microtask checkpoints`,
+      observed: `maxRun:${obs.maxRun} over ${obs.samples} samples, queue:${obs.witnessQueueTotal}`,
+      expected: 'at most 1 consecutive sample (a pending processQueues clears it next turn)',
+    })
+  },
+}
+
+/**
+ * The FROZEN I-1..I-13 registry. `runSafety` (in invariants.runner.ts) iterates
  * this `readonly Invariant[]` BLIND — it never references an id literally. This
  * array is the ONLY place the id literals legitimately appear in source.
  */
@@ -1156,4 +1308,5 @@ export const INVARIANTS: readonly Invariant[] = [
   I10,
   I11,
   I12,
+  I13,
 ] as const

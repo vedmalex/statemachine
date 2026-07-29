@@ -56,7 +56,12 @@ import {
 } from './faults'
 import { type FireResult, type SubmissionEntry, applyQueueFaults, applyThrowFaults, buildOverflowFlood, fireBuffered } from './harness'
 import type { Prng } from './prng'
-import { type SettlePolicy, type SettleReason, settleMacrostep } from './settle'
+import {
+  type SettlePolicy,
+  type SettleReason,
+  type SettleSample,
+  settleMacrostep,
+} from './settle'
 import type { SimErrorHandler } from './sim-error-handler'
 import type { SimMonitor } from './sim-monitor'
 import {
@@ -119,6 +124,18 @@ export interface DriverConfig<T extends object> {
    * because the two are indistinguishable over any FIXED window.
    */
   readonly maxTurns?: number
+  /**
+   * Optional per-pump-turn sample sink, forwarded to EVERY {@link settleMacrostep}
+   * this driver makes — the I-13 RTC-stall observation plane. Wire
+   * `makeRtcStallRecorder().onSample` here; absent ⇒ no samples are taken and the
+   * I-13 oracle is VACUOUS (the I-4 convention: a missing observation plane must
+   * never manufacture a violation).
+   *
+   * It belongs in {@link settleArgs} for the same reason `maxTurns` does: a new
+   * DRIVER settle site must not be able to silently drop it, which would make the
+   * oracle observe only part of the run.
+   */
+  readonly onSample?: (sample: SettleSample) => void
   /**
    * INTERNAL (not a public-ABI field): the resolved {@link FaultPlan} to apply
    * DURING this run. When present the driver routes external fires through the
@@ -460,6 +477,7 @@ export class SimDriver<T extends object> {
     env: Env
     policy: SettlePolicy
     maxTurns?: number
+    onSample?: (sample: SettleSample) => void
   } {
     return {
       sm: this.sm,
@@ -468,6 +486,7 @@ export class SimDriver<T extends object> {
       env: this.env,
       policy,
       ...(this.cfg.maxTurns !== undefined ? { maxTurns: this.cfg.maxTurns } : {}),
+      ...(this.cfg.onSample !== undefined ? { onSample: this.cfg.onSample } : {}),
     }
   }
 

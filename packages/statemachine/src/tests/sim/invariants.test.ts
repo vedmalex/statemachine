@@ -99,12 +99,12 @@ function makeDriver<T extends object>(
   })
 }
 
-// ── DoD 1: readonly Invariant[] with all twelve ids + MECHANICAL blind grep ───
+// ── DoD 1: readonly Invariant[] with all thirteen ids + MECHANICAL blind grep ─
 
 describe('invariants registry + blind iteration (DoD 1)', () => {
-  it('INVARIANTS holds all twelve ids I-1..I-12', () => {
+  it('INVARIANTS holds all thirteen ids I-1..I-13', () => {
     const ids = INVARIANTS.map((i) => i.id)
-    expect(ids).toEqual(['I-1', 'I-2', 'I-3', 'I-4', 'I-5', 'I-6', 'I-7', 'I-8', 'I-9', 'I-10', 'I-11', 'I-12'])
+    expect(ids).toEqual(['I-1', 'I-2', 'I-3', 'I-4', 'I-5', 'I-6', 'I-7', 'I-8', 'I-9', 'I-10', 'I-11', 'I-12', 'I-13'])
   })
 
   it('runSafety body contains NO /I-\\d+/ id literal (mechanical blind-iteration grep)', () => {

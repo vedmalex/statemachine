@@ -17,6 +17,87 @@ The engine side of this is `IMonitor.recordLifecycle` (see `LifecycleEvent` in
 deliberately raw: no timestamps, no pairing, no grouping. The **tracer** is the
 consumer side that turns it into something you can read.
 
+## The machine has already gone quiet and you wired nothing
+
+Everything below this section requires you to have installed a tracer *before*
+the machine misbehaved — that is, to have already suspected the problem. For the
+case you are usually in instead, the machine can answer on its own:
+
+```ts
+console.error(sm.describeProgress())
+```
+
+```
+onEnter at 'b' for nils (owner #1) is open, and the engine has not advanced a
+phase since it was entered.
+
+Engine at tick 6, last advanced at micro.exit.
+Source: the engine's live entry/settle counters, not the lifecycle buffer.
+```
+
+No monitor, no options, no setup. `describeProgress()` reads the same live
+bookkeeping `getProgress()` returns — the dispatch funnel maintains it whether or
+not anything is subscribed — and renders it as prose: *which* slot, in *which*
+state, for *which* owner, open for *how long*.
+
+The age is in **engine ticks**, not milliseconds and not microtask turns. A tick
+is one engine phase advance, so the gap between two ticks is a property of the
+engine's code rather than of your machine's shape: the same wedge reports the
+same age on a one-region machine and a sixteen-region one. `openTicks: 0` means
+the engine has not advanced *at all* since that callable was entered.
+
+With more than one callable open, the oldest leads and the rest are listed
+beneath it:
+
+```
+2 consumer callables are open. The oldest is invoke.operation at 'working' for
+alice (owner #1), open for 10 engine ticks since tick 10.
+
+  10 ticks  invoke.operation  working  alice (owner #1)
+   0 ticks  invoke.operation  working  bob (owner #2)
+
+Engine at tick 20, last advanced at drain.external.
+Source: the engine's live entry/settle counters, not the lifecycle buffer.
+```
+
+Over a single snapshot, "most ticks open" and "entered earliest" are the same
+ordering, so there is no tie-break to argue about.
+
+### What it will not tell you
+
+**It never says stuck.** A callable is entitled to take as long as it likes, and
+nothing in one snapshot separates a wedge from a slow `await` — a 60ms `onEnter`
+and a permanently hung one produce the identical report. So the report states the
+two facts it has (this slot is open; the engine has / has not advanced since) and
+leaves the verdict to you, who knows what that callback was supposed to do.
+
+**It is not a liveness oracle and there is no plan for it to become one.** If you
+want "is this machine wedged?", the honest answer is: sample `getProgress()`
+twice and compare, with knowledge of what the callbacks do.
+
+### On a `transitionTimeout`
+
+When a `transitionTimeout` wins its race the consumer body is, by construction,
+still running — the deadline aborts the *wait*, not the callback. That is the one
+moment the engine can volunteer the answer, and it does, on the existing warn
+channel:
+
+```
+Transition timeout after 20ms, but the callable is still running — onEnter at 'b'
+for deadline (owner #1) is open, and the engine has not advanced a phase since it
+was entered.
+```
+
+The rejected promise still carries exactly `Transition timeout`; the slot
+identity is additive and goes to the logger, so nothing matching on that message
+is affected. Silence the line with `options.logger`, like any other engine log.
+
+### Cross-checking against a trace
+
+If a tracer *is* installed as the machine's monitor, `describeProgress()` finds it
+and uses it as a **second opinion** — it can add a caveat, never a claim. See
+[Truncation](#truncation-and-the-false-all-clear) for the caveat that matters.
+
 ## Quick start
 
 ```ts
@@ -100,6 +181,10 @@ the list.
   enter    proc.r1.b  onAfterEnter   ⧗ unfinished
 — 13 records · 1 unfinished
 ```
+
+**Check `tracer.truncated` before you believe an empty result** — see
+[Truncation](#truncation-and-the-false-all-clear). On a truncated buffer,
+`unfinished()` returning `[]` does not mean nothing is hung.
 
 ### Who threw?
 
@@ -231,18 +316,25 @@ Reading a gap here as a bug will send you chasing the wrong thing.
 
 ## Memory
 
-The tracer keeps a **ring buffer**, so it cannot leak in a long-lived process.
+**The tracer retains at most 10 000 records by default.** Past that it keeps the
+most recent 10 000 and throws the rest away. That is the whole limit, stated
+plainly, because everything in the next section follows from it.
+
+It is a **ring buffer**, so it cannot leak in a long-lived process.
 
 - `options.limit` — maximum retained records. Default `10_000`. Pass
   `Number.POSITIVE_INFINITY` for unbounded retention. A non-integer or
   non-positive value falls back to the default rather than throwing: a debugging
   aid must not be the thing that breaks your build.
 - On overflow the **oldest** record is dropped and counted. The loss is
-  disclosed, never hidden — `stats().dropped` reports it and `format()` appends
-  `… · 37 dropped (limit 100)` to its summary line.
+  disclosed, never hidden — `truncated` flips to `true`, `stats().dropped`
+  reports it, and `format()` appends `… · 37 dropped (limit 100)` to its summary
+  line.
 - A dropped `begin` whose `end` survives is rendered as `⚠ end only` instead of
   being silently discarded.
-- `reset()` clears the trace *and* all counters.
+- `reset()` clears the trace *and* all counters — including `dropped`, so
+  `truncated` goes back to `false` over a buffer that is nonetheless missing
+  everything that came before.
 
 ```ts
 tracer.stats()
@@ -254,9 +346,81 @@ pure subscriber: it never calls back into the machine, never mutates a record,
 and never throws out of a sink method — a partial or nonsense payload is
 absorbed and counted, not propagated.
 
+### Truncation and the false all-clear
+
+The failure mode this creates is worth naming, because it is the *opposite* of
+the one people expect.
+
+Eviction is by **age**. A `begin` can therefore scroll out from under a callable
+that is still running — but its `end`, which is younger, never outlives it. So a
+truncated trace cannot *invent* a hung callback. It can only **miss** one, and it
+misses silently:
+
+```ts
+tracer.unfinished()   // []        ← nothing is hung?
+sm.getProgress().openDispatches.length   // 1  ← something very much is
+tracer.truncated      // true      ← this is why
+```
+
+A tool whose job is to be believed must not answer "all clear" from a buffer that
+can no longer see the run. So:
+
+- **`tracer.truncated`** is `true` once *any* record has been dropped. Read it at
+  the moment you draw a conclusion, never earlier — it is a **getter**, and a
+  `false` you captured at wiring time is a `false` that expires. (`SimMonitor`
+  froze the same rule for `raisesTruncated`, for the same reason.)
+- **`describeProgress()` consults it for you.** With a truncated trace installed,
+  the report keeps the live reading and explicitly disqualifies the buffer:
+
+  ```
+  invoke.operation at 'working' for held (owner #1) has been open for 144 engine
+  ticks, since tick 12.
+
+  Engine at tick 156, last advanced at drain.external.
+  Source: the engine's live entry/settle counters, not the lifecycle buffer. The
+  lifecycle trace has dropped 23 of 27 records (limit 4), so what it retains is a
+  suffix of the run and an unfinished callback that started earlier no longer
+  appears in it at all — nothing above rests on it.
+  ```
+
+- **The live counters are authoritative where the buffer is not.**
+  `getProgress().openDispatches` is maintained on entry and settle, never derived
+  by scanning a buffer, so it is bounded by real concurrency rather than by run
+  length and is unaffected by any of this.
+
+The reconciliation runs in both directions. An unmatched `begin` in the trace that
+the engine is *not* inside — one tracer shared across two machines, or a
+`reset()` mid-flight — is named and disowned rather than reported as this
+machine's:
+
+```
+Source: … The trace additionally shows onEnter at 'b' for alpha (owner #2) as
+unfinished, but this engine is not inside it — either that end edge never reached
+the trace, or the trace is shared with another machine. It is not evidence about
+this one.
+```
+
 ## API
 
 ```ts
+// ── the standing report ─────────────────────────────────────────────────────
+class StateMachine {
+  getProgress(): EngineProgress      // the raw snapshot
+  describeProgress(): string         // that snapshot, as prose
+}
+
+function describeProgress(
+  progress: EngineProgress,
+  options?: DescribeProgressOptions,
+): string
+
+interface DescribeProgressOptions {
+  trace?: LifecycleTracer   // a SECOND OPINION; may add a caveat, never a claim
+  limit?: number            // open slots listed before the tail is summarised; default 6
+  oneLine?: boolean         // just the lead sentence, for a log line; default false
+}
+
+// ── the tracer ──────────────────────────────────────────────────────────────
 function createLifecycleTracer(options?: LifecycleTracerOptions): LifecycleTracer
 
 interface LifecycleTracerOptions {
@@ -280,6 +444,7 @@ interface LifecycleTracer extends IMonitor {
   owners(): object[]
 
   stats(): LifecycleTracerStats
+  readonly truncated: boolean   // a GETTER — read it when you conclude, not when you wire
   reset(): void
 }
 
@@ -317,5 +482,6 @@ interface LifecycleTracerStats {
 ## Stability
 
 `@unstable`, like the `IMonitor.recordLifecycle` channel it consumes. The
-rendered `format()` output is a debugging aid, not a parsing target: treat it as
-prose and read structured data from the helpers instead.
+rendered `format()` and `describeProgress()` output is a debugging aid, not a
+parsing target: treat it as prose, and read structured data from the helpers —
+`unfinished()`, `stats()`, `getProgress()` — instead.

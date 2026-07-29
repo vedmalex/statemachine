@@ -176,6 +176,21 @@ const ORACLE_TEETH: readonly TeethCase[] = [
     fire: () =>
       runSafety(INVARIANTS, trace(frame({ step: 1, cause: 'internal', from: 'root', to: 'root', event: 'done.state.other' })), ctxFor({ states: { root: {} }, events: { 'done.state.root': {} } }, 8)),
   },
+  {
+    id: 'I-13',
+    // A CAPTURED sample-plane observation in which the stall predicate held across
+    // TWO microtask-adjacent pump checkpoints. One positive is a reading a correct
+    // machine produces (see the I-13 note in invariants.ts); two consecutive ones
+    // mean nothing was scheduled to drain the queue. The real teeth — the same
+    // predicate driven by an ENGINE with its `scheduleProcessing()` deleted — live
+    // in `rtc_stall_oracle.test.ts`; this fixture is the registry-level claim.
+    fire: () =>
+      runSafety(
+        INVARIANTS,
+        trace(frame({ step: 1, to: 'a' })),
+        { ...baseCtx(), rtcStall: { samples: 64, maxRun: 44, witnessQueueTotal: 1 } },
+      ),
+  },
 ]
 
 // Documented no-ops (MASTER §4а.1). I-4 LEFT this set in W8/V3a once the lifecycle

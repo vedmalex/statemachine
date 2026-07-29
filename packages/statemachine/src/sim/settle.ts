@@ -71,6 +71,119 @@ export type SettleReason =
   | 'WAITING_ON_TRANSITION_TIMEOUT' // GENUINE in-flight async (inFlight>0) racing a future deadline (safety: no jump)
   | 'WAITING_ON_INTERNAL' // pending queue/processing with NO tracked in-flight async + a future timer — a wedged-flag / undrained-queue RTC concern (U1)
 
+/**
+ * ONE observation of the three engine-observable settle components, taken at a
+ * MICROTASK CHECKPOINT inside the pump.
+ *
+ * ## THE SAMPLE DEFINITION — read this before adding any second read site
+ * A sample is the observation taken IMMEDIATELY AFTER `await Promise.resolve()`
+ * in {@link settleMacrostep}'s inner pump, EXACTLY ONCE PER TURN, AND NOWHERE
+ * ELSE. That is not a stylistic preference; it is the entire premise of the I-13
+ * oracle, whose soundness rests on there being a real microtask boundary — and
+ * therefore a full drain of every microtask queued before it — BETWEEN any two
+ * consecutive samples.
+ *
+ * The natural place to hang a second read is the `prev = fingerprint()`
+ * initializer at the top of each OUTER iteration, which runs after a SYNCHRONOUS
+ * `scheduler.process` and executes no `await` at all. Two "consecutive" samples
+ * with no microtask boundary between them would let I-13 convict a correct
+ * machine — the exact shape of the four RTC oracles that failed before it. The
+ * relation `sampleCount === SettleResult.turns` is therefore an INVARIANT of this
+ * file, and it is pinned by `src/tests/sim/rtc_stall_oracle.test.ts` precisely so
+ * a second sampling site turns red instead of turning the oracle unsound.
+ *
+ * `turn` is the 1-based pump-turn index WITHIN one {@link settleMacrostep} call.
+ * It is what makes "consecutive" checkable by a consumer without a settle-instance
+ * id: two samples are microtask-adjacent iff `b.turn === a.turn + 1`, and since
+ * every settle restarts at 1 the first sample of a NEW settle can never chain
+ * onto the last sample of the previous one.
+ */
+export interface SettleSample {
+  /** 1-based pump-turn index within THIS `settleMacrostep` call. */
+  readonly turn: number
+  /** `sm.getQueueDepth().total` at the checkpoint. */
+  readonly queueTotal: number
+  /** `sm.isProcessingEvents()` at the checkpoint. */
+  readonly processing: boolean
+  /** `env.inFlightAsyncCount()` at the checkpoint — the SIM-side composed count. */
+  readonly inFlight: number
+}
+
+/**
+ * What `makeRtcStallRecorder` accumulates across a run, and the ONLY thing
+ * the I-13 oracle reads. See `makeRtcStallRecorder` for the predicate and
+ * `invariants.ts` (I-13) for the soundness argument.
+ */
+export interface RtcStallObservation {
+  /** Total samples taken across every settle the recorder was wired into. */
+  readonly samples: number
+  /**
+   * Longest run of MICROTASK-ADJACENT samples for which the stall predicate
+   * `queueTotal > 0 && !processing && inFlight === 0` held. `>= 2` is the I-13
+   * witness; `1` is a reading a CORRECT machine legitimately produces.
+   */
+  readonly maxRun: number
+  /** `queueTotal` observed at the sample that set {@link maxRun} (0 when none). */
+  readonly witnessQueueTotal: number
+}
+
+/**
+ * A live, run-scoped accumulator over {@link SettleSample}s implementing the I-13
+ * stall predicate.
+ *
+ * THE PREDICATE: `queueTotal > 0 && processing === false && inFlight === 0` — the
+ * machine has queued work, is not draining it, and has no in-flight async
+ * operation that could still be about to enqueue+schedule.
+ *
+ * WHY A RUN OF 2, NEVER 1. `processQueues` sets `isProcessing = true`
+ * SYNCHRONOUSLY before its first `await` (state_machine.ts `processQueues`), so a
+ * pending `queueMicrotask(processQueues)` that runs between two samples is
+ * observable at the SECOND one. Conversely a correct machine DOES produce a
+ * single positive reading whenever the enqueue happens in a floating microtask
+ * that was already queued ahead of the pump's own continuation: that continuation
+ * runs BEFORE the freshly-queued `processQueues`, so it sees `queue > 0 &&
+ * !processing` once. One positive is therefore NOT a finding; two consecutive
+ * ones are.
+ *
+ * The returned `onSample` is an ARROW closure with no `this`, so it can be
+ * detached and handed straight to {@link SettleArgs.onSample}.
+ */
+export function makeRtcStallRecorder(): {
+  readonly onSample: (sample: SettleSample) => void
+  observation(): RtcStallObservation
+} {
+  let samples = 0
+  let run = 0
+  let maxRun = 0
+  let witnessQueueTotal = 0
+  let prevTurn = -1
+  return {
+    onSample: (s: SettleSample): void => {
+      samples += 1
+      const holds = s.queueTotal > 0 && s.processing === false && s.inFlight === 0
+      if (!holds) {
+        run = 0
+        prevTurn = s.turn
+        return
+      }
+      // Chain ONLY onto the immediately preceding turn of the SAME settle. A new
+      // settle restarts `turn` at 1, and `prevTurn + 1 === 1` would require
+      // `prevTurn === 0`, which no sample ever carries — so a run can never span
+      // two settleMacrostep calls (between which arbitrary synchronous driver
+      // work, not a microtask boundary, has happened).
+      run = s.turn === prevTurn + 1 ? run + 1 : 1
+      prevTurn = s.turn
+      if (run > maxRun) {
+        maxRun = run
+        witnessQueueTotal = s.queueTotal
+      }
+    },
+    observation(): RtcStallObservation {
+      return { samples, maxRun, witnessQueueTotal }
+    },
+  }
+}
+
 /** Outcome of one {@link settleMacrostep} call. */
 export interface SettleResult {
   /** True iff the full quiescence predicate held within budget. */
@@ -178,6 +291,16 @@ export interface SettleArgs {
    * frame). Not called in `'safety'` mode.
    */
   readonly onClockJump?: (to: number) => void
+  /**
+   * Optional sink called EXACTLY ONCE PER PUMP TURN, immediately after the pump's
+   * `await Promise.resolve()` and nowhere else — see {@link SettleSample} for why
+   * that placement is load-bearing rather than incidental.
+   *
+   * The number of calls equals {@link SettleResult.turns} for every settle,
+   * unconditionally. Wire `makeRtcStallRecorder` here to feed the I-13
+   * oracle; absent ⇒ zero cost and the oracle is vacuous.
+   */
+  readonly onSample?: (sample: SettleSample) => void
 }
 
 /**
@@ -273,11 +396,25 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
     return turns - lastMoveTurn <= recencyWindow ? 'budget-progressing' : 'microtask-budget'
   }
 
+  /**
+   * Read the three observable components at the current instant. PURE — no sink
+   * is notified from here. {@link SettleArgs.onSample} is driven from the ONE
+   * post-await site inside the pump; every other caller of this helper (notably
+   * the per-outer-iteration `prev = fingerprint()`) is deliberately silent
+   * because it observes NO microtask boundary. See {@link SettleSample}.
+   */
+  const observe = (): Omit<SettleSample, 'turn'> => ({
+    queueTotal: args.sm.getQueueDepth().total,
+    processing: args.sm.isProcessingEvents(),
+    inFlight: env.inFlightAsyncCount(),
+  })
+
+  /** The frozen fingerprint string form (`total|processing|inFlight`). */
+  const fingerprintOf = (o: Omit<SettleSample, 'turn'>): string =>
+    `${o.queueTotal}|${o.processing}|${o.inFlight}`
+
   /** Observable settle fingerprint at the current instant. */
-  const fingerprint = (): string => {
-    const q = args.sm.getQueueDepth()
-    return `${q.total}|${args.sm.isProcessingEvents()}|${env.inFlightAsyncCount()}`
-  }
+  const fingerprint = (): string => fingerprintOf(observe())
 
   // The outer loop re-fires due timers after each microtask-quiet window (and
   // re-enters after each liveness clock-jump). Bounded by the SAME `turns`
@@ -359,7 +496,18 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
       }
       await Promise.resolve()
       turns += 1
-      const cur = fingerprint()
+      // ===================================================================
+      // THE SINGLE SAMPLING SITE. Do not add a second one. `onSample` must
+      // appear exactly once in this file: the I-13 oracle's soundness is the
+      // claim that consecutive samples are separated by a REAL microtask
+      // boundary, and the only place in this pump where that is true is right
+      // here, one statement after the `await`. `sampleCount === turns` is
+      // pinned by src/tests/sim/rtc_stall_oracle.test.ts, both behaviourally
+      // and by a source-text count of this call.
+      // ===================================================================
+      const observed = observe()
+      args.onSample?.({ turn: turns, ...observed })
+      const cur = fingerprintOf(observed)
       if (cur === prev) {
         if (pending) {
           stuck += 1

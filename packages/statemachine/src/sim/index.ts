@@ -98,6 +98,9 @@ export type {
   SettlePolicy,
   SettleReason,
   SettleResult,
+  // The per-pump-turn observation `SettleArgs.onSample` receives — a consumer
+  // wiring that sink needs to be able to name its parameter.
+  SettleSample,
   SettleScheduler,
   SettleTarget,
 } from './settle'
@@ -219,6 +222,9 @@ export type {
   // W8/V3a: the lifecycle observation a custom invariant reads from
   // `CheckerContext.lifecycle` (I-4 keys its ordering predicate on it).
   LifecycleObservation,
+  // The RTC-stall observation a custom invariant reads from
+  // `CheckerContext.rtcStall` (I-13 keys its stall predicate on it).
+  RtcStallObservation,
   Violation,
 } from './invariants'
 export { runSafety, runSafetyWithDeterminism } from './invariants.runner'

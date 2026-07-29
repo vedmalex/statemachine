@@ -61,6 +61,16 @@ export function createVirtualScheduler(clock: Clock): ITimerScheduler;
 export type DeepNestedStateName<S> = StatePathsOf<S>;
 
 // @public
+export function describeProgress(progress: EngineProgress, options?: DescribeProgressOptions): string;
+
+// @public
+export interface DescribeProgressOptions {
+    limit?: number;
+    oneLine?: boolean;
+    trace?: LifecycleTracer;
+}
+
+// @public
 export interface EngineProgress {
     readonly inFlightUserCallables: number;
     readonly lastTickSeq: number;
@@ -444,6 +454,7 @@ export interface LifecycleTracer extends IMonitor {
     recordLifecycle(event: LifecycleEvent): void;
     reset(): void;
     stats(): LifecycleTracerStats;
+    readonly truncated: boolean;
     unfinished(): LifecycleRecord[];
     wrap(inner: IMonitor): IMonitor;
 }
@@ -709,6 +720,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    describeProgress(): string;
     detachOwner(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): OwnerDetachResult;
     // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;

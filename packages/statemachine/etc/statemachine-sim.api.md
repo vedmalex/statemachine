@@ -143,6 +143,7 @@ export interface CheckerContext {
     readonly maxQueueDepth?: number;
     readonly raises?: readonly LifecycleObservation[];
     readonly raisesTruncated?: boolean;
+    readonly rtcStall?: RtcStallObservation;
 }
 
 // @public (undocumented)
@@ -438,6 +439,7 @@ export interface DriverConfig<T extends object> {
     // (undocumented)
     readonly monitor: SimMonitor;
     readonly onFrame?: (frame: TraceFrame) => void;
+    readonly onSample?: (sample: SettleSample) => void;
     readonly owner: Adapter<T>;
     readonly policy?: SettlePolicy;
     readonly prng: Prng;
@@ -1332,6 +1334,13 @@ export function rekeyFaultPlan(plan: FaultPlan, survivingOpIds: ReadonlySet<stri
 export function resolveFaultAt(plan: FaultPlan, opId: string, cursor: FaultCursor, records: FaultRecord[]): FaultSpec | undefined;
 
 // @public
+export interface RtcStallObservation {
+    readonly maxRun: number;
+    readonly samples: number;
+    readonly witnessQueueTotal: number;
+}
+
+// @public
 export function runPerf(opts: RunPerfOptions): Promise<PerfReport>;
 
 // @public
@@ -1387,6 +1396,7 @@ export interface SettleArgs {
     readonly env: Env;
     readonly maxTurns?: number;
     readonly onClockJump?: (to: number) => void;
+    readonly onSample?: (sample: SettleSample) => void;
     // (undocumented)
     readonly policy: SettlePolicy;
     // (undocumented)
@@ -1410,6 +1420,14 @@ export interface SettleResult {
     readonly reason?: SettleReason;
     readonly t: number;
     readonly turns: number;
+}
+
+// @public
+export interface SettleSample {
+    readonly inFlight: number;
+    readonly processing: boolean;
+    readonly queueTotal: number;
+    readonly turn: number;
 }
 
 // @public
@@ -1748,6 +1766,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    describeProgress(): string;
     // Warning: (ae-forgotten-export) The symbol "OwnerDetachResult" needs to be exported by the entry point index.d.ts
     detachOwner(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): OwnerDetachResult;
     // (undocumented)

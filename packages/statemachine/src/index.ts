@@ -150,6 +150,18 @@ export { createLifecycleTracer } from './lifecycle-tracer'
 
 /**
  * @category Unstable
+ * @unstable — render a {@link EngineProgress} snapshot as the answer to "on what
+ * is this machine standing right now?". `StateMachine#describeProgress()` is the
+ * zero-setup way in; call this directly when you hold a snapshot rather than the
+ * machine, or when you want to cross-check against a tracer the machine does not
+ * have installed as its monitor.
+ *
+ * @see docs/lifecycle-tracing.md — "When the machine goes quiet"
+ */
+export { describeProgress } from './lifecycle-tracer'
+
+/**
+ * @category Unstable
  * @unstable — lifecycle tracer surface and its payload / option shapes.
  */
 export type {
@@ -158,6 +170,7 @@ export type {
   LifecycleTracerOptions,
   LifecycleTracerStats,
   LifecycleFormatOptions,
+  DescribeProgressOptions,
   GuardCoverage,
 } from './lifecycle-tracer'
 

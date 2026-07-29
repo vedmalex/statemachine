@@ -3,6 +3,7 @@ import {
   claimContextTrackerDisclosure,
   createDefaultContextTracker,
 } from './context_tracker'
+import { describeProgress, type LifecycleTracer } from './lifecycle-tracer'
 import { securityLogger, stateMachineLogger } from './logger'
 import { createDefaultScheduler } from './scheduler'
 import {
@@ -1128,6 +1129,57 @@ export class StateMachine<
       inFlightUserCallables: this.userDispatchInFlight,
       openDispatches: open,
     }
+  }
+
+  /**
+   * @unstable — A3 — the {@link getProgress} snapshot, rendered as prose:
+   * "on what, exactly, is this machine standing right now?".
+   *
+   * ## Why this is a METHOD and not a tracer recipe
+   * `createLifecycleTracer()` answers the same question better, but only for a
+   * consumer who wired it up BEFORE the machine went quiet — i.e. only for
+   * someone who already suspected the problem. Everything this method reads is
+   * the A1 funnel's live entry/settle bookkeeping, which is maintained whether or
+   * not anything is subscribed, so the answer is reachable from a REPL or a
+   * debugger against a machine nobody instrumented:
+   *
+   * ```ts
+   * console.error(sm.describeProgress())
+   * // onEnter at 'work.r1' for alice (owner #1) is open, and the engine has not
+   * // advanced a phase since it was entered (tick 14).
+   * ```
+   *
+   * When a {@link createLifecycleTracer} IS installed as the monitor it is picked
+   * up automatically and used to CROSS-CHECK the reading — it can add a caveat,
+   * never a claim. See {@link describeProgress}.
+   *
+   * READ-ONLY, allocation-light, and never a liveness verdict: it reports what is
+   * open and for how long, and leaves "is that wrong?" to the reader.
+   */
+  public describeProgress(): string {
+    return describeProgress(this.getProgress(), { ...this.traceCrossCheck() })
+  }
+
+  /**
+   * A3 — the installed monitor, IF it is a lifecycle tracer.
+   *
+   * A structural check, not an `instanceof`: {@link createLifecycleTracer}
+   * returns an object literal, and the consumer may well have built the tracer
+   * against a different copy of this package. Feature-detecting the three members
+   * the report reads is both sufficient and honest — anything else is simply not
+   * offered as a cross-check. NOTE the wrapper from `tracer.wrap(inner)` does NOT
+   * match (it is a plain `IMonitor`), which is correct: it holds no buffer.
+   */
+  private traceCrossCheck(): { trace?: LifecycleTracer } {
+    const candidate = this.monitor as Partial<LifecycleTracer>
+    if (
+      typeof candidate.unfinished === 'function' &&
+      typeof candidate.stats === 'function' &&
+      typeof candidate.truncated === 'boolean'
+    ) {
+      return { trace: candidate as LifecycleTracer }
+    }
+    return {}
   }
 
   // ── A1: the consumer-callable dispatch funnel ───────────────────────────────
@@ -5135,11 +5187,31 @@ export class StateMachine<
       // `owner` + `state` + `microstep`.
       return Promise.race([executeAction(), timeoutPromise]).finally(() => {
         this.clearTimer(timeoutHandle)
-        if (timedOut && !span.closed && this.lifecycleEnabled) {
-          const hook = `${span.hook}.timeout`
-          const ctx = span.event !== undefined ? { event: span.event } : undefined
-          this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'begin', ctx)
-          this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'end', ctx)
+        if (timedOut && !span.closed) {
+          // A3 — THE ONE MOMENT the engine can answer "standing on what?" without
+          // anybody having instrumented anything. `!span.closed` under `timedOut`
+          // is exactly the zombie: the deadline won and the consumer body is STILL
+          // RUNNING. The rejection the caller gets says only 'Transition timeout'
+          // and cannot be widened (`serialization_options` / `action_timeout` /
+          // `sim/faults.ts` all match that string EXACTLY), so the slot identity
+          // goes to the existing warn channel instead of into a new one. One line,
+          // on an error path, only for the case it describes.
+          this.logger.warn(
+            // `oneLine` is built from the live scalars alone, so no trace is
+            // consulted here — the lead sentence never rests on the buffer and
+            // therefore needs no truncation caveat to stay honest.
+            `Transition timeout after ${timeoutMs}ms, but the callable is still running — ${describeProgress(
+              this.getProgress(),
+              { oneLine: true },
+            )}`,
+            { action: typeof actionName === 'string' ? actionName : 'anonymous', phase: 'action' },
+          )
+          if (this.lifecycleEnabled) {
+            const hook = `${span.hook}.timeout`
+            const ctx = span.event !== undefined ? { event: span.event } : undefined
+            this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'begin', ctx)
+            this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'end', ctx)
+          }
         }
       })
     }

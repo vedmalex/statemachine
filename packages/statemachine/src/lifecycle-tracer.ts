@@ -18,7 +18,7 @@
  * @see docs/lifecycle-tracing.md for recipes and the channel's blind spots.
  */
 
-import type { IMonitor, LifecycleEvent } from './types'
+import type { EngineProgress, IMonitor, LifecycleEvent, OpenDispatch } from './types'
 
 /** Default retention of {@link LifecycleTracerOptions.limit}. */
 const DEFAULT_LIMIT = 10_000
@@ -188,6 +188,29 @@ export interface LifecycleTracer extends IMonitor {
 
   /** Retention / intake counters. */
   stats(): LifecycleTracerStats
+
+  /**
+   * True once the ring buffer has EVICTED at least one record — i.e. from this
+   * point on the retained trace is a SUFFIX of the run, not the run.
+   *
+   * ## Why this exists, and what it actually protects against
+   * Eviction is by AGE, so the loss is one-directional: a `begin` can scroll out
+   * from under a callable that is still running, but its later `end` never
+   * outlives it. So {@link unfinished} cannot INVENT a hung callback — it can
+   * only MISS one, and the miss is silent. An empty `unfinished()` over a
+   * truncated buffer therefore does not mean "nothing is hung"; it means "no
+   * hung callback started recently enough to still be retained". In an
+   * instrument whose whole job is to be believed, that false all-clear is the
+   * dangerous reading, and this flag is what stops a consumer reaching it.
+   *
+   * ## Why a GETTER and not a field on {@link stats}
+   * Truncation flips DURING a run, and a consumer that captured the flag while
+   * it was still `false` would keep being told the stream is complete long after
+   * it stopped being so. `src/sim/public.ts` froze the same rule for
+   * `CheckerContext.raisesTruncated`, for the same reason. Read it at the moment
+   * you draw a conclusion from the trace, never earlier.
+   */
+  readonly truncated: boolean
 
   /** Drop every record AND reset all counters. */
   reset(): void
@@ -660,6 +683,12 @@ export function createLifecycleTracer(options: LifecycleTracerOptions = {}): Lif
       return { recorded: buffer.length, seen, dropped, malformed, limit }
     },
 
+    // A GETTER on purpose — see the interface. A consumer that read this into a
+    // local at wiring time would be holding a `false` that has since expired.
+    get truncated(): boolean {
+      return dropped > 0
+    },
+
     reset() {
       buffer = []
       head = 0
@@ -670,4 +699,280 @@ export function createLifecycleTracer(options: LifecycleTracerOptions = {}): Lif
   }
 
   return tracer
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The standing report: "on what, exactly, is this machine standing right now?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Open slots listed individually before the tail is summarised. Six fits a
+ * terminal without scrolling and is well past the width of any real wedge — the
+ * cases with more open slots are fan-out `invoke.src` operations, where the
+ * OLDEST few are the whole story and the rest are noise.
+ */
+const MAX_LISTED_SLOTS = 6
+
+/** Options for {@link describeProgress}. */
+export interface DescribeProgressOptions {
+  /**
+   * A lifecycle tracer to CROSS-CHECK the live reading against.
+   *
+   * Strictly a second opinion: every claim in the report is made from the live
+   * snapshot, and the trace can only ADD a caveat (a slot the buffer no longer
+   * covers, an unmatched `begin` the engine is not actually inside). It can
+   * never promote or retract a slot — see {@link LifecycleTracer.truncated} for
+   * why a buffer-derived reading is not allowed to be load-bearing.
+   */
+  trace?: LifecycleTracer
+  /** How many open slots to list before summarising the tail. Default `6`. */
+  limit?: number
+  /**
+   * Render only the lead sentence, for embedding in a single log line. Default
+   * `false`. The sentence is self-contained in both modes.
+   */
+  oneLine?: boolean
+}
+
+/** `1 tick` / `4 ticks`, without the `1 ticks` that gives a report away. */
+function plural(n: number, one: string, many = `${one}s`): string {
+  return `${n} ${n === 1 ? one : many}`
+}
+
+/**
+ * A name a human recognises, dug out of the owner object without trusting it.
+ *
+ * The owner is arbitrary consumer data — possibly a Proxy with throwing traps —
+ * so every read is guarded and the fallback (`#N`, the same first-seen numbering
+ * `format()` uses) always exists.
+ */
+function ownerName(owner: object): string | undefined {
+  try {
+    const bag = owner as Record<string, unknown>
+    const name = bag.name
+    if (typeof name === 'string' && name.length > 0 && name.length <= 40) return name
+    const id = bag.id
+    if (typeof id === 'string' && id.length > 0 && id.length <= 40) return id
+    if (typeof id === 'number' && Number.isFinite(id)) return `#${id}`
+    const ctor = (owner as { constructor?: { name?: unknown } }).constructor?.name
+    if (typeof ctor === 'string' && ctor.length > 0 && ctor !== 'Object') return ctor
+  } catch {
+    /* a hostile owner must not be the reason the report fails to print */
+  }
+  return undefined
+}
+
+/** Identity of ONE slot, for reconciling the live set against the trace. */
+function slotKey(ownerIdx: number, hook: string, state: string): string {
+  return `${ownerIdx} ${hook} ${state}`
+}
+
+/**
+ * @unstable — render the answer to "on what is this machine standing right now?"
+ *
+ * ## What it is for
+ * When a machine goes quiet, the question a developer needs answered is not
+ * "is the run-to-completion contract broken?" (a verdict no snapshot can
+ * honestly reach) but "which callable is the engine inside, whose, and for how
+ * long?". This turns the {@link EngineProgress} snapshot into that answer:
+ *
+ * ```text
+ * onEnter at 'work.r1' for alice (owner #1) is open, and the engine has not
+ * advanced a phase since it was entered.
+ *
+ * Engine at tick 14, last advanced at micro.exit.
+ * Source: the engine's live entry/settle counters, not the lifecycle buffer.
+ * ```
+ *
+ * ## What it deliberately does NOT do
+ * It never says STUCK. A consumer callable is entitled to take as long as it
+ * likes, and nothing in a single snapshot distinguishes a wedge from a slow
+ * `await` — so the report states the two facts it actually has (the slot is
+ * open; the engine has / has not advanced since) and leaves the conclusion to
+ * the reader, who knows what the callback was supposed to do. Every sentence
+ * here is falsifiable against a counter.
+ *
+ * ## Where the claims come from
+ * The live entry/settle scalars in {@link EngineProgress}, which the dispatch
+ * funnel maintains whether or not anything is subscribed — that is what makes
+ * this reachable with NO instrumentation wired in advance, which is the case you
+ * are debugging in. An optional {@link DescribeProgressOptions.trace} is
+ * consulted only to ADD caveats, never to make a claim.
+ */
+export function describeProgress(
+  progress: EngineProgress,
+  options: DescribeProgressOptions = {},
+): string {
+  const tick = Number.isFinite(progress.tick) ? progress.tick : 0
+  const listLimit =
+    Number.isInteger(options.limit) && (options.limit as number) > 0
+      ? (options.limit as number)
+      : MAX_LISTED_SLOTS
+
+  // Oldest first. With `openTicks = tick - openedAtTick` over one snapshot the
+  // two orderings are the SAME ordering, so there is no tie-break to argue
+  // about: the slot that has outlived the most engine progress leads.
+  const slots: OpenDispatch[] = [...(progress.openDispatches ?? [])].sort(
+    (a, b) => b.openTicks - a.openTicks,
+  )
+
+  // First-seen owner numbering, over the sorted list, so `#1` is stable for a
+  // given snapshot and matches the order the reader sees.
+  const ownerIndex = new Map<object, number>()
+  const indexOwner = (owner: object): number => {
+    let idx = ownerIndex.get(owner)
+    if (idx === undefined) {
+      idx = ownerIndex.size + 1
+      ownerIndex.set(owner, idx)
+    }
+    return idx
+  }
+  const ownerPhrase = (owner: object): string => {
+    const idx = indexOwner(owner)
+    const name = ownerName(owner)
+    return name === undefined ? `owner #${idx}` : `${name} (owner #${idx})`
+  }
+  for (const slot of slots) indexOwner(slot.owner)
+
+  // The slot's identity, as a noun phrase: WHAT, WHERE, WHOSE.
+  const nameSlot = (slot: OpenDispatch): string =>
+    `${slot.hook}${slot.state === '' ? '' : ` at '${slot.state}'`} for ${ownerPhrase(slot.owner)}`
+
+  // ── the lead sentence ──────────────────────────────────────────────────────
+  // Two facts and no third: the slot is open, and the engine has / has not made
+  // progress since it was entered. Which of those is a BUG is the reader's call
+  // — they know what the callback was supposed to do and this snapshot does not.
+  let lead: string
+  const [oldest] = slots
+  if (oldest === undefined) {
+    lead = 'No consumer callable is open — the engine is not inside consumer code.'
+  } else if (slots.length === 1) {
+    lead =
+      oldest.openTicks === 0
+        ? `${nameSlot(oldest)} is open, and the engine has not advanced a phase since it was entered.`
+        : `${nameSlot(oldest)} has been open for ${plural(oldest.openTicks, 'engine tick')}, since tick ${oldest.openedAtTick}.`
+  } else {
+    const count = `${slots.length} consumer callables are open.`
+    lead =
+      oldest.openTicks === 0
+        ? `${count} The oldest is ${nameSlot(oldest)}, and the engine has not advanced a phase since it was entered.`
+        : `${count} The oldest is ${nameSlot(oldest)}, open for ${plural(oldest.openTicks, 'engine tick')} since tick ${oldest.openedAtTick}.`
+  }
+
+  if (options.oneLine === true) return lead
+
+  const lines: string[] = [lead]
+
+  // ── the list, when there is more than one thing to choose between ──────────
+  if (slots.length > 1) {
+    const shown = slots.slice(0, listLimit)
+    // The owner column earns its width only when the rows actually differ by
+    // owner — the same rule `format()` applies to its `#N` markers. Repeating
+    // one name down nine rows buries the column that varies.
+    const manyOwners = new Set(shown.map((s) => s.owner)).size > 1
+    const cells = shown.map((slot) => ({
+      age: plural(slot.openTicks, 'tick'),
+      hook: slot.hook,
+      state: slot.state === '' ? '—' : slot.state,
+      owner: manyOwners ? ownerPhrase(slot.owner) : '',
+    }))
+    const width = (pick: (c: (typeof cells)[number]) => string): number =>
+      cells.reduce((w, c) => Math.max(w, pick(c).length), 0)
+    const ageW = width((c) => c.age)
+    const hookW = width((c) => c.hook)
+    const stateW = width((c) => c.state)
+    lines.push('')
+    for (const cell of cells) {
+      lines.push(
+        `  ${cell.age.padStart(ageW)}  ${cell.hook.padEnd(hookW)}  ${cell.state.padEnd(stateW)}  ${cell.owner}`.trimEnd(),
+      )
+    }
+    if (slots.length > shown.length) {
+      // "no older than" and not "younger": the list is sorted by age, so the
+      // tail can TIE with the last row shown, and a report that overstates by
+      // one word is a report that gets checked instead of used.
+      lines.push(`  … and ${slots.length - shown.length} more, none older than these.`)
+    }
+  }
+
+  lines.push('')
+  lines.push(
+    tick === 0
+      ? 'Engine at tick 0 — it has not advanced a phase at all yet.'
+      : `Engine at tick ${tick}, last advanced at ${progress.lastTickSite || 'an unnamed site'}.`,
+  )
+
+  // ── where the claims rest ──────────────────────────────────────────────────
+  lines.push(describeSources(slots, { indexOwner, ownerPhrase }, options.trace))
+
+  return lines.join('\n')
+}
+
+/** The owner-naming closures {@link describeSources} borrows from its caller. */
+interface OwnerNaming {
+  indexOwner: (owner: object) => number
+  ownerPhrase: (owner: object) => string
+}
+
+/**
+ * The provenance paragraph — the half that keeps the report believable.
+ *
+ * The live scalars are always the basis. A trace can only reach four verdicts
+ * about them: it cannot be read at all; it is too lossy to say anything
+ * (truncated); it carries an unmatched `begin` the engine is NOT inside (an
+ * `end` lost in the buffer, or another machine's records); it does not cover
+ * every open slot; or it agrees. In no case does it change what is reported as
+ * open.
+ */
+function describeSources(
+  slots: readonly OpenDispatch[],
+  { indexOwner, ownerPhrase }: OwnerNaming,
+  trace: LifecycleTracer | undefined,
+): string {
+  const base = "Source: the engine's live entry/settle counters, not the lifecycle buffer."
+  if (trace === undefined) return base
+
+  // Read the flag HERE, at the moment the conclusion is drawn — never earlier.
+  let truncated: boolean
+  let stats: LifecycleTracerStats
+  let unfinished: readonly LifecycleRecord[]
+  try {
+    truncated = trace.truncated === true
+    stats = trace.stats()
+    unfinished = trace.unfinished()
+  } catch {
+    return `${base} A lifecycle trace was supplied but could not be read, so nothing here rests on it.`
+  }
+
+  if (truncated) {
+    return `${base} The lifecycle trace has dropped ${stats.dropped} of ${stats.seen} records (limit ${stats.limit}), so what it retains is a suffix of the run and an unfinished callback that started earlier no longer appears in it at all — nothing above rests on it.`
+  }
+
+  const live = new Set(slots.map((s) => slotKey(indexOwner(s.owner), s.hook, s.state)))
+  const phantoms = unfinished.filter(
+    (r) => !live.has(slotKey(indexOwner(r.owner), r.hook, r.state)),
+  )
+  if (phantoms.length > 0) {
+    const first = phantoms[0] as LifecycleRecord
+    const where = first.state === '' ? first.hook : `${first.hook} at '${first.state}'`
+    const rest = phantoms.length > 1 ? ` (and ${phantoms.length - 1} more like it)` : ''
+    return `${base} The trace additionally shows ${where} for ${ownerPhrase(first.owner)} as unfinished${rest}, but this engine is not inside it — either that end edge never reached the trace, or the trace is shared with another machine. It is not evidence about this one.`
+  }
+
+  // Count the LIVE slots the trace covers, not the records it holds: two
+  // invocations of one slot in different microsteps are two records but one
+  // entry in `openDispatches`, and a raw length comparison would call that
+  // agreement in one direction and a gap in the other.
+  const traced = new Set(unfinished.map((r) => slotKey(indexOwner(r.owner), r.hook, r.state)))
+  const covered = [...live].filter((key) => traced.has(key)).length
+  if (covered < slots.length) {
+    // The classic way to get here is `tracer.reset()` while a callable is open:
+    // the `begin` is destroyed, and `reset()` zeroes the drop counter too, so
+    // `truncated` is honestly false and the buffer is silently incomplete anyway.
+    return `${base} The lifecycle trace carries an unmatched begin for only ${covered} of the ${slots.length} open slots above; the rest started before the trace's current contents (a reset, or a subscription that began later), so it is not seeing everything the engine is holding.`
+  }
+
+  return slots.length === 0
+    ? `${base} The lifecycle trace agrees: it is intact (${stats.recorded} of ${stats.seen} records retained) and carries no unmatched begin.`
+    : `${base} The lifecycle trace agrees, and it is intact (${stats.recorded} of ${stats.seen} records retained).`
 }
