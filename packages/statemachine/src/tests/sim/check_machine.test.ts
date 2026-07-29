@@ -248,21 +248,21 @@ describe('checkMachine: violations carry engine/user routing + reproCode', () =>
     expect(v?.reproCode).toContain(r.seed)
   })
 
-  it('reproCode is the FULL seed-pinned run, NOT a shrunk repro (the documented honest no-op)', async () => {
-    // W8/V7: `sim/shrinker.ts` reduces a ScenarioSpec against a builtin-oracle
-    // fingerprint; a checkMachine finding is a LIVE config + a consumer predicate
-    // with no fingerprint. Rather than fabricate an UNVERIFIED "minimal" repro,
-    // the snippet stays the full run — pinned so it is bit-reproducible. This
-    // test pins that contract so a future "minimization" cannot land silently.
+  it('reproCode is the FULL seed-pinned run when minimization is OFF', async () => {
+    // W9/Г3 made minimization the default, so the pre-W9 form is now what you get
+    // by OPTING OUT. It stays bit-reproducible: seed-pinned, runs:1, and the
+    // ORIGINAL step budget (nothing was reduced, and it does not pretend it was).
     const r = await checkMachine<Box>(okCfg, okOwner, {
       seed: '7',
       steps: 23,
       runs: 1,
+      shrink: false,
       invariants: [{ name: 'always-false', check: () => false }],
     })
     const v = r.violations.find((x) => x.invariant === 'always-false' && !x.witness.includes('initial'))
     expect(v?.reproCode).toContain('steps: 23') // the ORIGINAL budget, unshrunk
     expect(v?.reproCode).toContain('runs: 1') // replayable in isolation
+    expect(v?.minimal).toBeUndefined() // opted out ⇒ NOTHING is published
   })
 })
 

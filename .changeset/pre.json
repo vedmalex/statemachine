@@ -8,6 +8,8 @@
     "composite-region-final-join",
     "dst-clock-injection",
     "dst-simulation-environment",
-    "phase-1-baseline"
+    "lifecycle-channel-and-w3c-ordering",
+    "phase-1-baseline",
+    "w9-oracle-teeth-and-shrink"
   ]
 }

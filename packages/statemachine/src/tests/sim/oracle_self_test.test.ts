@@ -28,15 +28,28 @@
  *    `IMonitor.recordLifecycle` channel, so the hierarchy-order class is now
  *    checkable. Its violator fixture is a SYNTHETIC lifecycle feed — a hand-built
  *    inverted sequence — deliberately NOT a wait-for-an-engine-bug fixture.
- *  - I-5 STAYS a documented no-op (V5b). `doneDelta` is now sampled on the verdict
- *    path (so half the blocker closed), but the `done.state.<C>` RAISE itself is
- *    still not soundly observable; see invariants.ts for the residual.
  *  - I-3 was PROMOTED into the DEFAULT builtin set (V8, ISS-030 closed), so §4а.2
  *    now carries string-method-invoke and composite-join machines that specifically
  *    exercise the false-positive I-3 used to produce.
  *
- * §4а.3 differential (I-5 done-set vs the model compiler) is DEFERRED with I-5's
- * teeth: while I-5 is a documented no-op there is nothing to diff.
+ * ── W9/Г1 status ────────────────────────────────────────────────────────────
+ *  - I-5 MOVED from `DOCUMENTED_NO_OPS` to teeth. The last blocker was that a
+ *    `done.state.<C>` raise which matched NO candidate transition recorded nothing
+ *    anywhere and was indistinguishable from "never raised"; the engine now emits a
+ *    `kind:'raise'` lifecycle record at every internal raise site, so the oracle
+ *    COUNTS raises against the `doneDelta` `false → true` edges. Its violator
+ *    fixture is a synthetic frame sequence plus an EMPTY raise stream — the
+ *    "the composite became done and nobody raised the event" witness. That the
+ *    ENGINE really emits those records (so the teeth are not synthetic-only) is
+ *    pinned separately by the planted-defect e2e in observation_plane.test.ts.
+ *  - `DOCUMENTED_NO_OPS` is now EMPTY. The meta-test stays TWO-SIDED by
+ *    construction: the classification/partition assertions still run over the whole
+ *    registry, and the no-op honesty loop is RETAINED (with an explicit assertion
+ *    that the empty set is deliberate) so the next documented no-op is checked the
+ *    same way rather than silently skipped.
+ *  - §4а.2 gains a composite-join machine whose declared join is GUARD-BLOCKED —
+ *    the shape in which the done configuration survives to the settle boundary, so
+ *    I-5 is genuinely ARMED (not vacuous) inside the corpus.
  */
 import { describe, expect, it } from 'vitest'
 import { buildConfigGraph, INVARIANTS } from '../../sim/invariants'
@@ -109,6 +122,34 @@ const ORACLE_TEETH: readonly TeethCase[] = [
       }),
   },
   {
+    id: 'I-5',
+    // W9/Г1 counting teeth: the doneDelta projection shows the composite ENTERING
+    // its all-final configuration (a `false → true` edge across two adjacent
+    // boundary frames) while the raise plane is PRESENT-BUT-EMPTY — i.e. the engine
+    // never raised the declared `done.state.C`. An ABSENT raise plane would make
+    // I-5 vacuous instead, so `raises: []` is the load-bearing part of the fixture.
+    // The frames are otherwise clean so the sweep reaches the final scope. The
+    // FRAMES are supplied by the runner, not by this context.
+    fire: () =>
+      runSafety(
+        INVARIANTS,
+        trace(
+          frame({ step: 0, cause: 'init', from: 'C', to: 'C', doneDelta: [{ composite: 'C', done: false }] }),
+          frame({ step: 1, from: 'C', to: 'C', doneDelta: [{ composite: 'C', done: true }] }),
+        ),
+        {
+          ...ctxFor(
+            {
+              states: { C: { regions: { r1: { w1: {}, d1: {} }, r2: { w2: {}, d2: {} } } } },
+              events: { 'done.state.C': {} },
+            },
+            8,
+          ),
+          raises: [],
+        },
+      ),
+  },
+  {
     id: 'I-6',
     fire: () =>
       runSafety(
@@ -138,11 +179,11 @@ const ORACLE_TEETH: readonly TeethCase[] = [
 ]
 
 // Documented no-ops (MASTER §4а.1). I-4 LEFT this set in W8/V3a once the lifecycle
-// channel made callback order observable. I-5 remains: the `done.state.<C>` RAISE is
-// still not soundly observable (a raise that matched no candidate transition records
-// nothing at all and is indistinguishable from no raise), and the CONVERSE direction
-// is already covered with real teeth by I-12.
-const DOCUMENTED_NO_OPS = ['I-5'] as const
+// channel made callback order observable; I-5 LEFT it in W9/Г1 once the engine's
+// `kind:'raise'` records made the internal raise observable. The set is now EMPTY —
+// every registry member claims teeth and must prove them. The honesty loop below is
+// KEPT (not deleted) so the next documented no-op is held to the same two-sided bar.
+const DOCUMENTED_NO_OPS: readonly string[] = []
 
 describe('§4а.1 oracle meta-test: registry classification + teeth', () => {
   it('every INVARIANTS id is CLASSIFIED as either teeth or a documented no-op (no silent unaccounted oracle)', () => {
@@ -166,6 +207,15 @@ describe('§4а.1 oracle meta-test: registry classification + teeth', () => {
       expect(v?.invariantId).toBe(t.id)
     })
   }
+
+  it('the DOCUMENTED_NO_OPS set is EMPTY by DECISION, not by omission (every oracle claims teeth)', () => {
+    // Guards the state W9/Г1 reached: with I-5 promoted, no registry member is
+    // allowed to be a silent stub. If a future oracle is added as a documented
+    // no-op this assertion goes red and forces an explicit, reviewed re-classification
+    // instead of a set that quietly grows again.
+    expect(DOCUMENTED_NO_OPS).toEqual([])
+    expect(ORACLE_TEETH.length).toBe(INVARIANTS.length)
+  })
 
   for (const id of DOCUMENTED_NO_OPS) {
     it(`${id} is an HONEST no-op: it exposes no checkTrace and never fires on a battery of frames`, () => {
@@ -345,6 +395,34 @@ const CORPUS: readonly CorpusEntry[] = [
           await Promise.resolve()
         },
       },
+    }),
+  },
+  // ── W9/Г1 shape ───────────────────────────────────────────────────────────
+  // A GUARD-BLOCKED join: the composite reaches all-final, the engine raises the
+  // declared `done.state.C`, the guard refuses the transition and the composite
+  // therefore STAYS all-final at the settle boundary. That is the only shape in
+  // which the doneDelta `false → true` EDGE survives to the boundary sample, so it
+  // is the shape in which I-5 is genuinely ARMED rather than vacuous. A regression
+  // that stops emitting `kind:'raise'` — or an I-5 rewrite that drifts back toward
+  // replicating selection — turns THIS entry red instead of a consumer's run.
+  {
+    name: 'W9: composite join whose declared done.state.C is GUARD-BLOCKED (I-5 armed, must stay clean)',
+    setup: () => ({
+      config: {
+        name: 'guardedJoin',
+        stateAttribute: 'state',
+        initialState: 'C',
+        states: {
+          C: { regions: { r1: { w1: {}, d1: { final: true } }, r2: { w2: {}, d2: { final: true } } } },
+          after: { final: true },
+        },
+        events: {
+          f1: { transitions: [{ from: 'C.r1.w1', to: 'C.r1.d1' }] },
+          f2: { transitions: [{ from: 'C.r2.w2', to: 'C.r2.d2' }] },
+          'done.state.C': { transitions: [{ from: 'C', to: 'after', guard: () => false }] },
+        },
+      },
+      owner: { state: 'C' },
     }),
   },
   {

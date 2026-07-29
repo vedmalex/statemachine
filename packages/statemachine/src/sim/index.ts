@@ -250,6 +250,9 @@ export type {
   ShrinkResult,
   ViolationFingerprint,
 } from './shrinker'
+// --- W9/Г3 op-stream delta-debugging (the live-config minimizer) ---
+export { shrinkOps, DEFAULT_OP_SHRINK_BUDGET } from './op-shrink'
+export type { ShrinkableOp, OpShrinkPredicate, OpShrinkBudget, OpShrinkResult } from './op-shrink'
 export {
   buildMinimalRepro,
   emitReproTest,
@@ -345,6 +348,9 @@ export type {
   CheckOptions,
   CheckViolation,
   CheckWarning,
+  CheckScriptOp,
+  CheckMinimalOp,
+  CheckMinimalRepro,
   CheckEventSpec,
   MachineInvariant,
   MachineSnapshot,

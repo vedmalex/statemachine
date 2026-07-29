@@ -55,7 +55,7 @@ field — `ok`. The causes:
 | `no-progress` | `transitionsFired === 0` — the machine never moved |
 | `escape` | a real (non-virtual) timer escaped the scheduler (see below) |
 | `degradation` | a dead event / uncovered transition survived a **saturated** coverage sweep |
-| `non-converging` | a parallel region never reaches its join (reserved) |
+| `non-converging` | a parallel region can never complete, so its composite's join can never fire |
 
 An **engine-synthetic** violation (`kind: 'engine'`) — an internal engine crash or
 unhandled rejection — always fails the verdict and is routed to the *engine*
@@ -140,10 +140,12 @@ await checkMachine(cfg, factory, {
 })
 ```
 
-> **MVP note.** Object-valued payloads are not yet driven end-to-end; today the
-> generator is the documented extension point and the `no-payload` warning is the
-> honest signal that arg-branches are uncovered. See task **W5c** for the payload
-> substrate.
+The values you return are forwarded **verbatim** to `fireEvent`, object payloads
+included, so a guard or `onTransition` declared as `(owner, verdict) => …` receives
+`verdict` and its argument-dependent branches become reachable. `rng` is a
+seed-derived child stream, independent of the op-selection stream: the same seed
+always yields the same payload sequence, and an event without a generator costs no
+draw at all. A throw inside a generator is not swallowed.
 
 The `payload(rng, snapshot)` generator is the single place where fuzzing *sees the
 state* — essential for stateful events (e.g. an MB3 verdict object meaningful only
@@ -165,14 +167,16 @@ interface CheckReport {
   unreachableStates: string[]         // declared but never visited — REPORTED, not a fail
   uncoveredTransitions: { event; from; to }[]
   deadEvents: string[]                // never fired
+  guardOutcomes: { transition; sawTrue; sawFalse }[]   // per declared guarded transition
   saturation: { plateauedAtRun: number | null; newCoveragePerRun: number[] }
 
   // structural findings
   deadlocks: { state }[]
   livelocks: { reason }[]
+  nonConvergingRegions: { composite; region }[]
 
   // violations & warnings
-  violations: { invariant; kind: 'engine'|'builtin'|'user'; witness; reproCode }[]
+  violations: { invariant; kind: 'engine'|'builtin'|'user'; witness; reproCode; minimal? }[]
   warnings: { kind: WarningKind; detail: string }[]
   failedOn: FailCause[]        // empty ⇒ ok
 }
@@ -183,8 +187,23 @@ interface CheckReport {
   more runs stopped finding new coverage, so a remaining `deadEvents` /
   `uncoveredTransitions` is a genuine gap (that is what turns them into a
   `degradation` fail) rather than "not reached yet".
+- **`guardOutcomes`** is seeded from the config, so a guard that was never *evaluated*
+  shows as `{ sawTrue: false, sawFalse: false }` rather than vanishing. `sawTrue:
+  false` is the classic silent bug — a branch the machine can never take. It is
+  **advisory**, not a fail cause: a guard's `true` branch routinely needs a payload
+  the fuzzer cannot synthesize. Rows are keyed by the engine's `"<from> -> <to>"`
+  label, so two events declaring the same pair share one row whose flags are the
+  union; that only ever makes `sawTrue: true` less specific, never `sawTrue: false`
+  wrong. Assert on this field yourself when you want a dead guard to break the build.
+- **`nonConvergingRegions`** lists only *justified* entries: either the region declares
+  no final sub-state and no nested composite at all (structural — the engine can never
+  raise that join), or the region was entered, never reached a final sub-state, and
+  coverage plateaued. Without a plateau the entry is omitted rather than reported as a
+  maybe.
 - **`warnings`** are typed (`no-payload`, `timer-escape`, `dead-events-at-plateau`,
-  `uncovered-at-plateau`, `residual-rejection`) so you can triage or relax by kind.
+  `uncovered-at-plateau`, `dead-guard-at-plateau`, `non-converging-region`,
+  `residual-rejection`, `init-check-skipped`, `shrink-skipped`) so you can triage or
+  relax by kind.
 
 ### Reproducing a finding
 
@@ -199,6 +218,56 @@ await checkMachine(myConfig, myOwnerFactory, { seed: '<the reported seed>', runs
 The sim cannot know your live owner's constructor, so `reproCode` references *your*
 factory by name — wire it to the real one.
 
+### Minimizing a finding — `shrink`
+
+A seed-pinned repro replays the whole failing run: `steps` ops, of which perhaps
+three matter. `shrink` (**on by default**) reduces that stream by delta-debugging —
+dropping op chunks and binary-searching each `advance` toward `0` — and re-driving
+each candidate against *your live config on a fresh owner*. Only the first reported
+violation is minimized, and only a run that already failed pays for it; a green
+sweep spends zero extra runs.
+
+```ts
+// defaults shown; both fields are optional
+await checkMachine(cfg, factory, { shrink: { budget: { maxRuns: 200, maxStagnantRounds: 2 } } })
+await checkMachine(cfg, factory, { shrink: false })   // opt out
+```
+
+The result lands on `violations[i].minimal`:
+
+```ts
+{
+  ops: ({ kind: 'fire'; event; args?; argsNote? } | { kind: 'advance'; dtMs } | { kind: 'noop' })[]
+  trace: TraceFrame[]                                    // the trace of the final verification replay
+  provenance: { runs: number; moves: number; minimal: boolean }
+}
+```
+
+`provenance.minimal: false` means "verified, but the budget ran out before
+1-minimality was proven" — it never means unverified. When every argument has a
+literal form, `reproCode` becomes an executable `script: [...]` call you can paste
+back; when a payload is a live object with no literal form (a class instance, a
+`Date`, a cycle) the op is flagged `argsNote: 'non-serializable'`, the snippet falls
+back to its seed-pinned form and lists the minimal ops in order, and the real values
+stay available on `minimal.ops`. That degrades the printed snippet only — never the
+reduction, because payloads ride along in memory.
+
+**Verify-first is the contract.** Before any reduction is attempted, the *recorded*
+stream is replayed on a fresh owner. If the original finding does not come back, the
+run is not reproducible from its op stream alone — a payload the machine mutates in
+place, or a config reading state outside the owner (an external counter, a real
+clock, module-level state) — and minimization abstains: no `minimal` is published,
+and a `shrink-skipped` warning says why. The same abstention covers a live-`Adapter`
+owner (a copy would lose its get/set semantics), an initial-configuration finding
+(there is no op stream to reduce), and a reduced stream that fails its final
+re-verification. A missing minimal repro is honest; a fabricated one would send you
+to bisect the wrong thing.
+
+The same op stream is a first-class input: `script` drives every run from a fixed
+sequence instead of the fuzzer, which is exactly what a printed minimal repro pastes
+back. Under a `script` the per-event `payload` generators are not consulted — the
+script's `fire` ops already carry materialized args.
+
 ---
 
 ## Real timers
@@ -212,6 +281,82 @@ Override with `onRealTimerEscape: 'ignore' | 'warn' | 'fail'`.
 
 ---
 
+## Run-to-completion and the settle budget
+
+Every step ends by draining the machine to quiescence: queues empty, nothing in
+flight, no timer pending. The drain is bounded — it pumps microtasks for a fixed
+number of turns — so a wedged machine can never hang the run. A boundary that did
+not reach quiescence records *why*, as `settleReason` on its trace frame. Two of
+those reasons look alike and mean opposite things:
+
+- **`microtask-budget`** — the pump ran out and the machine's observable state had
+  not moved for a long time (or never moved at all). Nothing was progressing when
+  the budget ended: this is a wedged drain, and the builtin `I-3` run-to-completion
+  oracle reports it as a violation. A machine that takes one legal hop and *then*
+  wedges lands here too — what counts is whether it was still moving at the end, not
+  whether it ever moved.
+- **`budget-progressing`** — the pump ran out while the machine was *still*
+  observably moving. A long legal chain of zero-delay `invoke` hops does exactly
+  this: each hop costs a stabilisation window, so on the order of forty of them
+  exhaust the default budget. That is the harness stopping, not a run-to-completion
+  break — `I-3` excludes it, and the drain continues on the following steps until
+  the machine reaches its final state. It is surfaced as a `budget-progressing`
+  warning (once per run), never as a verdict: `ok` is unaffected.
+
+The two are separated by *recency* — how many turns passed since the observable
+state last changed — and the separation is deliberately lopsided. A legitimate hop's
+quiet gap is bounded by the pump's own stabilisation window (measured at 16 turns on
+the zero-delay chain fixtures, whatever their length); a wedge has no bound at all
+and holds the state frozen for whatever remains of the budget (measured at 1007).
+The threshold sits at four stabilisation windows, well clear of both.
+
+The other reasons describe a settle waiting on *time* rather than on the budget:
+`WAITING_ON_TIMER` (nothing pending, only a future timer) and
+`WAITING_ON_TRANSITION_TIMEOUT` (a genuine in-flight async action racing a future
+deadline) are both legitimate and excluded; `WAITING_ON_INTERNAL` — queued or
+in-progress work with no in-flight async behind it — is a real run-to-completion
+concern and an `I-3` witness.
+
+### Known gap — a zero-delay livelock cannot be convicted
+
+`budget-progressing` is compatible with two situations the harness cannot tell
+apart, and it is a warning rather than a verdict precisely because of that:
+
+1. A long but **finite** chain of zero-delay hops that simply needs a bigger turn
+   budget. It will settle; the run stopped watching first.
+2. A genuine **livelock** — `A -(invoke delay:0, raise e)-> B -(invoke delay:0,
+   raise e)-> A`, forever. It will never settle.
+
+There is no observation that separates them. For any budget-truncated prefix the
+livelock produces, a **correct** machine exists that produces a byte-identical
+prefix: the same topology, plus a counter in the owner data that exits the loop
+after more iterations than the budget can reach. The state that distinguishes them —
+context fields, closure variables — is consumer-private and appears in no channel
+the harness reads: `TraceFrame` carries no context, and lifecycle records are
+deliberately payload-free. Any rule that convicted case 2 would convict case 1 as
+well, and case 1 is a correct machine. Warning-only is the sound maximum here.
+
+**You can usually resolve it and the harness cannot.** The per-macrostep turn budget
+is fixed and not an option, but the drain resumes on the *next* step, so raising
+`steps` gives the machine more total budget to finish in. A 200-hop zero-delay chain
+reaches `h36` at `steps: 1`, `h108` at `steps: 2` and its final state at `steps: 6`.
+A finite chain settles that way; a livelock reports the same warning at every `steps`
+value you try. That is the signal to go looking.
+
+Note what is *not* in this gap. Exhaustion with no recent movement stays
+`microtask-budget` and remains a hard `I-3` violation, and that one **is** soundly
+distinguishable: a legitimate hop's quiet gap is bounded by the pump's own
+stabilisation window, so a machine still making progress cannot hold its observable
+state frozen for hundreds of turns. Absence of movement is a positive observation,
+not an absence of evidence.
+
+Separately: a machine that drives itself through unbounded zero-delay `invoke` hops
+is outside the macrostep contract to begin with. A macrostep is meant to converge;
+`checkMachine` bounds the drain so such a machine cannot hang the run, but it does
+not promise to classify one.
+
+---
+
 ## What `checkMachine` does NOT check
 
 - **Full reachability / exhaustiveness** — it is a fuzzer, not a model checker.
@@ -222,6 +367,19 @@ Override with `onRealTimerEscape: 'ignore' | 'warn' | 'fail'`.
 - **Real-world timing / wall-clock behaviour** — the clock is virtual.
 - **Anything outside the state machine** — side effects in actions are only observed
   through the owner data your invariants inspect.
+- **Callback order for states with no hooks, and outside a microstep.** The `I-4`
+  oracle checks that enter hooks run ancestor-before-descendant and exit hooks the
+  other way, but it can only compare callbacks that were actually *emitted*: a state
+  with no hook is invisible to it, and the reserved `microstep 0` used by
+  construction, `reset` and `resumeTimers` is skipped, because those are unrelated
+  passes that would compare against each other.
+- **A join whose composite is left again within the same macrostep.** The `I-5`
+  oracle catches an all-final composite whose `done.state.<C>` was never raised, by
+  comparing per-boundary completion samples against the engine's raise records. If a
+  composite becomes all-final and its join transition carries the machine out of it
+  before the next settle boundary, no boundary ever samples it as done and the check
+  is vacuous there. Like `I-4`, it under-reports by construction — neither oracle can
+  manufacture a violation on a correct machine.
 
 Treat a clean `checkMachine` as *"no defect found within the fuzzed envelope"*, not
 *"proven correct"* — and grow the envelope (alphabet, payloads, `runs`, `steps`,

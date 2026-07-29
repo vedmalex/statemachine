@@ -810,20 +810,212 @@ describe('I-4 / I-5 do not false-fire on well-formed composites', () => {
     expect(runSafety(INVARIANTS, trace, ctxFor(cfg, 8))).toBeNull()
   })
 
-  it('I-5 is a documented no-op backstop (A3): stays clean on all doneDelta shapes', () => {
-    // A3 HONEST accounting: the parallel-join miss is not soundly observable from
-    // the current trace plane (internal `done.state.<C>` raise never appears as
-    // `frame.event`; doneDelta is absent on the verdict path), so I-5 is a clean
-    // backstop — the converse done-event gating is enforced by I-12. It must never
-    // fire regardless of the doneDelta shape.
-    const cfgDecl = { states: { root: {} }, events: { 'done.state.root': {} } }
-    const inv5 = INVARIANTS.find((i) => i.id === 'I-5') as Invariant
-    expect(inv5.checkTrace).toBeUndefined()
-    const f = frame({ step: 1, from: 'root', to: 'root', doneDelta: [{ composite: 'root', done: true }] })
-    expect(inv5.checkStep?.(f, ctxFor(cfgDecl, 8))).toBeNull()
-    const notDone = frame({ step: 2, from: 'root', to: 'root', doneDelta: [{ composite: 'root', done: false }] })
-    expect(inv5.checkStep?.(notDone, ctxFor(cfgDecl, 8))).toBeNull()
-    expect(runSafety(INVARIANTS, { header: HEADER, frames: [f] }, ctxFor(cfgDecl, 8))).toBeNull()
+  // ── W9/Г1 — I-5 PURE-CHECKER teeth + the FALSE-POSITIVE frontier ────────────
+  // The checkers are pure, so the predicate is exercised DIRECTLY on a synthetic
+  // CheckerContext (fabricated frames + a fabricated raise stream). The e2e half —
+  // that a REAL engine run emits these records, and that removing them makes I-5
+  // fire — lives in observation_plane.test.ts (planted defect, no engine mutation).
+  const inv5 = (): Invariant => INVARIANTS.find((i) => i.id === 'I-5') as Invariant
+  /** A parallel composite C with a DECLARED join, plus an UNDECLARED composite D. */
+  const CFG_JOIN = {
+    states: {
+      C: { regions: { r1: { w1: {}, d1: { final: true } }, r2: { w2: {}, d2: { final: true } } } },
+      D: { regions: { r1: { x1: {}, y1: { final: true } } } },
+    },
+    events: { 'done.state.C': {} },
+  }
+  const I5_FINAL = { config: 'C', queue: { internal: 0, external: 0 }, quiescent: true }
+  /** A settle-BOUNDARY frame: the doneDelta projection is what marks one. */
+  const bframe = (
+    step: number,
+    done: Record<string, boolean>,
+    over?: Partial<TraceFrame>,
+  ): TraceFrame =>
+    frame({
+      step,
+      from: 'C',
+      to: 'C',
+      doneDelta: Object.entries(done).map(([composite, d]) => ({ composite, done: d })),
+      ...over,
+    })
+  /** One engine raise record (the `begin` half of the adjacent begin+end pair). */
+  const raiseRec = (
+    event: string,
+    seq: number,
+    over?: Partial<LifecycleObservation>,
+  ): LifecycleObservation => ({
+    kind: 'raise',
+    hook: 'raise.done',
+    state: 'C',
+    owner: OWNER_A,
+    microstep: 1,
+    seq,
+    edge: 'begin',
+    event,
+    ...over,
+  })
+  const i5ctx = (
+    frames: readonly TraceFrame[],
+    raises: readonly LifecycleObservation[] | undefined,
+    over?: Partial<CheckerContext>,
+  ): CheckerContext => ({
+    ...ctxFor(CFG_JOIN, 8),
+    frames,
+    ...(raises !== undefined ? { raises } : {}),
+    ...over,
+  })
+
+  it('I-5 is final-scoped and counting: it exposes NO checkStep (a single frame carries no edge)', () => {
+    expect(inv5().checkStep).toBeUndefined()
+    expect(inv5().scope).toBe('final')
+  })
+
+  it('I-5 FIRES: the composite ENTERED its all-final configuration but no done.state.C was raised', () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    const v = inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))
+    expect(v?.invariantId).toBe('I-5')
+    expect(v?.witness).toBe('C')
+    expect(v?.observed).toContain("0 raise(s) of 'done.state.C'")
+  })
+
+  it('I-5 stays clean when the engine DID raise the declared join', () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, [raiseRec('done.state.C', 0)]))).toBeNull()
+  })
+
+  it('I-5 tolerates MORE raises than edges (microstep vs macrostep granularity)', () => {
+    // The engine checks the done edge per MICROSTEP; the harness samples doneDelta
+    // per settle BOUNDARY. A done→undone→done blink inside one macrostep raises
+    // TWICE but shows ONE boundary edge. `>` is the only sound direction.
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    const raises = [raiseRec('done.state.C', 0), raiseRec('done.state.C', 2)]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, raises))).toBeNull()
+  })
+
+  it('I-5 counts RE-ENTRY: leaving and re-entering the done configuration expects TWO raises', () => {
+    const frames = [
+      bframe(1, { C: false }),
+      bframe(2, { C: true }),
+      bframe(3, { C: false }),
+      bframe(4, { C: true }),
+    ]
+    // one raise for two edges → fires
+    const v = inv5().checkFinal?.(I5_FINAL, i5ctx(frames, [raiseRec('done.state.C', 0)]))
+    expect(v?.invariantId).toBe('I-5')
+    expect(v?.expected).toContain('at least 2')
+    // two raises → clean
+    const raises = [raiseRec('done.state.C', 0), raiseRec('done.state.C', 4)]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, raises))).toBeNull()
+  })
+
+  it('FP-surface: EDGE-TRIGGERED — a done PLATEAU is not a new expectation', () => {
+    // done.state.C is generated once, when the done configuration is ENTERED. A
+    // composite that stays all-final across later macrosteps is NOT re-signalled.
+    const frames = [
+      bframe(1, { C: false }),
+      bframe(2, { C: true }),
+      bframe(3, { C: true }),
+      bframe(4, { C: true }),
+    ]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, [raiseRec('done.state.C', 0)]))).toBeNull()
+  })
+
+  it('FP-surface: a composite ALREADY all-final at frame 0 is not an edge (no predecessor)', () => {
+    const frames = [bframe(0, { C: true }, { cause: 'init' }), bframe(1, { C: true })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))).toBeNull()
+  })
+
+  it("FP-surface: a step carrying a synthetic:'post-restore' frame is excluded (restoreState does NOT re-fire the join)", () => {
+    const frames = [
+      bframe(1, { C: false }),
+      bframe(2, { C: true }, { synthetic: 'post-restore' }),
+    ]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))).toBeNull()
+  })
+
+  it("FP-surface: a step carrying a synthetic:'corrupt-state' frame is excluded (the probe writes past checkCompletion)", () => {
+    // The exclusion is per STEP, not per frame: the boundary frame that carries the
+    // doneDelta may be a different frame of the same corrupt-state step.
+    const frames = [
+      bframe(1, { C: false }),
+      frame({ step: 2, from: 'C', to: 'C', synthetic: 'corrupt-state' }),
+      bframe(2, { C: true }),
+    ]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))).toBeNull()
+  })
+
+  it("FP-surface: a step carrying a synthetic:'errorState-fallback' frame is excluded (the recovery commits past checkCompletion)", () => {
+    // No harness produces this tag today (see the KNOWN RESIDUAL note on I-5), but
+    // the exclusion is in place BEFORE a producer exists so the oracle cannot start
+    // false-positiving the day one appears.
+    const frames = [
+      bframe(1, { C: false }),
+      bframe(2, { C: true }, { synthetic: 'errorState-fallback' }),
+    ]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))).toBeNull()
+  })
+
+  it('FP-surface: an UNDECLARED done.state.<C> is never raised by the engine, so it is never expected', () => {
+    // D is a real composite but the config declares no `done.state.D` event; the
+    // engine gates the raise on events.has(...) and stays silent. Keying on
+    // declaredDoneEvents is what keeps this clean.
+    const frames = [bframe(1, { C: false, D: false }), bframe(2, { C: true, D: true })]
+    expect(
+      inv5().checkFinal?.(I5_FINAL, i5ctx(frames, [raiseRec('done.state.C', 0)])),
+    ).toBeNull()
+  })
+
+  it('FP-surface: a composite ABSENT from the predecessor sample is not an edge', () => {
+    // `undefined` is not `false`: without an observed not-done predecessor there is
+    // no evidence the configuration was ENTERED during the run.
+    const frames = [bframe(1, { D: false }), bframe(2, { C: true, D: false })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, []))).toBeNull()
+  })
+
+  it('FP-surface: VACUOUS without a raise plane (ctx.raises undefined) — I-4 convention', () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, undefined))).toBeNull()
+  })
+
+  it('FP-surface: VACUOUS when the raise buffer TRUNCATED (an under-count would be a false positive)', () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    expect(
+      inv5().checkFinal?.(I5_FINAL, i5ctx(frames, [], { raisesTruncated: true })),
+    ).toBeNull()
+  })
+
+  it('FP-surface: VACUOUS with fewer than two boundary frames (no adjacent pair exists)', () => {
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx([bframe(1, { C: true })], []))).toBeNull()
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx([], []))).toBeNull()
+  })
+
+  it("I-5 counts only the `begin` edge of the raise pair (counting `end` too would double every raise)", () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    // ONLY the `end` half present → the raise is NOT counted → fires.
+    const endsOnly = [raiseRec('done.state.C', 1, { edge: 'end' })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, endsOnly))?.invariantId).toBe('I-5')
+    // The real adjacent pair counts exactly ONCE → clean.
+    const pair = [raiseRec('done.state.C', 0), raiseRec('done.state.C', 1, { edge: 'end' })]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, pair))).toBeNull()
+  })
+
+  it('I-5 ignores non-raise lifecycle records that happen to carry the same event name', () => {
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    const decoy: LifecycleObservation[] = [
+      { kind: 'enter', hook: 'onEnter', state: 'C', owner: OWNER_A, microstep: 1, seq: 0, edge: 'begin', event: 'done.state.C' },
+    ]
+    expect(inv5().checkFinal?.(I5_FINAL, i5ctx(frames, decoy))?.invariantId).toBe('I-5')
+  })
+
+  it('the RUNNER supplies the frames to checkFinal: runSafety fires I-5 without the caller passing any', () => {
+    // The caller's context carries the raise plane only. Sequence-shaped final-scope
+    // predicates get their frames from the runner, so an oracle can never be armed
+    // on one call path and silently vacuous on another.
+    const frames = [bframe(1, { C: false }), bframe(2, { C: true })]
+    const callerCtx: CheckerContext = { ...ctxFor(CFG_JOIN, 8), raises: [] }
+    expect(callerCtx.frames).toBeUndefined()
+    const v = runSafety(INVARIANTS, { header: HEADER, frames }, callerCtx)
+    expect(v?.invariantId).toBe('I-5')
   })
 
   it('I-6 NON-synthetic frame carrying contradictory-state errorClass (transition-target throw) is clean', () => {

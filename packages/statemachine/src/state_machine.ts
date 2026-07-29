@@ -63,6 +63,38 @@ const RUNTIME_ERROR_REPORTED = Symbol('mb3.runtimeErrorReported')
 const ENTER_HOOK_NAMES = ['onBeforeEnter', 'onEnter', 'onAfterEnter'] as const
 
 /**
+ * W9/Г1 — the CLOSED set of engine-internal raise origins, one per `raiseEvent`
+ * call site. It is a closed union ON PURPOSE: adding a sixth raise site forces the
+ * author to name it here and to pass a {@link RaiseOrigin}, which is what makes
+ * the `kind:'raise'` observation plane structurally complete rather than
+ * best-effort. (On the PUBLIC `LifecycleEvent.hook` these are still plain strings
+ * — that union stays EXTENSIBLE for consumers.)
+ */
+type RaiseHook =
+  /** `checkCompletion` raised `done.state.<C>` for a newly all-final composite. */
+  | 'raise.done'
+  /** An `invoke` TIMER elapsed and raised its `event`. */
+  | 'raise.invoke.timer'
+  /** An `invoke` OPERATION resolved and raised its `onDone`. */
+  | 'raise.invoke.onDone'
+  /** An `invoke` OPERATION rejected and raised its `onError`. */
+  | 'raise.invoke.onError'
+  /** A timer RESUMED from a deserialized snapshot elapsed and raised its `event`. */
+  | 'raise.invoke.resume'
+
+/**
+ * W9/Г1 — the REQUIRED provenance every `raiseEvent` call must declare. `state` is
+ * a real dot-path (the composite for `raise.done`, the invoke-owning leaf
+ * otherwise) and `microstep` follows the RAISE ASYMMETRY documented on
+ * {@link LifecycleEvent.microstep}.
+ */
+interface RaiseOrigin {
+  readonly hook: RaiseHook
+  readonly state: string
+  readonly microstep: number
+}
+
+/**
  * Prototype-chain builtin names that must NEVER be call-time-resolved as an
  * action / guard / error-handler by bare-name lookup (W0 B1).
  *
@@ -974,9 +1006,35 @@ export class StateMachine<
     })
   }
 
+  /**
+   * W9/Г1 — push ONE engine-internal event onto the internal queue AND make that
+   * raise OBSERVABLE on the lifecycle channel (`kind:'raise'`).
+   *
+   * ## Why the emission lives HERE and not at the call sites
+   * `raiseEvent` is the SINGLE private funnel through which every engine-internal
+   * event enters the queue. Emitting inside it makes the observation STRUCTURALLY
+   * complete: a future sixth raise site cannot "forget" to report itself, because
+   * {@link RaiseOrigin} is a REQUIRED parameter — omitting it is a compile error,
+   * not a silent observability hole.
+   *
+   * ## Why the raise must be observable at all
+   * A raised event that matches NO candidate transition records NOTHING anywhere
+   * else: `selectTransition` writes no commit, no refusal and no guard record when
+   * `rejected.length === 0`. From outside, "the engine raised `done.state.<C>` and
+   * nothing was listening" was therefore INDISTINGUISHABLE from "the engine never
+   * raised it" — which is precisely why the I-5 parallel-join oracle could not have
+   * sound teeth. This record closes that gap on the ENGINE side, so the oracle can
+   * COUNT raises instead of re-implementing selection semantics.
+   *
+   * The record is an ADJACENT `begin`+`end` pair (the `invoke.abort` precedent): a
+   * raise is an instantaneous point, and widening `edge` would blur the
+   * "`begin` without `end` = HUNG callback" contract. `args` are NOT carried (see
+   * {@link LifecycleEvent.event}).
+   */
   private raiseEvent(
     eventName: string,
     obj: Adapter<PropertiesOf<TOwner>>,
+    origin: RaiseOrigin,
     ...args: any[]
   ): void {
     this.internalQueue.push({
@@ -987,6 +1045,14 @@ export class StateMachine<
       timestamp: this.clock(),
       type: 'internal',
     })
+    // Same near-zero-when-unsubscribed discipline as every other emission site:
+    // one boolean test, and NOTHING is allocated for an unsubscribed machine.
+    if (this.lifecycleEnabled) {
+      const owner = this.ownerKey(obj)
+      const ctx = { event: eventName }
+      this.emitLifecycle('raise', origin.hook, origin.state, owner, origin.microstep, 'begin', ctx)
+      this.emitLifecycle('raise', origin.hook, origin.state, owner, origin.microstep, 'end', ctx)
+    }
   }
 
   private scheduleProcessing(): void {
@@ -1697,6 +1763,111 @@ export class StateMachine<
     )
   }
 
+  /**
+   * Cache of `rawOwner -> Adapter`, so the `*For` family does not allocate a fresh
+   * adapter per call. Weak keys: a forgotten owner is collectable. Correct by
+   * construction — every per-owner map keys on `ownerKey(adapter) === adaptee`, so
+   * a freshly-wrapped adapter lands in the SAME timers/invokes/history buckets as
+   * the object itself.
+   */
+  private readonly ownerAdapters = new WeakMap<object, Adapter<PropertiesOf<TOwner>>>()
+
+  /** Normalize an owner (raw object or Adapter) to an Adapter. */
+  private resolveOwnerAdapter(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+  ): Adapter<PropertiesOf<TOwner>> {
+    if (isAdapter<PropertiesOf<TOwner>>(owner)) {
+      return owner
+    }
+    const raw = owner as unknown as object
+    let cached = this.ownerAdapters.get(raw)
+    if (!cached) {
+      cached = new MemoryAdapter(owner as PropertiesOf<TOwner>) as Adapter<PropertiesOf<TOwner>>
+      this.ownerAdapters.set(raw, cached)
+    }
+    return cached
+  }
+
+  /**
+   * Fire an event AGAINST AN EXPLICIT OWNER — the multi-owner form.
+   *
+   * ## Why this exists
+   * `fireEvent(event, x, ...)` cannot tell a second OWNER from an event ARGUMENT:
+   * a non-Adapter 2nd positional is (deliberately) treated as an argument, which is
+   * what makes `fireEvent(event, arg1, arg2)` work. So driving a second object with
+   * a raw `fireEvent` silently resolved against the PRIMARY owner.
+   *
+   * Here the ambiguity is removed STRUCTURALLY rather than by sniffing: slot 1 is
+   * ALWAYS the owner, slots 3+ are ALWAYS arguments. A raw object is accepted and
+   * wrapped internally (cached per object), so the caller needs no `MemoryAdapter`
+   * ceremony — and because every per-owner structure keys on the adaptee, the
+   * object keeps its own timers, invokes and history.
+   *
+   * @example
+   * ```ts
+   * const a = { state: 'idle' }, b = { state: 'idle' }
+   * const sm = new StateMachine(config, a)
+   * await sm.fireEventFor(a, 'go')   // moves a only
+   * await sm.fireEventFor(b, 'go')   // moves b only
+   * ```
+   *
+   * ## CAVEAT — the owner SLOT is structural, the owner KIND is a duck test
+   * Which POSITION holds the owner is unambiguous, but deciding whether the value
+   * in that position is already an `Adapter` or a raw object to be wrapped is NOT:
+   * `resolveOwnerAdapter` asks `isAdapter` (`src/types.ts:700`), which is the duck
+   * test `!!x && typeof x === 'object' && 'set' in x && 'get' in x` — nothing
+   * more, and in particular it never inspects arity, prototype or `adaptee`. A raw
+   * DOMAIN object that merely happens to expose `get`/`set` methods (a cache, a
+   * `Map`-backed store, a config bag, an ORM record) therefore satisfies it and is
+   * accepted AS an adapter: it is returned unwrapped, and the machine drives the
+   * state through THAT object's own `get('state')`/`set('state', …)` rather than
+   * through a `MemoryAdapter` over its properties. If those methods mean something
+   * else (a key-value store, say), the state lands somewhere the caller does not
+   * expect and no error is raised.
+   *
+   * If your owner type has `get`/`set` of its own, wrap it explicitly:
+   * `sm.fireEventFor(new MemoryAdapter(owner), 'go')` — or give the machine a
+   * real `Adapter` implementation for it.
+   *
+   * This is DOCUMENTED, not fixed. `isAdapter` is exported and load-bearing on
+   * several other paths, so tightening it (e.g. also requiring an `adaptee`
+   * accessor) is a behavioural change to a public surface and belongs to its own
+   * deliberate decision, not to a drive-by edit. The same caveat applies to
+   * {@link fireEventDetailedFor}, {@link canFireEventFor} and
+   * {@link getAvailableEventsFor}, which share `resolveOwnerAdapter`.
+   */
+  public async fireEventFor(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+    eventName: keyof SMConfig['events'] | '*',
+    ...args: unknown[]
+  ): Promise<boolean> {
+    return this.fireEvent(eventName, this.resolveOwnerAdapter(owner), ...args)
+  }
+
+  /** {@link fireEventDetailed} against an EXPLICIT owner — see {@link fireEventFor}. */
+  public async fireEventDetailedFor(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+    eventName: keyof SMConfig['events'] | '*',
+    ...args: unknown[]
+  ): Promise<FireResult> {
+    return this.fireEventDetailed(eventName, this.resolveOwnerAdapter(owner), ...args)
+  }
+
+  /** {@link canFireEvent} against an EXPLICIT owner — see {@link fireEventFor}. */
+  public canFireEventFor(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+    eventName: keyof SMConfig['events'] | '*',
+  ): boolean {
+    return this.canFireEvent(eventName, this.resolveOwnerAdapter(owner))
+  }
+
+  /** {@link getAvailableEvents} for an EXPLICIT owner — see {@link fireEventFor}. */
+  public getAvailableEventsFor(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+  ): string[] {
+    return this.getAvailableEvents(this.resolveOwnerAdapter(owner))
+  }
+
   public async fireEvent(
     eventName: keyof SMConfig['events'] | '*',
     ...args: any[]
@@ -1812,7 +1983,15 @@ export class StateMachine<
     eventName: keyof SMConfig['events'] | '*',
     adaptee?: Adapter<PropertiesOf<TOwner>>,
   ): boolean {
-    const targetAdaptee = adaptee || this.adaptee
+    // W9/Г4: the parameter is TYPED as an Adapter but nothing enforced it at
+    // runtime, so a raw object slipped through and was read via `getCurrentState`
+    // as if it were one — silently yielding garbage instead of that object's state.
+    // Normalize it (the `*For` family is the intended multi-owner entry point).
+    const normalized =
+      adaptee !== undefined && !isAdapter<PropertiesOf<TOwner>>(adaptee)
+        ? this.resolveOwnerAdapter(adaptee as unknown as PropertiesOf<TOwner>)
+        : adaptee
+    const targetAdaptee = normalized || this.adaptee
     if (!targetAdaptee) return false
 
     const currentState = this.getCurrentState(targetAdaptee)
@@ -3407,7 +3586,16 @@ export class StateMachine<
       emitted.add(compositeId)
       const doneEvent = `done.state.${compositeId}`
       if (!this.events.has(doneEvent as keyof SMConfig['events'])) continue
-      this.raiseEvent(doneEvent, obj)
+      // W9/Г1 — `state` is the COMPOSITE whose completion produced the event, and
+      // the microstep is the CURRENT one: the completion scan runs inside the very
+      // microstep whose state write made C all-final (see the RAISE ASYMMETRY note
+      // on LifecycleEvent.microstep — this origin, unlike the invoke ones, is NOT
+      // an arming-step id).
+      this.raiseEvent(doneEvent, obj, {
+        hook: 'raise.done',
+        state: compositeId,
+        microstep: this.currentMicrostep,
+      })
       this.scheduleProcessing()
     }
   }
@@ -4411,6 +4599,17 @@ export class StateMachine<
         this.commitConfiguration(obj, errorConfig, errSets.exitStates)
         for (const s of errSets.exitStates) this.teardownStateTimers(s, obj)
         for (const s of errSets.enterStates) this.armStateInvoke(obj, s, microstep)
+        // W9: the recovery configuration can itself be ALL-FINAL (e.g. `errorState`
+        // points at a region's final leaf while the sibling regions are already
+        // final). The success path has always signalled completion here; this path
+        // did NOT, so `isDone(C)` reported true while `done.state.<C>` was never
+        // raised — a consumer's completion handler silently never ran. Recovery is
+        // still a recovery (the requested target did not fire, and success is not
+        // recorded), but a composite that BECAME done must say so: completion is a
+        // property of the committed configuration, not of how it was reached.
+        // `checkCompletion` is edge-triggered, so a configuration that was already
+        // done does not re-raise.
+        this.checkCompletion(obj as any, currentState, errorConfig)
         // W4.1 #3: signal error-state recovery distinctly. The requested target
         // did NOT fire — the caller reports fired:false so the detailed channel
         // matches the monitor's recordTransition(false) above and the machine's
@@ -4782,7 +4981,12 @@ export class StateMachine<
                 timer.event !== undefined ? String(timer.event) : undefined,
               )
             }
-            this.raiseEvent(timer.event as string, obj as any)
+            this.raiseEvent(timer.event as string, obj as any, {
+              hook: 'raise.invoke.timer',
+              state: toStateName,
+              // The ARMING microstep from the enclosing closure (INVOKE ASYMMETRY).
+              microstep,
+            })
             this.scheduleProcessing()
           } catch (err) {
             this.logger.error(
@@ -4847,7 +5051,7 @@ export class StateMachine<
             failed: true,
           })
         }
-        this.handleInvokeRejection(obj, op, controller, err, toStateName)
+        this.handleInvokeRejection(obj, op, controller, err, toStateName, microstep)
         return
       }
       Promise.resolve(result).then(
@@ -4865,7 +5069,18 @@ export class StateMachine<
           // Cancelled (leaf left before settle) → drop the completion event.
           if (controller.signal.aborted) return
           if (op.onDone) {
-            this.raiseEvent(op.onDone as string, obj as any, value)
+            this.raiseEvent(
+              op.onDone as string,
+              obj as any,
+              {
+                hook: 'raise.invoke.onDone',
+                state: toStateName,
+                // ARMING microstep (INVOKE ASYMMETRY): a long-running `src` can
+                // settle many microsteps after the entry that launched it.
+                microstep,
+              },
+              value,
+            )
             this.scheduleProcessing()
           }
         },
@@ -4876,7 +5091,7 @@ export class StateMachine<
               failed: true,
             })
           }
-          this.handleInvokeRejection(obj, op, controller, err, toStateName)
+          this.handleInvokeRejection(obj, op, controller, err, toStateName, microstep)
         },
       )
     }
@@ -5038,11 +5253,24 @@ export class StateMachine<
     controller: AbortController,
     err: unknown,
     stateName: string,
+    // W9/Г1 — the ARMING microstep of the operation that rejected, threaded from
+    // the launch closure so the `raise.invoke.onError` record carries the same id
+    // as the `invoke.operation` records of the very same operation.
+    microstep = 0,
   ): void {
     if (controller.signal.aborted) return
     const errObj = err instanceof Error ? err : new Error(String(err))
     if (op.onError) {
-      this.raiseEvent(op.onError as string, obj as any, errObj)
+      this.raiseEvent(
+        op.onError as string,
+        obj as any,
+        {
+          hook: 'raise.invoke.onError',
+          state: stateName,
+          microstep,
+        },
+        errObj,
+      )
       this.scheduleProcessing()
       return
     }
@@ -5380,7 +5608,14 @@ export class StateMachine<
               // fireEvent, which the reentrancy guard would reject if this
               // resumed timer happened to fire while a drain is in flight.
               if (this.adaptee) {
-                this.raiseEvent(invocation.event as string, this.adaptee)
+                this.raiseEvent(invocation.event as string, this.adaptee, {
+                  hook: 'raise.invoke.resume',
+                  state: stateName,
+                  // Reserved id 0: a RESUMED timer fires outside any event-driven
+                  // microstep (same convention as the runTracedInvokeAction call
+                  // a few lines above).
+                  microstep: 0,
+                })
                 this.scheduleProcessing()
               }
             } catch (_err) {

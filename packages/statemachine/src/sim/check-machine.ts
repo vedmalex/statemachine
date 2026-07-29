@@ -32,7 +32,12 @@ import { compileModel } from '../model'
 import type { CompiledModel } from '../model'
 import { runSimulation } from './public'
 import type { SimResult, SimWarning } from './public'
+import type { DriverOp } from './driver'
 import type { LivenessResult } from './liveness'
+import type { Violation } from './invariants'
+import { DEFAULT_OP_SHRINK_BUDGET, shrinkOps } from './op-shrink'
+import type { OpShrinkBudget, ShrinkableOp } from './op-shrink'
+import { fingerprintEquals } from './shrinker'
 import type { TraceFrame } from './trace'
 
 // ── public option / report surface ──────────────────────────────────────────
@@ -85,13 +90,16 @@ export interface CheckEventSpec<T extends object> {
    * the op-selection stream (see `SimEventPayload` in public.ts), so the same seed
    * always yields the same payload sequence. A THROW here is not swallowed.
    *
-   * SCOPE LIMIT (W8): payload-driven findings are SEED-REPRODUCIBLE but NOT
+   * SCOPE LIMIT (W8, narrowed by W9/Г3): payload-driven findings are still NOT
    * corpus-serialized — the persisted `ScenarioSpec` keeps number-only args on
-   * purpose (an object would collapse in the shrinker's memo key and yield an
-   * UNVERIFIED "minimal" repro; see the `## W8` note in sim/scenario.ts). So a
-   * failure found via a payload generator is replayed by re-running the SAME
-   * seed + the same generator, and it is not shrinkable into a standalone repro
-   * artifact yet.
+   * purpose (an object would collapse in that shrinker's memo key; see the
+   * `## W8` note in sim/scenario.ts). What that no longer costs is
+   * MINIMIZATION: a payload-driven finding IS reduced to a verified minimal op
+   * stream ({@link CheckViolation.minimal}), because the op-stream shrinker keys
+   * on op INDEX and carries the payload in memory as an opaque value. Only the
+   * PRINTED snippet needs serialization, and an object with no literal form
+   * degrades that snippet alone (`argsNote:'non-serializable'`) — never the
+   * reduction.
    */
   readonly payload?: (rng: Rng, snapshot: MachineSnapshot<T>) => readonly unknown[]
   /** Relative fuzzing weight (default 1). */
@@ -137,6 +145,22 @@ export type WarningKind =
   | 'non-converging-region'
   /** The initial-configuration invariant pass could not run — see the detail. */
   | 'init-check-skipped'
+  /**
+   * Minimization was DECLINED for the reported finding — see the detail for
+   * which precondition failed. Its presence is the honest alternative to an
+   * UNVERIFIED `minimal`: the violation stands, only the 1-minimal repro is
+   * missing. Advisory (never a {@link FailCause}).
+   */
+  | 'shrink-skipped'
+  /**
+   * The harness exhausted its per-macrostep TURN budget while the machine was
+   * still observably working (`settleReason:'budget-progressing'`). The machine
+   * did nothing wrong — the run just stopped watching before it settled, so the
+   * remainder of that macrostep went unchecked. The drain resumes on the next
+   * step, so raise `steps` to give the machine more total budget to finish in.
+   * Advisory (never a {@link FailCause}, never flips `ok`).
+   */
+  | 'budget-progressing'
 
 /**
  * The owner source. A SINGLE live owner reused across N runs breaks run
@@ -157,6 +181,94 @@ export interface CheckOptions<T extends object> {
   /** Point-relax `degradation` by warning KIND instead of surrendering the class. */
   readonly degradationExcept?: readonly WarningKind[]
   readonly onRealTimerEscape?: 'warn' | 'fail' | 'ignore'
+  /**
+   * Minimize the FIRST reported violation into a {@link CheckViolation.minimal}
+   * repro by delta-debugging the failing run's op stream (W9/Г3). **Default:
+   * `true`.**
+   *
+   * The default is on because the cost is paid ONLY on a run that already
+   * failed, and it is bounded: the budget caps predicate invocations, and each
+   * invocation re-drives a stream no longer than the failing one. A green sweep
+   * spends exactly zero extra runs.
+   *
+   * Only the FIRST (lowest) violation is minimized. Minimizing every violation
+   * would multiply the cost by the finding count for very little gain — the
+   * later ones are usually the same defect observed again on a later run.
+   */
+  readonly shrink?: boolean | { readonly budget?: Partial<OpShrinkBudget> }
+  /**
+   * Drive every run from a FIXED op stream instead of the fuzzer (W9/Г3) — the
+   * executable form of {@link CheckViolation.reproCode}. This is the symmetric
+   * public twin of the internal replay the shrinker uses, so a printed minimal
+   * repro is a script you can paste back in and re-run.
+   *
+   * With a script the per-event {@link CheckEventSpec.payload} generators are NOT
+   * consulted: the script's `fire` ops already carry the materialized args.
+   */
+  readonly script?: readonly CheckScriptOp[]
+}
+
+/**
+ * One op of a {@link CheckOptions.script} replay stream. Structurally the sim's
+ * `DriverOp` — an alias rather than a redeclaration so the two can never drift.
+ */
+export type CheckScriptOp = ShrinkableOp
+
+/**
+ * One op of a printed {@link CheckMinimalRepro}. Narrower than {@link CheckScriptOp}:
+ * the internal `opId` addressing is dropped (it is meaningless outside the run
+ * that produced it) and `argsNote` records that the args could not be reduced to
+ * a printable literal.
+ */
+export type CheckMinimalOp =
+  | {
+      readonly kind: 'fire'
+      readonly event: string
+      readonly args?: readonly unknown[]
+      /**
+       * The args are a live object graph that cannot be printed as a JSON
+       * literal (a class instance, a `Date`, a function, a cycle, `undefined`).
+       * `args` still holds the REAL values — they are just not paste-able, which
+       * is why {@link CheckViolation.reproCode} falls back to its seed-pinned
+       * form for such a finding.
+       */
+      readonly argsNote?: 'non-serializable'
+    }
+  | { readonly kind: 'advance'; readonly dtMs: number }
+  | { readonly kind: 'noop' }
+
+/**
+ * A VERIFIED minimal reproduction of a violation (W9/Г3).
+ *
+ * "Verified" is the load-bearing word: every field here comes from an op stream
+ * that was actually RE-DRIVEN against the consumer's live config on a fresh
+ * owner and observed to reproduce the SAME finding. A stream that could not be
+ * verified never reaches this type — the report carries a `shrink-skipped`
+ * warning instead.
+ */
+export interface CheckMinimalRepro {
+  /** The reduced op stream, in execution order. */
+  readonly ops: readonly CheckMinimalOp[]
+  /**
+   * The canonical trace of the FINAL verification replay of {@link ops}. Always
+   * serializable (content-only frames), so it survives a JSON report artifact.
+   */
+  readonly trace: readonly TraceFrame[]
+  readonly provenance: {
+    /**
+     * Predicate invocations the ddmin search spent. The verify-first pass and
+     * the final trace-capturing replay are 2 further runs, not counted here.
+     */
+    readonly runs: number
+    /** Accepted reductions (dropped ops + shortened advances). */
+    readonly moves: number
+    /**
+     * `true` iff the search reached a fixpoint. `false` means "verified, but the
+     * budget ran out before 1-minimality was proven" — the same honesty flag the
+     * scenario shrinker carries. It NEVER means "unverified".
+     */
+    readonly minimal: boolean
+  }
 }
 
 export interface CheckWarning {
@@ -174,38 +286,50 @@ export interface CheckViolation {
    * A repro snippet RELATIVE to the consumer's owner factory (the sim cannot know
    * the live owner's constructor).
    *
-   * ## NOT MINIMIZED — and why (W8/V7, honest no-op)
-   * This is the FULL failing run pinned to its seed, NOT a shrunk 1-minimal
-   * repro. The package DOES ship a structured ddmin minimizer
-   * (`sim/shrinker.ts`), and it is deliberately NOT wired in here — three
-   * structural mismatches, not a scheduling decision:
+   * ## Two forms (W9/Г3)
+   *  - **Executable minimal script** — when {@link minimal} is present AND its
+   *    args are printable literals, this is a paste-able
+   *    `checkMachine(..., { runs:1, script:[…] })` call that re-drives EXACTLY
+   *    the reduced op stream. Nothing to bisect: the printed ops ARE the witness.
+   *  - **Seed-pinned full run** — otherwise (no `minimal`, or a live object
+   *    payload that has no literal form). Still bit-reproducible: it is `runs:1`
+   *    and seed-pinned. When a `minimal` exists but could not be printed, the
+   *    snippet additionally lists the minimal stream's EVENTS in order, which
+   *    collapses a manual bisection from `steps` down to that handful of ops.
    *
-   *  1. **Different input type.** `shrink()` reduces a {@link ScenarioSpec} —
-   *     a JSON-serializable `TopologySpec` whose callbacks are closure-free
-   *     inlined SOURCE STRINGS (`sim/scenario.ts` R13). `checkMachine` runs the
-   *     consumer's LIVE `StateMachineConfig`, whose guards/actions are real
-   *     closures over consumer scope. There is no total function from the
-   *     latter to the former, so the shrinker cannot even be handed the input.
-   *  2. **Different predicate.** The shrink predicate is strict FULL-TUPLE
-   *     equality on a builtin-oracle {@link Violation.fingerprint} (R15). A
-   *     `kind:'user'` violation here is produced OUTSIDE the oracle registry
-   *     (a consumer predicate evaluated on the settle-boundary frame) and has
-   *     no fingerprint to match, so ddmin has no acceptance test.
-   *  3. **Payloads are not corpus-serializable.** Per the `## W8` note in
-   *     `sim/scenario.ts`, the persisted op stream keeps NUMBER-ONLY args on
-   *     purpose — an object payload collapses in the shrinker's memo key and
-   *     would yield an UNVERIFIED "minimal" repro. A finding reached through a
-   *     {@link CheckEventSpec.payload} generator is therefore unshrinkable by
-   *     construction.
+   * ## Why this used to say "NOT MINIMIZED" (resolved)
+   * Through W8 this field documented three structural blockers to wiring the
+   * package's ddmin minimizer in: `shrink()` reduces a `ScenarioSpec` whose
+   * callbacks are source strings (not a live closure config); its predicate is
+   * strict equality on a builtin `Violation.fingerprint`, which a `kind:'user'`
+   * finding does not have; and object payloads collapse in the corpus memo key,
+   * so a "minimal" could be accepted without ever being run.
    *
-   * Emitting a `minimalTrace` we cannot verify would be worse than emitting
-   * none — a false "minimal" repro sends the consumer to bisect the wrong
-   * thing. To narrow a finding TODAY: re-run the printed snippet (it is
-   * `runs:1` and seed-pinned, so it is bit-reproducible), then bisect `steps`
-   * downward by hand — the run is deterministic, so the smallest `steps` that
-   * still fails is a valid minimal witness.
+   * W9/Г3 dissolves all three by reducing the OP STREAM instead of the spec
+   * (`sim/op-shrink.ts`): a candidate is the SAME live config re-driven through
+   * {@link CheckOptions.script}, the acceptance predicate is supplied here (a
+   * builtin/engine finding compares `Violation.fingerprint` verbatim, a user
+   * finding compares the strict `{invariant, witness}` tuple), and payload values
+   * ride along IN MEMORY, so no serialization is needed to shrink one — only to
+   * print one, which is why the non-printable case degrades the SNIPPET rather
+   * than the minimization.
+   *
+   * The anti-fabrication rule is unchanged and now enforced by construction: a
+   * `minimal` is emitted ONLY after the stream was re-driven and observed to
+   * reproduce. When it cannot be (see `shrink-skipped`), this field stays in its
+   * seed-pinned form and no `minimal` appears.
    */
   readonly reproCode: string
+  /**
+   * The VERIFIED minimal reproduction (W9/Г3) — present on at most the FIRST
+   * reported violation, and only when minimization both ran and verified.
+   *
+   * ABSENT means "not minimized", never "minimal is the full run": see the
+   * `shrink-skipped` warning in {@link CheckReport.warnings} for the reason
+   * (`shrink:false`, a live-Adapter owner, an initial-configuration finding that
+   * has no op stream, or a failing verify-first replay).
+   */
+  readonly minimal?: CheckMinimalRepro
 }
 
 export interface CheckReport {
@@ -590,6 +714,164 @@ export function decorateLifecycle(
   }
 }
 
+/** A user-invariant finding from ONE run: the strict `{invariant, witness}` tuple. */
+interface UserFinding {
+  readonly name: string
+  readonly witness: string
+}
+
+/**
+ * The shape {@link decorateLifecycle} hands the guard-coverage fold. Structurally
+ * a widened `LifecycleEvent` — the fold reads five fields and must not couple to
+ * the rest of the record.
+ */
+type GuardFold = (record: {
+  kind?: unknown
+  edge?: unknown
+  outcome?: unknown
+  transition?: unknown
+  state?: unknown
+}) => void
+
+interface RunOneCheckParams<T extends object> {
+  readonly config: StateMachineConfig<T>
+  /** THIS run's owner. Every run gets a fresh one (run independence). */
+  readonly owner: T | Adapter<T>
+  readonly seed: string
+  readonly steps: number
+  readonly mode: 'safety' | 'liveness' | 'both'
+  readonly invariants: readonly MachineInvariant<T>[]
+  readonly events: readonly CheckEventSpec<T>[]
+  /**
+   * Guard-coverage fold, attached by DECORATION to this run's monitor. ABSENT
+   * for a shrink replay — a replay is not a coverage SAMPLE, and folding it in
+   * would let minimizing a violation silently flip an unrelated
+   * `dead-guard-at-plateau` verdict.
+   */
+  readonly foldGuard?: GuardFold
+  /** W9/Г3: drive from a fixed op stream instead of the fuzzer. */
+  readonly script?: readonly DriverOp[]
+}
+
+interface RunOneCheckResult {
+  readonly result: SimResult
+  /** User-invariant violations observed on this run's settle boundaries. */
+  readonly userViolations: readonly UserFinding[]
+}
+
+/**
+ * Drive ONE run and evaluate the consumer's {@link MachineInvariant}s over it.
+ *
+ * ## Why this is a shared helper (W9/Г3)
+ * It is called by BOTH the main sweep and the shrink replayer. If the replayer
+ * had its own copy of the boundary-frame logic below, the two would evaluate
+ * user invariants on DIFFERENT frames the moment either changed — and the
+ * shrinker's acceptance predicate would then be answering a different question
+ * from the one the sweep asked. A minimal repro derived from a drifted predicate
+ * is exactly the fabricated-repro failure mode this whole path exists to avoid,
+ * so the evaluation lives in ONE place by construction.
+ *
+ * ## What is deliberately NOT here
+ * Coverage aggregation (reached states / fired events / transitions / plateau)
+ * stays in the sweep. It is a pure fold over the returned `result.trace`, so
+ * there is no drift risk — and keeping it out is what lets a shrink replay run
+ * dozens of times without contaminating the coverage sample the report publishes.
+ *
+ * User invariants are evaluated on the SETTLE-BOUNDARY frame of each step — the
+ * LAST frame carrying that step number, whose config is the SETTLED configuration
+ * (the driver emits a step's frames in one batch AFTER settle, so the live owner
+ * is already at that step's rest state). Evaluating the FIRST frame would check a
+ * mid-cascade seam config (a violation in the settled state would be missed; a
+ * transient seam state would false-fire), and mismatch the settled `data`. We
+ * therefore buffer the step's last frame + a snapshot of the owner data captured
+ * DURING that step (the data does not change within a settled step) and evaluate
+ * when the step advances / the run ends. A throw is a violation (anti-F7).
+ * NOTE: `data` is a SHALLOW copy — nested mutable fields are shared; a deep
+ * invariant should snapshot what it needs.
+ */
+async function runOneCheck<T extends object>(params: RunOneCheckParams<T>): Promise<RunOneCheckResult> {
+  const { config, owner, seed, steps, mode, invariants, events, foldGuard, script } = params
+  const data = ownerData(owner)
+
+  const userViolations: UserFinding[] = []
+  let curStep = -1
+  let boundaryFrame: TraceFrame | undefined
+  let boundaryData: T | undefined
+  const evalBoundary = (): void => {
+    if (boundaryFrame === undefined || boundaryData === undefined || invariants.length === 0) {
+      return
+    }
+    const snapshot: MachineSnapshot<T> = {
+      config: boundaryFrame.to,
+      state: boundaryFrame.to,
+      data: boundaryData as Readonly<T>,
+      queueDepth: boundaryFrame.queue.internal + boundaryFrame.queue.external,
+    }
+    for (const inv of invariants) {
+      let held: boolean
+      try {
+        held = inv.check(snapshot)
+      } catch {
+        held = false // a throw inside the check is a violation, not swallowed.
+      }
+      if (!held) {
+        userViolations.push({ name: inv.name, witness: boundaryFrame.to })
+      }
+    }
+  }
+  const onTrace = (frame: TraceFrame): void => {
+    if (frame.step !== curStep) {
+      evalBoundary() // the previous step's boundary (its data was captured during it).
+      curStep = frame.step
+    }
+    boundaryFrame = frame // keeps updating → ends as the LAST frame of this step.
+    boundaryData = { ...data } // snapshot the settled owner data for THIS step.
+  }
+
+  // W8: bridge the consumer's per-event `payload` generators into the sim's
+  // `eventPayload` hook. The hook is passed ONLY when at least one spec declares
+  // a payload — otherwise the run must stay byte-identical to the arg-free path
+  // (an always-installed hook returning `[]` would still be a behavior change we
+  // do not want to smuggle in). Under a `script` the sim ignores the hook
+  // outright (the script's args are already materialized).
+  const eventPayload = buildEventPayload<T>(events, () => data)
+
+  const result: SimResult = await runSimulation<T>(
+    (env) => {
+      // W8/V7 — subscribe to the lifecycle observability channel for THIS run.
+      //
+      // DECORATION, NEVER REPLACEMENT. `SimMonitor.recordLifecycle` is
+      // LOAD-BEARING: it feeds the I-4 hierarchy-order oracle AND maintains the
+      // `invoke.action` in-flight counter the settle predicate reads (the
+      // ISS-030 string-method gap). Overwriting the slot would wedge that
+      // counter and silently break quiescence for every checkMachine run, so we
+      // chain instead — our fold first (it is a pure Map write and cannot
+      // throw), then the harness's own sink.
+      //
+      // The setup callback is the last thing that runs BEFORE the driver
+      // constructs the machine, which is the only legal window: presence on
+      // `IMonitor.recordLifecycle` is SAMPLED ONCE at construction (types.ts),
+      // so attaching later would be a silent no-op. The monitor is constructed
+      // per-Simulator, so the wrapper cannot accumulate across runs.
+      if (foldGuard !== undefined) {
+        decorateLifecycle(env.monitor, foldGuard)
+      }
+      return { config, owner }
+    },
+    {
+      seed,
+      steps,
+      mode,
+      onTrace,
+      ...(eventPayload !== undefined ? { eventPayload } : {}),
+      ...(script !== undefined ? { script } : {}),
+    },
+  )
+  evalBoundary() // the FINAL step's boundary (no later frame triggers it).
+
+  return { result, userViolations }
+}
+
 export async function checkMachine<T extends object>(
   config: StateMachineConfig<T>,
   owner: OwnerSource<T>,
@@ -608,6 +890,20 @@ export async function checkMachine<T extends object>(
   const factory = resolveOwnerFactory(owner, runs)
   const base = seedBase(options.seed)
   const decl = declaredModel(config)
+
+  // ── W9/Г3 minimization setup ────────────────────────────────────────────────
+  const shrinkOpt = options.shrink ?? true
+  const shrinkEnabled = shrinkOpt !== false
+  const shrinkBudget: OpShrinkBudget =
+    typeof shrinkOpt === 'object' && shrinkOpt.budget !== undefined
+      ? { ...DEFAULT_OP_SHRINK_BUDGET, ...shrinkOpt.budget }
+      : DEFAULT_OP_SHRINK_BUDGET
+  // How a shrink replay gets a FRESH owner. Resolved HERE — before the sweep —
+  // because a plain-object owner is mutated IN PLACE by its run: copying it after
+  // the sweep would seed every replay from the POST-FAILURE data, and a stream
+  // "verified" against the wrong starting state is exactly the fabricated repro
+  // this path must never emit.
+  const shrinkOwner = resolveShrinkOwner<T>(owner)
 
   // Aggregation accumulators.
   const reached = new Set<string>()
@@ -689,87 +985,26 @@ export async function checkMachine<T extends object>(
     })
   }
 
+  // W9/Г3: the shrink target — the FIRST violation a RUN produced, together with
+  // everything needed to re-drive it. Captured during the sweep and minimized
+  // after it, so the sweep's own determinism is untouched.
+  let shrinkTarget: ShrinkTarget | undefined
+
   for (let run = 0; run < runs; run++) {
     const seed = runSeed(base, run)
     const runOwner = factory()
-    const data = ownerData(runOwner)
 
-    // User-invariant evaluation on the SETTLE-BOUNDARY frame of each step — the
-    // LAST frame carrying that step number, whose config is the SETTLED
-    // configuration (the driver emits a step's frames in one batch AFTER settle, so
-    // the live owner is already at that step's rest state). Evaluating the FIRST
-    // frame would check a mid-cascade seam config (a violation in the settled state
-    // would be missed; a transient seam state would false-fire), and mismatch the
-    // settled `data`. We therefore buffer the step's last frame + a snapshot of the
-    // owner data captured DURING that step (the data does not change within a
-    // settled step) and evaluate when the step advances / the run ends. A throw is
-    // a violation (anti-F7). NOTE: `data` is a SHALLOW copy — nested mutable fields
-    // are shared; a deep invariant should snapshot what it needs.
-    const userViolationThisRun: Array<{ name: string; witness: string }> = []
-    let curStep = -1
-    let boundaryFrame: TraceFrame | undefined
-    let boundaryData: T | undefined
-    const evalBoundary = (): void => {
-      if (boundaryFrame === undefined || boundaryData === undefined || userInvariants.length === 0) {
-        return
-      }
-      const snapshot: MachineSnapshot<T> = {
-        config: boundaryFrame.to,
-        state: boundaryFrame.to,
-        data: boundaryData as Readonly<T>,
-        queueDepth: boundaryFrame.queue.internal + boundaryFrame.queue.external,
-      }
-      for (const inv of userInvariants) {
-        let held: boolean
-        try {
-          held = inv.check(snapshot)
-        } catch {
-          held = false // a throw inside the check is a violation, not swallowed.
-        }
-        if (!held) {
-          userViolationThisRun.push({ name: inv.name, witness: boundaryFrame.to })
-        }
-      }
-    }
-    const onTrace = (frame: TraceFrame): void => {
-      if (frame.step !== curStep) {
-        evalBoundary() // the previous step's boundary (its data was captured during it).
-        curStep = frame.step
-      }
-      boundaryFrame = frame // keeps updating → ends as the LAST frame of this step.
-      boundaryData = { ...data } // snapshot the settled owner data for THIS step.
-    }
-
-    // W8: bridge the consumer's per-event `payload` generators into the sim's
-    // `eventPayload` hook. The hook is passed ONLY when at least one spec declares
-    // a payload — otherwise the run must stay byte-identical to the arg-free path
-    // (an always-installed hook returning `[]` would still be a behavior change we
-    // do not want to smuggle in).
-    const eventPayload = buildEventPayload<T>(eventSpecs, () => data)
-
-    const result: SimResult = await runSimulation<T>(
-      (env) => {
-        // W8/V7 — subscribe to the lifecycle observability channel for THIS run.
-        //
-        // DECORATION, NEVER REPLACEMENT. `SimMonitor.recordLifecycle` is
-        // LOAD-BEARING: it feeds the I-4 hierarchy-order oracle AND maintains the
-        // `invoke.action` in-flight counter the settle predicate reads (the
-        // ISS-030 string-method gap). Overwriting the slot would wedge that
-        // counter and silently break quiescence for every checkMachine run, so we
-        // chain instead — our fold first (it is a pure Map write and cannot
-        // throw), then the harness's own sink.
-        //
-        // The setup callback is the last thing that runs BEFORE the driver
-        // constructs the machine, which is the only legal window: presence on
-        // `IMonitor.recordLifecycle` is SAMPLED ONCE at construction (types.ts),
-        // so attaching later would be a silent no-op. The monitor is constructed
-        // per-Simulator, so the wrapper cannot accumulate across runs.
-        decorateLifecycle(env.monitor, foldGuardRecord)
-        return { config, owner: runOwner }
-      },
-      { seed, steps, mode, onTrace, ...(eventPayload !== undefined ? { eventPayload } : {}) },
-    )
-    evalBoundary() // the FINAL step's boundary (no later frame triggers it).
+    const { result, userViolations: userViolationThisRun } = await runOneCheck<T>({
+      config,
+      owner: runOwner,
+      seed,
+      steps,
+      mode,
+      invariants: userInvariants,
+      events: eventSpecs,
+      foldGuard: foldGuardRecord,
+      ...(options.script !== undefined ? { script: options.script } : {}),
+    })
 
     oraclesRun = Math.max(oraclesRun, result.oraclesRun + userInvariants.length)
 
@@ -804,6 +1039,17 @@ export async function checkMachine<T extends object>(
     // Engine / builtin violation (kind carried by the sim).
     if (result.violation !== undefined) {
       const kind = result.violation.kind === 'engine' ? 'engine' : 'builtin'
+      if (shrinkTarget === undefined) {
+        // A builtin/engine finding is born INSIDE the oracle registry, so it
+        // carries the canonical `fingerprint` tuple — the acceptance key is that
+        // tuple VERBATIM, exactly as the scenario shrinker uses it.
+        shrinkTarget = {
+          violationIndex: violations.length,
+          seed,
+          ops: result.ops ?? [],
+          key: { kind: 'builtin', fingerprint: result.violation.fingerprint },
+        }
+      }
       violations.push({
         invariant: result.violation.invariantId,
         kind,
@@ -814,6 +1060,21 @@ export async function checkMachine<T extends object>(
 
     // User-invariant violations (kind user).
     for (const uv of userViolationThisRun) {
+      if (shrinkTarget === undefined) {
+        // A user finding has NO fingerprint (it is born outside the registry), so
+        // the key is the strict `{invariant, witness}` tuple. Strictness is
+        // DELIBERATE and not tunable: a name-only key would happily accept a
+        // candidate that broke the same invariant in a DIFFERENT configuration,
+        // and calling that the "minimal repro" of this finding is fabrication.
+        // The cost of strictness is a possibly-less-reduced stream, which is the
+        // right side to err on.
+        shrinkTarget = {
+          violationIndex: violations.length,
+          seed,
+          ops: result.ops ?? [],
+          key: { kind: 'user', invariant: uv.name, witness: uv.witness },
+        }
+      }
       violations.push({ invariant: uv.name, kind: 'user', witness: uv.witness, reproCode: reproCode(config, seed, steps, mode) })
     }
 
@@ -825,6 +1086,44 @@ export async function checkMachine<T extends object>(
         sawResidualRejection = true
       }
       warnings.push(mapSimWarning(w))
+    }
+  }
+
+  // ── W9/Г3: minimize the FIRST violation into a VERIFIED repro ───────────────
+  // Runs AFTER the sweep so it cannot perturb the sweep's own determinism, and
+  // ONLY when something already failed (a green report spends zero extra runs).
+  if (shrinkEnabled && violations.length > 0) {
+    if (shrinkTarget === undefined) {
+      // Reachable only when EVERY violation came from the initial-configuration
+      // pass, which runs at `steps:0` and therefore drove no ops at all.
+      warnings.push({
+        kind: 'shrink-skipped',
+        detail:
+          'minimization was skipped: the reported finding is an INITIAL-CONFIGURATION violation, reached by construction plus the mandatory post-construction drain with ZERO driven ops — there is no op stream to reduce (the repro is already minimal).',
+      })
+    } else {
+      const outcome = await minimizeViolation<T>({
+        config,
+        ownerSource: shrinkOwner,
+        target: shrinkTarget,
+        steps,
+        mode,
+        invariants: userInvariants,
+        events: eventSpecs,
+        budget: shrinkBudget,
+      })
+      if (outcome.warning !== undefined) {
+        warnings.push(outcome.warning)
+      }
+      const minimal = outcome.minimal
+      const targetViolation = violations[shrinkTarget.violationIndex]
+      if (minimal !== undefined && targetViolation !== undefined) {
+        violations[shrinkTarget.violationIndex] = {
+          ...targetViolation,
+          reproCode: minimalReproCode(config, shrinkTarget.seed, steps, mode, minimal),
+          minimal,
+        }
+      }
     }
   }
 
@@ -1037,6 +1336,420 @@ export async function checkMachine<T extends object>(
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// W9/Г3 — op-stream delta-debugging (`minimalTrace` + an executable repro)
+//
+// The unit being reduced is the OP STREAM of ONE failing run, never the machine
+// spec. That single choice is what makes minimization possible here at all: a
+// candidate is the SAME live `StateMachineConfig` with the SAME closures, only
+// driven by fewer ops, and an object payload rides along in memory as an opaque
+// value instead of having to survive a corpus round-trip.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * The acceptance key a shrink candidate must reproduce EXACTLY.
+ *
+ * Two constructors because the two finding families have genuinely different
+ * identities, not because one is a fallback for the other:
+ *  - `builtin` — a finding born inside the oracle registry, which stamps the
+ *    canonical `{invariantId, witness, errorClass}` fingerprint. Consumed
+ *    VERBATIM (never recomputed), matched with the same `fingerprintEquals` the
+ *    scenario shrinker uses, so the two predicates cannot drift.
+ *  - `user` — a consumer {@link MachineInvariant} evaluated on a settle boundary.
+ *    It has no fingerprint, so the key is the strict `{invariant, witness}`
+ *    tuple. There is deliberately NO knob to relax this to name-only: a
+ *    name-only key accepts a candidate that broke the same invariant in a
+ *    DIFFERENT configuration, and presenting that as "the minimal repro of this
+ *    finding" is fabrication. A stricter key can only cost reduction depth; a
+ *    looser one costs correctness.
+ */
+type ViolationKey =
+  | { readonly kind: 'builtin'; readonly fingerprint: Violation['fingerprint'] }
+  | { readonly kind: 'user'; readonly invariant: string; readonly witness: string }
+
+/** Everything the minimizer needs about the violation it is reducing. */
+interface ShrinkTarget {
+  /** Index into the report's `violations` array — where the `minimal` is attached. */
+  readonly violationIndex: number
+  /** The seed of the run that produced it (the replay must use the SAME one). */
+  readonly seed: string
+  /** The ops that run actually drove, with materialized args. */
+  readonly ops: readonly DriverOp[]
+  readonly key: ViolationKey
+}
+
+/**
+ * How a shrink replay obtains a FRESH owner — the precondition the whole path
+ * rests on, since every candidate is a full re-run from construction.
+ */
+type ShrinkOwnerSource<T extends object> =
+  | { readonly kind: 'factory'; readonly make: () => T | Adapter<T> }
+  | { readonly kind: 'copy'; readonly pristine: T }
+  | { readonly kind: 'abstain'; readonly reason: string }
+
+/**
+ * Classify the consumer's {@link OwnerSource} for replay purposes. Mirrors the
+ * initial-configuration probe's rules, and for the same reason: a replay that
+ * cannot start from a faithful fresh owner must ABSTAIN, never guess.
+ *
+ *  - FACTORY → a genuinely fresh owner per candidate. Full fidelity.
+ *  - PLAIN OBJECT (only legal at `runs===1`) → a shallow copy taken BEFORE the
+ *    sweep mutates it. Nested mutable fields are shared — the same caveat the
+ *    per-step `boundaryData` snapshot carries — and the verify-first pass is the
+ *    net that catches it when it matters.
+ *  - LIVE ADAPTER → ABSTAIN. A copy would lose the adapter's own get/set
+ *    semantics, so a stream "verified" against the copy proves nothing about the
+ *    real machine.
+ */
+function resolveShrinkOwner<T extends object>(owner: OwnerSource<T>): ShrinkOwnerSource<T> {
+  if (typeof owner === 'function') {
+    return { kind: 'factory', make: owner as () => T | Adapter<T> }
+  }
+  if (isAdapter<T>(owner)) {
+    return {
+      kind: 'abstain',
+      reason:
+        'the owner is a LIVE Adapter — a replay needs a FRESH owner per candidate, and copying an adapter would lose its get/set semantics, so a stream verified against the copy would prove nothing about the real machine. Pass an owner FACTORY `() => adapter` to enable minimization.',
+    }
+  }
+  return { kind: 'copy', pristine: { ...(owner as T) } }
+}
+
+interface MinimizeParams<T extends object> {
+  readonly config: StateMachineConfig<T>
+  readonly ownerSource: ShrinkOwnerSource<T>
+  readonly target: ShrinkTarget
+  /** The sweep's step budget — used only for the fallback repro snippet. */
+  readonly steps: number
+  readonly mode: 'safety' | 'liveness' | 'both'
+  readonly invariants: readonly MachineInvariant<T>[]
+  readonly events: readonly CheckEventSpec<T>[]
+  readonly budget: OpShrinkBudget
+}
+
+/**
+ * Reduce `target.ops` to a VERIFIED minimal repro, or abstain with a reason.
+ *
+ * ## VERIFY-FIRST (step 0) — the anti-fabrication gate
+ * Before a single reduction is attempted, the RECORDED stream is replayed in
+ * full on a fresh owner. If the original finding does not come back, the run was
+ * not reproducible from its op stream alone — a payload object the machine
+ * mutated in place, a config whose callbacks read state outside the owner, a
+ * clock/counter in consumer scope. Minimization then ABSTAINS: it emits no
+ * `minimal` and says why. This is the difference between "we could not shrink
+ * it" and the far worse "here is a smaller repro" that does not reproduce.
+ *
+ * ## structuredClone before EVERY candidate
+ * Candidate args are deep-copied per run, so a machine that mutates its payload
+ * cannot let run N poison run N+1 — without which the ddmin search would be
+ * exploring a moving target and its "verified" verdicts would be stale. An arg
+ * graph that cannot be cloned is NOT a hard error: the original values are
+ * passed through and the op is flagged, because the verify predicate is what
+ * actually decides, and refusing to run would turn a printing limitation into a
+ * lost minimization.
+ */
+async function minimizeViolation<T extends object>(
+  p: MinimizeParams<T>,
+): Promise<{ minimal?: CheckMinimalRepro; warning?: CheckWarning }> {
+  const { config, ownerSource, target, mode, invariants, events, budget } = p
+
+  if (ownerSource.kind === 'abstain') {
+    return { warning: { kind: 'shrink-skipped', detail: `minimization was skipped: ${ownerSource.reason}` } }
+  }
+  if (target.ops.length === 0) {
+    return {
+      warning: {
+        kind: 'shrink-skipped',
+        detail: 'minimization was skipped: the failing run recorded no driven ops, so there is no stream to reduce.',
+      },
+    }
+  }
+  const makeOwner = (): T | Adapter<T> =>
+    ownerSource.kind === 'factory' ? ownerSource.make() : { ...ownerSource.pristine }
+
+  const replay = async (ops: readonly ShrinkableOp[]): Promise<RunOneCheckResult> =>
+    runOneCheck<T>({
+      config,
+      owner: makeOwner(),
+      seed: target.seed,
+      // The candidate stream IS the budget: exactly these ops, nothing after.
+      steps: ops.length,
+      mode,
+      invariants,
+      events,
+      // No `foldGuard` — a replay must not contribute to guard coverage.
+      script: cloneOpsForRun(ops),
+    })
+
+  // ── step 0: VERIFY-FIRST ──────────────────────────────────────────────────
+  let verified: RunOneCheckResult
+  try {
+    verified = await replay(target.ops)
+  } catch (error) {
+    return {
+      warning: {
+        kind: 'shrink-skipped',
+        detail: `minimization was skipped: replaying the recorded op stream THREW (${error instanceof Error ? error.message : String(error)}), so no candidate could be verified.`,
+      },
+    }
+  }
+  if (!findingMatches(target.key, verified)) {
+    return {
+      warning: {
+        kind: 'shrink-skipped',
+        detail:
+          'minimization was skipped: replaying the recorded op stream on a FRESH owner did NOT reproduce the finding, so no reduced stream could be honestly verified either. The usual causes are a payload object the machine mutates in place, or a config whose behavior depends on state outside the owner (an external counter, a real clock, module-level state). Emitting an unverified "minimal" repro would send you to bisect the wrong thing.',
+      },
+    }
+  }
+
+  // ── the search ────────────────────────────────────────────────────────────
+  const search = await shrinkOps(
+    target.ops,
+    async (candidate) => findingMatches(target.key, await replay(candidate)),
+    budget,
+  )
+
+  // ── the final replay: capture the trace AND re-confirm the reduced stream ──
+  // Cheap (one run) and load-bearing: `minimal.trace` must be the trace OF the
+  // published ops, not of the original run, and re-checking here means the
+  // emitted repro was confirmed by a run that no memo could have short-circuited.
+  let final: RunOneCheckResult
+  try {
+    final = await replay(search.ops)
+  } catch (error) {
+    return {
+      warning: {
+        kind: 'shrink-skipped',
+        detail: `minimization was skipped: the final verification replay THREW (${error instanceof Error ? error.message : String(error)}).`,
+      },
+    }
+  }
+  if (!findingMatches(target.key, final)) {
+    return {
+      warning: {
+        kind: 'shrink-skipped',
+        detail:
+          'minimization was skipped: the reduced stream failed its FINAL verification replay. The run is therefore not reproducible from its op stream alone, and no "minimal" is published.',
+      },
+    }
+  }
+
+  return {
+    minimal: {
+      ops: toMinimalOps(search.ops),
+      trace: final.result.trace,
+      provenance: { runs: search.runs, moves: search.moves, minimal: search.minimal },
+    },
+  }
+}
+
+/** Does this replay carry the SAME finding the target names? */
+function findingMatches(key: ViolationKey, run: RunOneCheckResult): boolean {
+  if (key.kind === 'builtin') {
+    const v = run.result.violation
+    return v !== undefined && fingerprintEquals(v.fingerprint, key.fingerprint)
+  }
+  return run.userViolations.some((u) => u.name === key.invariant && u.witness === key.witness)
+}
+
+/**
+ * Deep-copy every `fire` op's args for ONE candidate run, so a machine that
+ * mutates its payload cannot let run N poison run N+1 (which would leave the
+ * ddmin search exploring a moving target and its "verified" verdicts stale).
+ *
+ * ## Cloning is GATED on {@link argsArePlainData}, not on `structuredClone`
+ * `structuredClone` does not throw on a class instance — it silently returns a
+ * PLAIN object with the prototype stripped. A guard written as
+ * `v instanceof Verdict` (or one that calls a method) then fails on the clone,
+ * the replay does not reproduce, and the finding is abandoned by a "safety"
+ * measure that CAUSED the divergence. So a non-plain arg graph is passed through
+ * BY REFERENCE and its op is flagged `non-serializable` instead: the shared value
+ * is a fidelity risk the verify-first pass is there to catch, whereas a
+ * prototype-stripping clone is a fidelity loss guaranteed up front.
+ */
+function cloneOpsForRun(ops: readonly ShrinkableOp[]): DriverOp[] {
+  return ops.map((op) => {
+    if (op.kind !== 'fire' || op.args === undefined || op.args.length === 0) {
+      return op
+    }
+    if (!argsArePlainData(op.args)) {
+      return op
+    }
+    const cloned = tryStructuredClone(op.args)
+    return cloned === undefined ? op : { ...op, args: cloned }
+  })
+}
+
+function tryStructuredClone(args: readonly unknown[]): unknown[] | undefined {
+  if (typeof structuredClone !== 'function') {
+    return undefined
+  }
+  try {
+    return structuredClone(args as unknown[])
+  } catch {
+    return undefined
+  }
+}
+
+/** Project the reduced stream onto the published {@link CheckMinimalOp} shape. */
+function toMinimalOps(ops: readonly ShrinkableOp[]): CheckMinimalOp[] {
+  return ops.map((op): CheckMinimalOp => {
+    if (op.kind === 'advance') {
+      return { kind: 'advance', dtMs: op.dtMs }
+    }
+    if (op.kind === 'noop') {
+      return { kind: 'noop' }
+    }
+    if (op.args === undefined || op.args.length === 0) {
+      return { kind: 'fire', event: op.event }
+    }
+    return argsArePlainData(op.args)
+      ? { kind: 'fire', event: op.event, args: op.args }
+      : { kind: 'fire', event: op.event, args: op.args, argsNote: 'non-serializable' }
+  })
+}
+
+/**
+ * Is this arg list PLAIN DATA — a value that both survives `structuredClone`
+ * faithfully AND has a literal form that reconstructs it? The two questions have
+ * the same answer, so they share one predicate: a value with a custom prototype
+ * is exactly the value `structuredClone` flattens and `JSON.stringify` misprints.
+ *
+ * Deliberately CONSERVATIVE — accepts only primitives, arrays, and
+ * `Object.prototype`/null-prototype objects; rejects `undefined`, `bigint`,
+ * functions, symbols, non-finite numbers, cycles, and anything with a custom
+ * prototype (a `Date`, a `Map`, a class instance).
+ *
+ * The strictness is the point on BOTH sides. `JSON.stringify` would happily
+ * flatten a class instance into `{a:1}` and a `Date` into a string, and printing
+ * that as the repro would hand the consumer a script whose payload BEHAVES
+ * differently from the one that failed. Rejecting costs only the executable
+ * snippet and the per-candidate copy — {@link CheckMinimalRepro.ops} still
+ * carries the real values, and the op is flagged so nobody mistakes the two.
+ */
+function argsArePlainData(args: readonly unknown[]): boolean {
+  const seen = new Set<object>()
+  const ok = (v: unknown): boolean => {
+    if (v === null) {
+      return true
+    }
+    const t = typeof v
+    if (t === 'string' || t === 'boolean') {
+      return true
+    }
+    if (t === 'number') {
+      return Number.isFinite(v as number) // NaN/Infinity have no JSON literal.
+    }
+    if (t !== 'object') {
+      return false // undefined, bigint, symbol, function.
+    }
+    const obj = v as object
+    if (seen.has(obj)) {
+      return false // a cycle has no literal form.
+    }
+    seen.add(obj)
+    try {
+      if (Array.isArray(obj)) {
+        return obj.every(ok)
+      }
+      const proto = Object.getPrototypeOf(obj)
+      if (proto !== Object.prototype && proto !== null) {
+        return false
+      }
+      return Object.values(obj as Record<string, unknown>).every(ok)
+    } finally {
+      seen.delete(obj)
+    }
+  }
+  return args.every(ok)
+}
+
+/**
+ * The MINIMIZED repro snippet. Two forms, chosen by whether every arg has a
+ * literal representation:
+ *  - printable → an EXECUTABLE `script:[…]` call that re-drives exactly the
+ *    reduced stream (paste, run, watch it fail);
+ *  - not printable → the seed-pinned full-run form PLUS the minimal stream's ops
+ *    listed in order, which is still a large win: the manual search shrinks from
+ *    `steps` down to that handful of ops.
+ */
+function minimalReproCode<T extends object>(
+  config: StateMachineConfig<T>,
+  seed: string,
+  steps: number,
+  mode: string,
+  minimal: CheckMinimalRepro,
+): string {
+  const name = (config as { name?: string }).name ?? 'machine'
+  const provenance = minimal.provenance.minimal
+    ? '1-minimal: no further op could be removed'
+    : `budget-bounded after ${minimal.provenance.runs} verification run(s) — verified, but possibly not 1-minimal`
+  const printable = minimal.ops.every((o) => o.kind !== 'fire' || o.argsNote === undefined)
+  if (printable) {
+    return [
+      `// reproduce this finding — MINIMIZED to ${minimal.ops.length} op(s), VERIFIED by replay`,
+      `// (${provenance}).`,
+      `await checkMachine(${name}Config, ${name}OwnerFactory, {`,
+      `  seed: '${seed}', runs: 1, steps: ${minimal.ops.length}, mode: '${mode}',`,
+      `  script: [`,
+      ...minimal.ops.map((o) => `    ${renderScriptOp(o)},`),
+      `  ],`,
+      `})`,
+    ].join('\n')
+  }
+  return [
+    `// reproduce this finding (owner comes from YOUR factory):`,
+    `await checkMachine(${name}Config, ${name}OwnerFactory, {`,
+    `  seed: '${seed}', steps: ${steps}, mode: '${mode}', runs: 1,`,
+    `})`,
+    `//`,
+    `// MINIMIZED to ${minimal.ops.length} op(s) and VERIFIED by replay (${provenance}), but at`,
+    `// least one payload is a live object with no literal form, so the script cannot be`,
+    `// printed. The minimal stream, in order:`,
+    `//   ${minimal.ops.map(describeOp).join(' -> ')}`,
+    `// The REAL values are on violations[i].minimal.ops — pass them back as \`script\`.`,
+  ].join('\n')
+}
+
+/** One op as a paste-able object literal. */
+function renderScriptOp(op: CheckMinimalOp): string {
+  if (op.kind === 'advance') {
+    return `{ kind: 'advance', dtMs: ${op.dtMs} }`
+  }
+  if (op.kind === 'noop') {
+    return `{ kind: 'noop' }`
+  }
+  const event = singleQuoted(op.event)
+  return op.args === undefined || op.args.length === 0
+    ? `{ kind: 'fire', event: ${event} }`
+    : `{ kind: 'fire', event: ${event}, args: ${JSON.stringify(op.args)} }`
+}
+
+/**
+ * A single-quoted JS string literal. `JSON.stringify` would be correct too, but
+ * it double-quotes — and a snippet that mixes quote styles inside one object
+ * literal reads like a bug in the tool that printed it.
+ */
+function singleQuoted(s: string): string {
+  return `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n')}'`
+}
+
+/** One op as a one-line human summary (the non-printable fallback). */
+function describeOp(op: CheckMinimalOp): string {
+  if (op.kind === 'advance') {
+    return `advance ${op.dtMs}ms`
+  }
+  if (op.kind === 'noop') {
+    return 'noop'
+  }
+  const n = op.args?.length ?? 0
+  if (n === 0) {
+    return `fire ${op.event}()`
+  }
+  return `fire ${op.event}(${op.argsNote === 'non-serializable' ? `${n} non-printable arg(s)` : `${n} arg(s)`})`
+}
+
 /**
  * W8/V7 — evaluate the consumer's {@link MachineInvariant}s on the INITIAL
  * configuration: the state the machine settles into after the mandatory
@@ -1150,6 +1863,13 @@ function livenessReason(l: LivenessResult): string {
 function mapSimWarning(w: SimWarning): CheckWarning {
   if (w.kind === 'timer-escape') {
     return { kind: 'timer-escape', detail: w.message }
+  }
+  // W9 remediation: keep the two warning surfaces consistent — a
+  // `budget-progressing` finding must not be laundered into the
+  // 'residual-rejection' catch-all, which would name a completely different
+  // (and much more alarming) condition than the one observed.
+  if (w.kind === 'budget-progressing') {
+    return { kind: 'budget-progressing', detail: w.message }
   }
   return { kind: 'residual-rejection', detail: w.message }
 }

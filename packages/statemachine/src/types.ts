@@ -136,10 +136,19 @@ export interface MonitorMetricsSnapshot {
  * `invoke.abort` is the one exception to "begin starts something": an abort is an
  * instantaneous POINT, so it is emitted as an ADJACENT `begin`+`end` pair with no
  * work in between (`edge` has no `'point'` member and the union is kept narrow).
+ * `kind:'raise'` follows that SAME precedent for the same reason: an internal
+ * event RAISE is instantaneous (the event is pushed onto the internal queue; the
+ * transition it later drives is a separate, already-observable fact), so it too is
+ * an ADJACENT `begin`+`end` pair. `edge` is deliberately NOT widened — the
+ * "a `begin` with no `end` means HUNG" contract must stay unambiguous.
  *
  * ## What this channel does NOT see
  * - the TRANSITION's own callbacks: `onTransition`, the event-level `onBefore` /
- *   `onAfter`. Only STATE hooks, invoke work and guards are instrumented.
+ *   `onAfter`. Only STATE hooks, invoke work, guards and internal event RAISES are
+ *   instrumented.
+ * - an EXTERNAL `fireEvent`: `kind:'raise'` covers the ENGINE-INTERNAL raise path
+ *   only (the five sites that push onto the internal queue). A caller-issued event
+ *   is already visible to the caller.
  * - the `onError` handler itself (by construction — see the pairing note above).
  * - the `errorState` fallback path emits NO `enter` events: that recovery commits
  *   the error configuration DIRECTLY, bypassing the enter-hook executor. This is
@@ -172,16 +181,22 @@ export interface LifecycleEvent {
    * Coarse family of the instrumented callback. EXTENSIBLE — never switch
    * exhaustively.
    */
-  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard'
+  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
   /**
    * Precise callback slot. EXTENSIBLE. Currently one of `'onBeforeEnter'`,
    * `'onEnter'`, `'onAfterEnter'`, `'onBeforeExit'`, `'onExit'`, `'onAfterExit'`,
-   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'guard'`.
+   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'guard'`, and the
+   * five `kind:'raise'` origins: `'raise.done'`, `'raise.invoke.timer'`,
+   * `'raise.invoke.onDone'`, `'raise.invoke.onError'`, `'raise.invoke.resume'`.
    */
   readonly hook: string
   /**
    * Full dot-path of the state the callback belongs to (for `kind:'guard'`, the
    * transition's `from` selector). Hierarchy = dot-parsing of this string.
+   *
+   * For `kind:'raise'` it is the ORIGIN of the raise, which is a real dot-path:
+   * the COMPOSITE whose completion produced `done.state.<C>` for `'raise.done'`,
+   * and the invoke-OWNING leaf for the four `raise.invoke.*` hooks.
    */
   readonly state: string
   /**
@@ -216,6 +231,22 @@ export interface LifecycleEvent {
    * EXIT step that cancelled it — so an operation's begin and its abort
    * legitimately report DIFFERENT ids. Pair them by `owner` + `state` +
    * adjacency, not by `microstep`.
+   *
+   * RAISE ASYMMETRY (same family, stated explicitly because the three raise
+   * origins differ from each other):
+   * - `'raise.done'` carries the CURRENT microstep — the completion scan runs
+   *   INSIDE the microstep whose state write produced the done configuration, so
+   *   this id is the one that caused the raise;
+   * - `'raise.invoke.timer'` / `'raise.invoke.onDone'` / `'raise.invoke.onError'`
+   *   carry the ARMING microstep (carried in the launch closure), exactly like the
+   *   `invoke` records they belong to — NOT the step at which the timer/promise
+   *   actually fired, which has no microstep of its own;
+   * - `'raise.invoke.resume'` carries the reserved `0`: a timer resumed from a
+   *   deserialized snapshot fires outside any event-driven microstep.
+   *
+   * A consumer must therefore NOT read a raise record's `microstep` as "the step
+   * in which the raised event was PROCESSED" — the raised event is drained later,
+   * in its own microstep(s).
    */
   readonly microstep: number
   /** Per-machine monotonic record counter; the total order of this stream. */
@@ -225,7 +256,16 @@ export interface LifecycleEvent {
    * avoid colliding with the unrelated {@link ErrorContext.phase}.
    */
   readonly edge: 'begin' | 'end'
-  /** Name of the event that drove this microstep, when there is one. */
+  /**
+   * Name of the event that drove this microstep, when there is one.
+   *
+   * For `kind:'raise'` this is the RAISED event name — the primary payload of the
+   * record (`'done.state.<C>'` for `'raise.done'`, the invoke `event`/`onDone`/
+   * `onError` name otherwise). It is ALWAYS present on a raise record. The raise
+   * ARGUMENTS are deliberately NOT carried: they are arbitrary objects with no
+   * deterministic serialization, and this channel must stay allocation-light and
+   * replay-stable.
+   */
   readonly event?: string
   /** Present on `edge:'end'`: `true` when the callback THREW / rejected. */
   readonly failed?: boolean

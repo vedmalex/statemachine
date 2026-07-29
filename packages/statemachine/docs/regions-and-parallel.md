@@ -178,6 +178,12 @@ Semantics worth knowing:
   non-final; `done.state.C` fires only at all-final.
 - `isDone(compositeId)` is a public predicate usable as a guard; it returns true exactly while the
   all-final configuration is active.
+- Completion is a property of the **committed configuration**, not of the path taken into it. A
+  recovery into the configured `errorState` (`StateMachineOptions.errorState`, zombie-state
+  prevention) commits its configuration directly, and that configuration is checked for completion
+  like any other: if the recovery leaves every region final, `done.state.<C>` is raised. The
+  recovery is still a recovery — the attempted transition reports `fired: false` — and the join
+  stays edge-triggered, so a recovery into a partially-final configuration raises nothing.
 
 > Scope note: this is UML *all-regions-final* completion. There is no per-region `In()` join across
 > partial configurations beyond `isDone`/`done.state`.

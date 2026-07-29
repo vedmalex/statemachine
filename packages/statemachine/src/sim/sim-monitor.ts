@@ -42,6 +42,26 @@ import type { LifecycleObservation } from './invariants'
 const LIFECYCLE_BUFFER_LIMIT = 200_000
 
 /**
+ * W9/Г1 — SEPARATE hard cap for the `kind:'raise'` stream, with its OWN truncation
+ * flag. Two reasons it is not folded into {@link LIFECYCLE_BUFFER_LIMIT}:
+ *
+ * 1. VOLUME ASYMMETRY. Raises are point events emitted only by the five internal
+ *    raise sites, so a run emits ORDERS OF MAGNITUDE fewer of them than callback
+ *    begin/end pairs. Sharing one cap would let a hook-heavy run exhaust the budget
+ *    and silently blind the I-5 join oracle even though the raise stream itself is
+ *    tiny — the same reasoning that keeps `invokeActionInFlight` maintained
+ *    REGARDLESS of the buffer cap.
+ * 2. INDEPENDENT VACUITY. I-5 must go vacuous exactly when the RAISE stream is
+ *    incomplete, not when an unrelated callback stream overflowed. A shared flag
+ *    would couple the two oracles' soundness windows.
+ *
+ * Truncation semantics match the main buffer: the buffer STOPS growing (never
+ * rotates), so a truncated PREFIX is intact and the counting oracle can only miss a
+ * late violation (false-NEGATIVE) — and it is told to go vacuous anyway.
+ */
+const RAISE_BUFFER_LIMIT = 50_000
+
+/**
  * Deterministic {@link IMonitor}. All state is integer counters plus a
  * non-hashed latency accumulator (the Step-8 perf hook) and the W8/V3a lifecycle
  * observation buffer.
@@ -80,6 +100,18 @@ export class SimMonitor implements IMonitor {
   private readonly lifecycle: LifecycleObservation[] = []
   /** True once {@link LIFECYCLE_BUFFER_LIMIT} was hit and records started dropping. */
   private lifecycleTruncated = false
+  /**
+   * W9/Г1 — the retained `kind:'raise'` stream, in engine `seq` order. Read by the
+   * I-5 join checker through {@link CheckerContext.raises}. NEVER hashed.
+   *
+   * Raise records live HERE and are deliberately NOT also pushed into
+   * {@link lifecycle}: the main buffer is the CALLBACK TIMELINE (what I-4 orders),
+   * and interleaving instantaneous point records into it would consume the shared
+   * cap without adding anything any callback-keyed oracle reads.
+   */
+  private readonly raises: LifecycleObservation[] = []
+  /** True once {@link RAISE_BUFFER_LIMIT} was hit and raise records started dropping. */
+  private raisesTruncated = false
   /**
    * W8/V8 — live count of `invoke.action` callbacks whose `begin` has no matching
    * `end` yet. This is the ISS-030 half of the settledness signal: a STRING-METHOD
@@ -134,6 +166,26 @@ export class SimMonitor implements IMonitor {
         this.invokeActionInFlight -= 1
       }
     }
+    // W9/Г1 — the raise plane is retained in its OWN buffer under its OWN cap, and
+    // is routed BEFORE the callback-buffer cap test so a saturated callback stream
+    // can never silently blind the I-5 join oracle.
+    if (event.kind === 'raise') {
+      if (this.raises.length >= RAISE_BUFFER_LIMIT) {
+        this.raisesTruncated = true
+        return
+      }
+      this.raises.push({
+        kind: event.kind,
+        hook: event.hook,
+        state: event.state,
+        owner: event.owner,
+        microstep: event.microstep,
+        seq: event.seq,
+        edge: event.edge,
+        ...(event.event !== undefined ? { event: event.event } : {}),
+      })
+      return
+    }
     if (this.lifecycle.length >= LIFECYCLE_BUFFER_LIMIT) {
       this.lifecycleTruncated = true
       return
@@ -165,6 +217,26 @@ export class SimMonitor implements IMonitor {
   /** True iff the lifecycle buffer hit its cap and stopped retaining records. */
   isLifecycleTruncated(): boolean {
     return this.lifecycleTruncated
+  }
+
+  /**
+   * W9/Г1 — the retained `kind:'raise'` stream, in engine `seq` order. Returned BY
+   * REFERENCE (same live-view contract as {@link getLifecycle}) so a
+   * {@link CheckerContext} built once at `init()` observes the run as it grows.
+   * Consumers MUST treat it as read-only.
+   */
+  getRaises(): readonly LifecycleObservation[] {
+    return this.raises
+  }
+
+  /**
+   * True iff the RAISE buffer hit its cap and stopped retaining records. The I-5
+   * join oracle MUST go vacuous on this: a counting predicate over a truncated
+   * raise stream would see fewer raises than the run really performed and
+   * manufacture a false positive.
+   */
+  isRaisesTruncated(): boolean {
+    return this.raisesTruncated
   }
 
   /**

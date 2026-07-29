@@ -134,12 +134,15 @@ export interface CaptureSink {
 
 // @public
 export interface CheckerContext {
+    readonly frames?: readonly TraceFrame[];
     // (undocumented)
     readonly graph: ConfigGraph;
     // (undocumented)
     readonly header: CanonicalHeader;
     readonly lifecycle?: readonly LifecycleObservation[];
     readonly maxQueueDepth?: number;
+    readonly raises?: readonly LifecycleObservation[];
+    readonly raisesTruncated?: boolean;
 }
 
 // @public (undocumented)
@@ -152,6 +155,31 @@ export interface CheckEventSpec<T extends object> {
 
 // @public (undocumented)
 export function checkMachine<T extends object>(config: StateMachineConfig<T>, owner: OwnerSource<T>, options?: CheckOptions<T>): Promise<CheckReport>;
+
+// @public
+export type CheckMinimalOp = {
+    readonly kind: 'fire';
+    readonly event: string;
+    readonly args?: readonly unknown[];
+    readonly argsNote?: 'non-serializable';
+} | {
+    readonly kind: 'advance';
+    readonly dtMs: number;
+} | {
+    readonly kind: 'noop';
+};
+
+// @public
+export interface CheckMinimalRepro {
+    readonly ops: readonly CheckMinimalOp[];
+    // (undocumented)
+    readonly provenance: {
+        readonly runs: number;
+        readonly moves: number;
+        readonly minimal: boolean;
+    };
+    readonly trace: readonly TraceFrame[];
+}
 
 // @public (undocumented)
 export interface CheckOptions<T extends object> {
@@ -167,8 +195,12 @@ export interface CheckOptions<T extends object> {
     readonly onRealTimerEscape?: 'warn' | 'fail' | 'ignore';
     // (undocumented)
     readonly runs?: number;
+    readonly script?: readonly CheckScriptOp[];
     // (undocumented)
     readonly seed?: string | bigint;
+    readonly shrink?: boolean | {
+        readonly budget?: Partial<OpShrinkBudget>;
+    };
     // (undocumented)
     readonly steps?: number;
 }
@@ -232,11 +264,15 @@ export interface CheckRng {
     pick<A>(xs: readonly A[]): A;
 }
 
+// @public
+export type CheckScriptOp = ShrinkableOp;
+
 // @public (undocumented)
 export interface CheckViolation {
     // (undocumented)
     readonly invariant: string;
     readonly kind: 'engine' | 'builtin' | 'user';
+    readonly minimal?: CheckMinimalRepro;
     readonly reproCode: string;
     // (undocumented)
     readonly witness: string;
@@ -367,6 +403,9 @@ export const DEFAULT_GENOPS_PARAMS: GenOpsParams;
 
 // @public
 export const DEFAULT_MAX_TURNS = 1024;
+
+// @public (undocumented)
+export const DEFAULT_OP_SHRINK_BUDGET: OpShrinkBudget;
 
 // @public
 export const DEFAULT_SHRINK_BUDGET: ShrinkBudget;
@@ -818,7 +857,7 @@ export interface LifecycleObservation {
     // (undocumented)
     readonly hook: string;
     // (undocumented)
-    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard';
+    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise';
     // (undocumented)
     readonly microstep: number;
     // (undocumented)
@@ -1063,6 +1102,23 @@ export interface OpDriverView {
     } | {
         kind: 'noop';
     }): Promise<unknown>;
+}
+
+// @public (undocumented)
+export interface OpShrinkBudget {
+    readonly maxRuns: number;
+    readonly maxStagnantRounds: number;
+}
+
+// @public
+export type OpShrinkPredicate = (candidate: readonly ShrinkableOp[]) => Promise<boolean>;
+
+// @public (undocumented)
+export interface OpShrinkResult {
+    readonly minimal: boolean;
+    readonly moves: number;
+    readonly ops: readonly ShrinkableOp[];
+    readonly runs: number;
 }
 
 // @public
@@ -1314,7 +1370,7 @@ export function settleMacrostep(args: SettleArgs): Promise<SettleResult>;
 export type SettlePolicy = 'safety' | 'liveness';
 
 // @public
-export type SettleReason = 'microtask-budget' | 'WAITING_ON_TIMER' | 'WAITING_ON_TRANSITION_TIMEOUT' | 'WAITING_ON_INTERNAL';
+export type SettleReason = 'microtask-budget' | 'budget-progressing' | 'WAITING_ON_TIMER' | 'WAITING_ON_TRANSITION_TIMEOUT' | 'WAITING_ON_INTERNAL';
 
 // @public
 export interface SettleResult {
@@ -1349,6 +1405,21 @@ export function shrink(spec: ScenarioSpec, target: Violation, opts?: {
 }): Promise<ShrinkResult>;
 
 // @public
+export type ShrinkableOp = {
+    readonly kind: 'fire';
+    readonly event: string;
+    readonly args?: readonly unknown[];
+    readonly opId?: string;
+} | {
+    readonly kind: 'advance';
+    readonly dtMs: number;
+    readonly opId?: string;
+} | {
+    readonly kind: 'noop';
+    readonly opId?: string;
+};
+
+// @public
 export interface ShrinkBudget {
     readonly maxRuns: number;
     readonly maxStagnantRounds: number;
@@ -1357,6 +1428,9 @@ export interface ShrinkBudget {
 
 // @public
 export function shrinkCacheKey(spec: ScenarioSpec): string;
+
+// @public
+export function shrinkOps(ops: readonly ShrinkableOp[], predicate: OpShrinkPredicate, budget?: OpShrinkBudget): Promise<OpShrinkResult>;
 
 // @public
 export interface ShrinkResult {
@@ -1447,10 +1521,12 @@ export class SimMonitor implements IMonitor {
     getErrorCount(): number;
     getFailureCount(): number;
     getLifecycle(): readonly LifecycleObservation[];
+    getRaises(): readonly LifecycleObservation[];
     getTransitionContexts(): readonly TransitionContext[];
     getTransitionCount(): number;
     invokeActionInFlightCount(): number;
     isLifecycleTruncated(): boolean;
+    isRaisesTruncated(): boolean;
     // (undocumented)
     recordError(_error: Error, _context?: ErrorContext): void;
     recordLifecycle(event: LifecycleEvent): void;
@@ -1469,6 +1545,7 @@ export interface SimOptions {
     readonly mode?: 'safety' | 'liveness' | 'both';
     // (undocumented)
     readonly onTrace?: (frame: TraceFrame) => void;
+    readonly script?: readonly DriverOp[];
     // (undocumented)
     readonly seed: bigint | string;
     // (undocumented)
@@ -1499,6 +1576,7 @@ export interface SimResult {
     readonly metrics: PerfSample;
     // (undocumented)
     readonly ok: boolean;
+    readonly ops?: readonly DriverOp[];
     readonly oraclesRun: number;
     // (undocumented)
     readonly seed: string;
@@ -1561,7 +1639,15 @@ export interface SimWarning {
     // (undocumented)
     readonly count?: number;
     // (undocumented)
-    readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles' | 'lifecycle-truncated';
+    readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles' | 'lifecycle-truncated'
+    /**
+    * The HARNESS ran out of per-macrostep turn budget while the machine was
+    * still observably working (`settleReason:'budget-progressing'`). Advisory
+    * only — it never flips `ok`, because the machine did nothing wrong: the
+    * run simply did not get to watch it finish. Emitted at most ONCE per run;
+    * `count` carries how many boundaries hit it.
+    */
+    | 'budget-progressing';
     // (undocumented)
     readonly message: string;
 }
@@ -1584,14 +1670,17 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
         [key: string]: string;
     }): void;
     canFireEvent(eventName: keyof SMConfig['events'] | '*', adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
+    canFireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*'): boolean;
     // Warning: (ae-forgotten-export) The symbol "StateName" needs to be exported by the entry point index.d.ts
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
     // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
-    // Warning: (ae-forgotten-export) The symbol "FireResult_2" needs to be exported by the entry point index.d.ts
     fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult_2>;
+    // Warning: (ae-forgotten-export) The symbol "FireResult_2" needs to be exported by the entry point index.d.ts
+    fireEventDetailedFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<FireResult_2>;
+    fireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<boolean>;
     // (undocumented)
     static fromData<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(config: SMConfig, initialState?: string, context?: TOwner, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     // (undocumented)
@@ -1601,6 +1690,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     static fromSecureJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): Promise<StateMachine<TOwner, SMConfig>>;
     // (undocumented)
     getAvailableEvents(adaptee?: Adapter<PropertiesOf<TOwner>>): string[];
+    getAvailableEventsFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): string[];
     // Warning: (ae-forgotten-export) The symbol "CompiledModel" needs to be exported by the entry point index.d.ts
     //
     // @internal
@@ -1873,7 +1963,23 @@ export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-platea
 /** Detail carrier for {@link CheckReport.nonConvergingRegions}. */
 | 'non-converging-region'
 /** The initial-configuration invariant pass could not run — see the detail. */
-| 'init-check-skipped';
+| 'init-check-skipped'
+/**
+* Minimization was DECLINED for the reported finding — see the detail for
+* which precondition failed. Its presence is the honest alternative to an
+* UNVERIFIED `minimal`: the violation stands, only the 1-minimal repro is
+* missing. Advisory (never a {@link FailCause}).
+*/
+| 'shrink-skipped'
+/**
+* The harness exhausted its per-macrostep TURN budget while the machine was
+* still observably working (`settleReason:'budget-progressing'`). The machine
+* did nothing wrong — the run just stopped watching before it settled, so the
+* remainder of that macrostep went unchecked. The drain resumes on the next
+* step, so raise `steps` to give the machine more total budget to finish in.
+* Advisory (never a {@link FailCause}, never flips `ok`).
+*/
+| 'budget-progressing';
 
 // @public
 export function wire<T extends object>(env: SimEnv, config: StateMachineConfig<T>, owner: T | Adapter<T>): StateMachine<T, StateMachineConfig<T>>;

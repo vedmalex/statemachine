@@ -208,6 +208,26 @@ export interface SimOptions {
    * payload, so the generated corpus stays byte-identical to pre-W8.
    */
   readonly eventPayload?: SimEventPayload
+  /**
+   * W9/Г3 SCRIPTED RUN — drive the run from a FIXED op stream instead of the
+   * PRNG. Op `i` of the script becomes the op of step `i`; once the script is
+   * exhausted every remaining step is a `noop`.
+   *
+   * This is the replay half of op-stream delta-debugging ({@link shrinkOps}): a
+   * candidate stream is re-driven against the SAME live config, so a finding
+   * reached with real closures and object payloads can be verified without any
+   * spec/corpus round-trip.
+   *
+   * Two contract points a caller must know:
+   *  - `eventPayload` is NOT consulted while a script is active. The script's
+   *    `fire` ops already carry MATERIALIZED args (they were recorded from a real
+   *    run), and re-drawing would overwrite the very values under test.
+   *  - the resulting {@link SimResult.traceHash} legitimately DIFFERS from the
+   *    PRNG-driven run the script was recorded from once the stream is reduced —
+   *    it is a hash of a different (shorter) trace. Compare the FINDING (a
+   *    violation fingerprint / a user-invariant witness), never the hash.
+   */
+  readonly script?: readonly DriverOp[]
   readonly onTrace?: (frame: TraceFrame) => void
 }
 
@@ -247,7 +267,19 @@ export type SimViolation = Violation & { readonly kind?: 'engine' | 'liveness' }
 // ============================================================================
 /** @unstable */
 export interface SimWarning {
-  readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles' | 'lifecycle-truncated'
+  readonly kind:
+    | 'timer-escape'
+    | 'unhandled-rejection'
+    | 'no-oracles'
+    | 'lifecycle-truncated'
+    /**
+     * The HARNESS ran out of per-macrostep turn budget while the machine was
+     * still observably working (`settleReason:'budget-progressing'`). Advisory
+     * only — it never flips `ok`, because the machine did nothing wrong: the
+     * run simply did not get to watch it finish. Emitted at most ONCE per run;
+     * `count` carries how many boundaries hit it.
+     */
+    | 'budget-progressing'
   readonly message: string
   readonly count?: number
 }
@@ -285,6 +317,17 @@ export interface SimResult {
   readonly livelocks?: readonly LivenessResult[]
   /** Non-fatal observability findings (A5 real-timer escape, residual rejection). */
   readonly warnings?: readonly SimWarning[]
+  /**
+   * W9/Г3 — the ops this run ACTUALLY executed, in order: one entry per driven
+   * step, with `fire` args MATERIALIZED (the value the payload generator
+   * returned, not the generator). Re-feeding this array as
+   * {@link SimOptions.script} re-drives the identical run.
+   *
+   * This is what makes the run's op stream shrinkable ({@link shrinkOps}) even
+   * when the payload is an opaque object: the values ride along in memory and
+   * are never required to survive a corpus round-trip.
+   */
+  readonly ops?: readonly DriverOp[]
 }
 
 /**
@@ -312,13 +355,23 @@ export interface SimResult {
  *  - I-4 is INCLUDED (W8/V3a): it reads the CAPTURED lifecycle stream and fires only
  *    on a genuine in-microstep ancestor/descendant inversion. It is VACUOUS when no
  *    lifecycle plane is present, so it cannot fabricate a violation.
- *  - I-5 is EXCLUDED: it remains a documented no-op (the `done.state.<C>` RAISE is
- *    still not soundly observable — see invariants.ts), so including it adds nothing.
+ *  - I-5 is now INCLUDED (W9/Г1) — it stopped being a documented no-op. The engine
+ *    emits `kind:'raise'` records at all five internal raise sites, so the oracle
+ *    COUNTS raises against the `doneDelta` `false → true` edges instead of
+ *    re-implementing selection semantics (the fabricated-oracle trap that produced
+ *    this invariant's earlier shipped false positive). It is sound by CONSTRUCTION
+ *    in the counting DIRECTION: every microstep-vs-macrostep granularity mismatch
+ *    can only give `raises >= edges`, and it is VACUOUS when the raise plane is
+ *    absent or truncated. Its remaining false-positive surfaces (edge-triggered
+ *    plateaus, post-restore, corrupt-state probes, the init edge, undeclared
+ *    composites) are each excluded explicitly and each pinned by a test; the §4а.2
+ *    zero-false-positive corpus guards the set as a whole.
  */
 const DEFAULT_BUILTIN_INVARIANT_IDS: ReadonlySet<string> = new Set([
   'I-2',
   'I-3',
   'I-4',
+  'I-5',
   'I-6',
   'I-7',
   'I-9',
@@ -470,10 +523,11 @@ function emptyHeader(seed: string): CanonicalHeader {
     seed,
     configHash: '',
     engine: '@vedmalex/statemachine',
-    // '4': kept in lockstep with the driver's canonical header (C1 settleReason +
+    // '5': kept in lockstep with the driver's canonical header (C1 settleReason +
     // U1 WAITING_ON_INTERNAL re-semantization + W8/V5b doneDelta now populated on
-    // the verdict path). See driver.ts for the full version rationale.
-    version: '4',
+    // the verdict path + W9/Г2 the SettleReason union gaining 'budget-progressing').
+    // See driver.ts for the full version rationale.
+    version: '5',
     runtime: 'node-sim-v1',
     prngVersion: 'splitmix64-bigint-v1',
     errorHandlerEnabled: true,
@@ -551,6 +605,20 @@ export class Simulator<T extends object = object> {
    * op-selection stream.
    */
   private payloadRng?: SimPayloadRng
+  /**
+   * W9/Г3: the fixed op stream (opts.script). Absent ⇒ the ordinary PRNG-driven
+   * op selection AND zero behavior change (the branch is skipped before any
+   * probe), so a non-scripted run reproduces byte-identically.
+   */
+  private readonly script: readonly DriverOp[] | undefined
+  /**
+   * W9/Г3: the ops actually driven, accumulated in step order. Recorded AFTER
+   * `pickOp` resolved them, so a `fire` entry carries the MATERIALIZED args the
+   * payload generator returned — the property the op-stream shrinker depends on
+   * (a generator could not be re-run against a reduced stream and still yield the
+   * same values).
+   */
+  private readonly executedOps: DriverOp[] = []
   /** The resolved owner adapter, kept so a payload snapshot can read live data. */
   private ownerAdapter?: Adapter<T>
 
@@ -600,6 +668,8 @@ export class Simulator<T extends object = object> {
     this.maxQueueDepth = opts.maxQueueDepth
     // W8: absent ⇒ arg-free fuzzing, and `pickOp` makes ZERO extra PRNG draws.
     this.eventPayload = opts.eventPayload
+    // W9/Г3: absent ⇒ PRNG-driven op selection, unchanged.
+    this.script = opts.script
     if (opts.onTrace) {
       this.onTrace = opts.onTrace
     }
@@ -657,6 +727,7 @@ export class Simulator<T extends object = object> {
     // (when invariants run) and the liveness cycle-window K = stateCount + 1 (A4).
     const graph: ConfigGraph = buildConfigGraph(resolved.config)
     this.stateCount = Math.max(1, graph.states.size)
+    const simMonitor = this._env.monitor as SimMonitor
     if (this.invariants.length > 0) {
       this.checkerCtx = {
         graph,
@@ -667,7 +738,17 @@ export class Simulator<T extends object = object> {
         // BY REFERENCE so this once-built context observes the run as it grows. It
         // is not a live engine read — the monitor seam recorded these during the
         // drain, exactly like the doneDelta projection.
-        lifecycle: (this._env.monitor as SimMonitor).getLifecycle(),
+        lifecycle: simMonitor.getLifecycle(),
+        // W9/Г1: the CAPTURED raise stream, on the same by-reference live-view
+        // contract — the I-5 join oracle counts these against the doneDelta edges.
+        raises: simMonitor.getRaises(),
+        // A GETTER, not a snapshot: truncation flips DURING the run, and this
+        // context is built ONCE. A captured `false` would tell the oracle the raise
+        // stream is complete when it no longer is — i.e. it would silently turn a
+        // vacuity signal into a false-positive licence.
+        get raisesTruncated(): boolean {
+          return simMonitor.isRaisesTruncated()
+        },
       }
     }
 
@@ -691,6 +772,10 @@ export class Simulator<T extends object = object> {
     }
     const op = this.pickOp()
     const result = await this.driver.step(op)
+    // W9/Г3: record what was DRIVEN (post-execution), so `SimResult.ops` is a
+    // faithful replay script rather than a plan. `op` already holds the drawn
+    // args — `pickOp` materialized them.
+    this.executedOps.push(op)
     this.stepCount += 1
     const trace = this.driver.trace()
     // SAFETY: evaluate the BLIND invariant registry against the accumulating
@@ -795,6 +880,22 @@ export class Simulator<T extends object = object> {
     // becomes a livelocks[] headline and forces ok:false. C2 (progress-aware
     // self-loop) must precede this so a legitimate progressing self-loop is not a
     // false STUCK once analyzeLiveness is authoritative for the verdict.
+    // W9 remediation: `LivenessParams.microtaskBudgetExhausted` had NO producer —
+    // `analyzeLiveness` consumed a flag nobody ever set, so a wedged drain never
+    // reached the liveness verdict. It is fed HERE, from the trace the run
+    // actually produced.
+    //
+    // CRITICAL — read `'microtask-budget'` ONLY, NEVER `'budget-progressing'`.
+    // They are both budget exhaustions, but they mean opposite things: the first
+    // is a wedged drain (no recent observable movement), the second is a long yet
+    // perfectly LEGAL delay-0 chain that simply outran the turn budget. Routing
+    // `'budget-progressing'` in here would re-create exactly the false positive
+    // this whole wave removed — a correct machine convicted of a livelock. The
+    // budget-progressing case is surfaced as an advisory WARNING below instead.
+    const microtaskBudgetExhausted = trace.frames.some(
+      (f) => f.settleReason === 'microtask-budget',
+    )
+
     let liveness: LivenessResult | undefined
     let livelocks: readonly LivenessResult[] | undefined
     if (this.livenessEnabled) {
@@ -802,6 +903,7 @@ export class Simulator<T extends object = object> {
       liveness = analyzeLiveness(samples, {
         stateCount: this.stateCount,
         budgetVirtualMs: LIVENESS_VIRTUAL_BUDGET_MS,
+        microtaskBudgetExhausted,
       })
       if (liveness.verdict !== 'PROGRESSED') {
         livelocks = [liveness]
@@ -819,6 +921,35 @@ export class Simulator<T extends object = object> {
         kind: 'lifecycle-truncated',
         message:
           'the lifecycle observation buffer was truncated: the ordering oracle (I-4) saw only a PREFIX of the callback stream, so a late ordering violation could have been missed',
+      })
+    }
+    // W9/Г1: the raise buffer has its OWN cap, and its truncation makes the I-5
+    // join oracle go VACUOUS (a counting predicate over an under-counted stream
+    // would false-positive). Silence would make the run look more verified than it
+    // is, so it is surfaced on the SAME frozen warning kind.
+    if ((this._env.monitor as SimMonitor).isRaisesTruncated?.()) {
+      warnings.push({
+        kind: 'lifecycle-truncated',
+        message:
+          'the RAISE observation buffer was truncated: the parallel-join oracle (I-5) went VACUOUS for this run because a counting predicate over a truncated raise stream cannot distinguish a dropped record from a missing raise',
+      })
+    }
+    // W9 remediation: a `budget-progressing` boundary is NOT a defect — the machine
+    // was still observably moving when the harness ran out of per-macrostep turns.
+    // It is also not nothing: the run stopped watching before the machine finished,
+    // so anything that would have happened later went unchecked. Surfaced as an
+    // advisory warning (never a verdict — `ok` is untouched) and DEDUPED to one per
+    // run: a long chain trips it on every step, and N identical warnings would bury
+    // the report without adding information. `count` carries the multiplicity.
+    const progressingFrames = trace.frames.filter(
+      (f) => f.settleReason === 'budget-progressing',
+    ).length
+    if (progressingFrames > 0) {
+      warnings.push({
+        kind: 'budget-progressing',
+        message:
+          'the per-macrostep turn budget was exhausted while the machine was still making observable progress, so this run stopped watching before the machine settled. The drain resumes on the NEXT step, so raising `steps` gives the machine more total budget to finish in: a finite chain of zero-delay hops does eventually settle that way, a real livelock reports this at every `steps` value you try — which is the signal to go looking for one.',
+        count: progressingFrames,
       })
     }
     if (guardReport.timerEscapes > 0) {
@@ -857,6 +988,9 @@ export class Simulator<T extends object = object> {
       ...(liveness !== undefined ? { liveness } : {}),
       ...(livelocks !== undefined ? { livelocks } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
+      // W9/Г3: always present (a defensive copy — the Simulator keeps mutating
+      // its own array if the caller steps further).
+      ops: this.executedOps.slice(),
       metrics: zeroMetrics(trace.frames.length),
     }
   }
@@ -957,6 +1091,9 @@ export class Simulator<T extends object = object> {
    * Pick the next op (ISS-040 deterministic driving). Probes the available-event
    * set; PRNG-picks one to fire, else a noop.
    *
+   * W9/Г3 script: when `opts.script` is supplied it DISPLACES op selection
+   * entirely (see the branch below) — no probe, no PRNG draw, no payload draw.
+   *
    * W8 payload: when (and ONLY when) `opts.eventPayload` is supplied, the picked
    * event's arguments are drawn from it. The generator sees the pre-fire settled
    * snapshot and draws from a FORKED child PRNG, so the op-selection stream is
@@ -970,6 +1107,18 @@ export class Simulator<T extends object = object> {
    * unreachable (driver.ts module doc).
    */
   private pickOp(): DriverOp {
+    // W9/Г3 SCRIPTED RUN. Op `i` of the script drives step `i`; past the end of
+    // the script every step is a noop. Placed BEFORE the availability probe on
+    // purpose: a scripted `fire` is re-driven VERBATIM even if the engine no
+    // longer offers that event, because whether the reduced stream still
+    // reproduces the finding is exactly what the caller is asking — silently
+    // substituting a noop for an unavailable event would answer a different
+    // question (`fireEvent` on a disabled event is a no-op the engine already
+    // handles). `eventPayload` is NOT consulted: the script's args are the
+    // recorded, materialized ones.
+    if (this.script !== undefined) {
+      return this.script[this.stepCount] ?? { kind: 'noop', opId: `sim-op-${this.stepCount}` }
+    }
     const sm = this.machine
     if (!sm) {
       return { kind: 'noop' }

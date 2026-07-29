@@ -376,7 +376,7 @@ export interface LifecycleEvent {
     readonly event?: string;
     readonly failed?: boolean;
     readonly hook: string;
-    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard';
+    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise';
     readonly microstep: number;
     readonly outcome?: boolean;
     readonly owner: object;
@@ -655,12 +655,15 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
         [key: string]: string;
     }): void;
     canFireEvent(eventName: keyof SMConfig['events'] | '*', adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
+    canFireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*'): boolean;
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
     // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
     fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult>;
+    fireEventDetailedFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<FireResult>;
+    fireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<boolean>;
     // (undocumented)
     static fromData<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(config: SMConfig, initialState?: string, context?: TOwner, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     // (undocumented)
@@ -670,6 +673,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     static fromSecureJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): Promise<StateMachine<TOwner, SMConfig>>;
     // (undocumented)
     getAvailableEvents(adaptee?: Adapter<PropertiesOf<TOwner>>): string[];
+    getAvailableEventsFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): string[];
     // Warning: (ae-forgotten-export) The symbol "CompiledModel" needs to be exported by the entry point index.d.ts
     //
     // @internal
@@ -910,6 +914,6 @@ export interface ValidationWarning extends ValidationError {
 // types/monitoring.d.ts:207:9 - (ae-forgotten-export) The symbol "HealthCheckResult" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:208:9 - (ae-forgotten-export) The symbol "PerformanceMonitor" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:209:9 - (ae-forgotten-export) The symbol "MetricsCollector" needs to be exported by the entry point index.d.ts
-// types/types.d.ts:468:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
+// types/types.d.ts:508:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
 
 ```

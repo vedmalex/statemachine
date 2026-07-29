@@ -85,9 +85,16 @@ export interface ConfigGraph {
  *   conflate them.
  * - `owner` is a REFERENCE-identity discriminator (one machine can drive many
  *   objects). Never serialize it; never compare it structurally.
+ * - `kind:'raise'` is an INSTANTANEOUS point record (an adjacent `begin`+`end`
+ *   pair, the `invoke.abort` precedent), NOT a callback bracket. Its `event` is the
+ *   RAISED event name and is always present; its `state` is the raise ORIGIN (the
+ *   composite for `raise.done`, the invoke-owning leaf otherwise). Its `microstep`
+ *   is the arming id for the `raise.invoke.*` hooks and the CURRENT id for
+ *   `raise.done` (see types.ts RAISE ASYMMETRY) — never the step in which the
+ *   raised event is later PROCESSED.
  */
 export interface LifecycleObservation {
-  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard'
+  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
   readonly hook: string
   readonly state: string
   readonly owner: object
@@ -119,8 +126,41 @@ export interface CheckerContext {
    * callback timeline is a per-MICROSTEP structure with no 1:1 frame mapping, and
    * putting it on a frame would drag a non-deterministic `owner` object reference
    * into the content hash.
+   *
+   * Carries the CALLBACK TIMELINE only — `kind:'raise'` records live on their own
+   * stream ({@link raises}) with their own cap and truncation flag.
    */
   readonly lifecycle?: readonly LifecycleObservation[]
+  /**
+   * W9/Г1 — the CAPTURED `kind:'raise'` stream of this run, in engine `seq` order
+   * (every record has `kind === 'raise'`). This is the ENGINE-side proof that an
+   * internal event was actually raised — the signal that lets the I-5 join oracle
+   * COUNT raises instead of re-implementing the engine's selection semantics.
+   *
+   * ABSENT when the run wired no lifecycle sink ⇒ every raise-keyed oracle is
+   * VACUOUS (the I-4 convention: a missing observation plane must never manufacture
+   * a violation).
+   */
+  readonly raises?: readonly LifecycleObservation[]
+  /**
+   * W9/Г1 — true iff the raise buffer hit its cap and STOPPED retaining records.
+   * A counting oracle MUST treat this as VACUOUS: a truncated stream under-counts
+   * raises, and an under-count in a `edges > raises` predicate is exactly a FALSE
+   * POSITIVE on a correct machine.
+   */
+  readonly raisesTruncated?: boolean
+  /**
+   * The trace frames the sweep is running over, supplied by the RUNNER (which
+   * already holds the trace) so a `checkFinal` predicate can be a function of the
+   * whole frame sequence and not just the terminal {@link FinalState}.
+   *
+   * This does NOT weaken checker purity: they are the SAME captured frames a
+   * `checkStep` checker already receives one at a time — no live engine read is
+   * added. It exists because some sound predicates are inherently SEQUENCE-shaped
+   * (I-5 counts `false → true` transitions of the `doneDelta` projection across
+   * ADJACENT boundary frames), and a per-frame hook cannot see its predecessor.
+   */
+  readonly frames?: readonly TraceFrame[]
 }
 
 /**
@@ -394,7 +434,16 @@ const I3: Invariant = {
     // The §4а.2 zero-false-positive corpus carries string-method-invoke and
     // composite-join machines as the standing guard on this promotion.
     const legitimateWait =
-      frame.settleReason === 'WAITING_ON_TIMER' || frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT'
+      frame.settleReason === 'WAITING_ON_TIMER' ||
+      frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT' ||
+      // W9/Г2: the pump budget ran out while the machine WAS making observable
+      // progress (a long legal delay-0 invoke chain — ~40 hops exhaust the default
+      // 1024 turns, since each hop costs QUIET_FLUSH stabilisation turns). That is
+      // the HARNESS giving up, not a run-to-completion break: the machine reaches
+      // its final state when given a bigger budget. Reported as a liveness/budget
+      // concern instead. `microtask-budget` — exhaustion with NOTHING moving —
+      // REMAINS an I-3 witness.
+      frame.settleReason === 'budget-progressing'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&
@@ -545,71 +594,199 @@ const I4: Invariant = {
 }
 
 /**
- * I-5 PARALLEL-JOIN (step). When all regions of a declared composite reach final,
- * the engine raises `done.state.<C>`. The harness samples `isDone(C)` per declared
- * composite at each settle boundary and stores the boolean as `frame.doneDelta`
- * (the PUBLIC isDone(C) :1433; isCompositeDone :1366 is private). The checker reads
- * THIS captured projection — NEVER a live `sm.isDone()` (ADR-6 c3 purity).
+ * I-5 PARALLEL-JOIN (final, COUNTING). When all regions of a declared composite
+ * reach final, the engine MUST raise `done.state.<C>` — otherwise a consumer's
+ * completion handler silently never runs.
  *
- * TARGET class: a frame whose `doneDelta` marks a composite done BUT the declared
- * `done.state.<C>` was never raised. I-5 remains a DOCUMENTED NO-OP: post-W8 the
- * `doneDelta` half of the observation plane is real on the verdict path, but the
- * RAISE itself is still not soundly observable. See the body comment for exactly
- * which blocker closed, which residual remains, and why fabricating teeth for it
- * would false-positive on a correct machine.
+ * ## The two halves of the observation
+ * - "it SHOULD have been raised": the harness samples `isDone(C)` per declared
+ *   composite at each settle boundary and stores the boolean as `frame.doneDelta`
+ *   (the PUBLIC isDone(C); `isCompositeDone` is private). ENTERING the done
+ *   configuration is a `false → true` EDGE of that projection.
+ * - "it WAS raised": the engine's `kind:'raise'` lifecycle records
+ *   ({@link CheckerContext.raises}) — W9/Г1 made the internal raise OBSERVABLE.
+ *
+ * Both halves are CAPTURED projections read from the context; the checker makes no
+ * live engine read (ADR-6 c3 purity).
+ *
+ * ## Predicate (per declared composite C)
+ * ```
+ * edges(C)  = # of ADJACENT boundary-frame pairs (prev,cur) with
+ *             prev.doneDelta[C] === false && cur.doneDelta[C] === true
+ * raises(C) = # of raise records with edge:'begin' and event === 'done.state.'+C
+ * VIOLATION ⇔ edges(C) > raises(C)
+ * ```
+ *
+ * ## Why `>` and not a per-edge match — the ONLY sound direction
+ * The two sides are counted at DIFFERENT GRANULARITIES, deliberately. The engine
+ * checks the done edge per MICROSTEP; the harness samples `doneDelta` per settle
+ * BOUNDARY (macrostep). Inside one macrostep a composite's configuration may blink
+ * done → undone → done: the engine correctly raises TWICE, while the boundary diff
+ * sees ONE edge. Every granularity mismatch therefore pushes in the SAME direction,
+ * `raises >= edges`, so it can only make the predicate MORE permissive. A DEFICIT
+ * (`edges > raises`) has no such explanation: it means the run entered a declared
+ * composite's done configuration more times than the engine raised its event.
+ *
+ * Note what this does NOT do: it never asks "was a transition for `done.state.<C>`
+ * ENABLED here?". That question is the fabricated-oracle trap this invariant
+ * already fell into once (the shipped W5b false positive) — answering it means
+ * REPLICATING selection semantics (wildcard/ancestor `from` selectors, `'a|b'`
+ * lists, LCA conflict resolution, documentIndex priority), and every divergence
+ * from the engine would be a false positive on a CORRECT machine. Counting needs
+ * none of it: a raise that matched no candidate transition is still a RAISE, and it
+ * is now recorded as one.
+ *
+ * ## The false-positive surfaces this predicate must (and does) avoid
+ * - EDGE-TRIGGERED join: a composite that STAYS all-final is not re-raised. Only
+ *   `false → true` counts, so a plateau creates no expectation.
+ * - `restoreState` deliberately does NOT re-fire the join (persistence.test.ts), so
+ *   any step carrying a `synthetic:'post-restore'` frame is excluded wholesale.
+ * - A composite already all-final AT START: boundary index 0 has no predecessor, so
+ *   the init edge is never counted (an initial done configuration DOES raise, which
+ *   would only add to `raises` — the exclusion stays on the safe side either way).
+ * - The corrupt-state probe writes an all-final configuration DIRECTLY through the
+ *   adapter seam, bypassing `checkCompletion` entirely — `synthetic:'corrupt-state'`
+ *   steps are excluded on the same rule.
+ * - An UNDECLARED `done.state.<C>` is never raised by the engine (it gates on
+ *   `events.has`), so the predicate keys ONLY on `graph.declaredDoneEvents`.
+ * - A TRUNCATED raise buffer under-counts raises ⇒ VACUOUS.
+ * - No lifecycle plane at all (`ctx.raises === undefined`) ⇒ VACUOUS (the I-4
+ *   convention: a missing observation plane never manufactures a violation).
+ *
+ * ## CLOSED RESIDUAL — the errorState fallback (fixed in the ENGINE, W9)
+ * This block used to document an OPEN residual: the `errorState` zombie-state
+ * recovery committed its error configuration directly (state_machine.ts, the
+ * `kind:'error-state'` branch) WITHOUT running `checkCompletion`, so an all-final
+ * recovery configuration would show a boundary edge the engine never signalled and
+ * this predicate could fire on a machine behaving as the engine specified.
+ *
+ * That is no longer true. The recovery path now calls
+ * `this.checkCompletion(obj, currentState, errorConfig)`
+ * (state_machine.ts:4587), pinned by `src/tests/error_state_join.test.ts`.
+ * Completion is a property of the COMMITTED configuration, not of how it was
+ * reached; `checkCompletion` is edge-triggered, so a configuration that was already
+ * done is not re-raised, and the recovery is still reported as a recovery
+ * (`fired:false`, `recordTransition(false)`). The engine question this note left
+ * open — harness tag vs. engine signal — was answered in favour of the ENGINE
+ * signalling completion, which is also why the oracle needed no broad exclusion
+ * that would have blunted it.
+ *
+ * The `'errorState-fallback'` synthetic tag remains in the exclusion set below and
+ * still has no producer; it is now HISTORICAL — reserved rather than load-bearing.
+ * Its exclusion is harmless (a tag nothing emits excludes nothing) and is kept so
+ * the exclusion exists before any future harness that does emit it.
+ *
+ * `doneDelta` is deliberately KEPT rather than replaced by the raise stream: the
+ * predicate is a CONJUNCTION of two independent halves (the raise proves "it
+ * happened", `doneDelta` proves "it had to happen"), and `doneDelta` also feeds the
+ * liveness `terminal` derivation.
+ *
+ * The CONVERSE direction ("a done event fired that was not declared / fell through
+ * a wildcard") is enforced separately, with its own teeth, by I-12.
  */
 const I5: Invariant = {
   id: 'I-5',
-  scope: 'step',
+  scope: 'final',
   capabilityTags: ['composite.parallel-join', 'composite.join.done-state'],
-  // ── W8/V5b RE-ASSESSMENT: still an HONEST no-op, with ONE of the two original
-  // blockers now genuinely CLOSED and the other NARROWED but NOT closed.
-  //
-  // CLOSED — (2) "doneDelta absent on the verdict path". The driver now samples
-  // `isDone(C)` per declared composite at EVERY settle boundary and stamps
-  // {@link TraceFrame.doneDelta} on the boundary frame, on the Simulator/runSafety
-  // path, not only in coverage.ts. `doneDelta` is real e2e data now (it also makes
-  // the liveness `terminal` derivation honest for the first time). This is why the
-  // trace-schema `header.version` moved '3' -> '4'.
-  //
-  // STILL OPEN — (1) INTERNAL-RAISE INVISIBILITY, narrowed to its residual. W8/V5a
-  // added the {@link TransitionContext} to the SUCCESS `recordTransition` call, so
-  // the observation plane can now attribute an internally-raised cause to the state
-  // write it produced. Combined with the two refusal sites the engine already
-  // reported, a raised `done.state.<C>` is observable when it
-  //   - COMMITTED a transition        (success + context.eventName), or
-  //   - was GUARD-REJECTED            (recordTransition(0,false,{eventName})), or
-  //   - ABORTED mid-microstep         (same refusal site).
-  // That is EXACTLY the distinction W5b's shipped false-positive lacked ("raise
-  // happened, guard said false, composite stayed all-final" is now distinguishable
-  // from "no raise"). It is NOT sufficient, because a THIRD case remains
-  // indistinguishable from "no raise": the event was raised and matched NO
-  // candidate transition at all. `selectTransition` records NOTHING when
-  // `rejected.length === 0` — no commit, no refusal, no guard record on the
-  // lifecycle channel (guards only run on candidates that already matched a
-  // `from` selector). A correct machine whose declared `done.state.<C>` has no
-  // enabled transition in the reached configuration is therefore identical, from
-  // outside, to a machine that failed to raise it.
-  //
-  // Closing THAT residual requires the oracle to decide "was a transition for
-  // `done.state.<C>` enabled in this configuration?" — i.e. to REPLICATE the
-  // engine's selection semantics (wildcard and ancestor `from` selectors,
-  // multi-source `'a|b'` lists, LCA/conflict resolution, documentIndex priority).
-  // A checker that re-implements selection is the fabricated-oracle trap: every
-  // divergence from the engine is a FALSE POSITIVE on a CORRECT machine, and this
-  // exact invariant already shipped one. It would also have to enumerate the
-  // engine's legitimate NON-raise paths exhaustively (the join is EDGE-triggered,
-  // so an initial configuration that is already all-final never raises, and
-  // `restoreState` deliberately does not re-fire the join — persistence.test.ts).
-  // Missing any one of them is another false positive.
-  //
-  // So I-5 stays a CLEAN backstop rather than shipping teeth that can fire on a
-  // correct machine. Its capability tags keep the parallel-join CLASS visible in
-  // the Step-9 coverage map, and the CONVERSE direction ("a done event fired that
-  // was not declared / fell through a wildcard") IS enforced with real teeth by
-  // I-12. Sound teeth here need an ENGINE-side signal that the raise happened
-  // (e.g. a lifecycle `kind:'raise'` edge), not another checker rewrite.
-  checkStep(): Violation | null {
+  checkFinal(_state, ctx): Violation | null {
+    const raises = ctx.raises
+    // VACUITY, in the two shapes that both mean "the raise plane cannot be
+    // counted": no plane wired at all, and a plane that stopped retaining records.
+    if (raises === undefined || ctx.raisesTruncated === true) {
+      return null
+    }
+    const frames = ctx.frames
+    if (frames === undefined || frames.length === 0) {
+      return null
+    }
+    const declared = ctx.graph.declaredDoneEvents
+    if (declared.size === 0) {
+      return null
+    }
+
+    // Steps carrying ANY harness-synthetic frame are excluded WHOLESALE:
+    // 'post-restore' (the engine deliberately does not re-fire the join),
+    // 'corrupt-state' (the probe writes the configuration past checkCompletion)
+    // and 'errorState-fallback' — HISTORICAL: the recovery path DOES run
+    // checkCompletion now (state_machine.ts:4587, W9), so this tag no longer names
+    // a real gap; it has no producer and is kept only so the exclusion exists
+    // before any future harness that emits it (see the CLOSED RESIDUAL note above).
+    // The first two produce a done configuration the engine was never asked to signal.
+    const syntheticSteps = new Set<number>()
+    for (const f of frames) {
+      if (f.synthetic !== undefined) {
+        syntheticSteps.add(f.step)
+      }
+    }
+
+    // BOUNDARY frames are exactly the ones carrying the doneDelta projection (the
+    // driver stamps it at the settle boundary of each step).
+    const boundaries = frames.filter(
+      (f) => f.doneDelta !== undefined && f.doneDelta.length > 0,
+    )
+    if (boundaries.length < 2) {
+      return null // no adjacent pair ⇒ no edge is observable
+    }
+
+    const edges = new Map<string, number>()
+    for (let i = 1; i < boundaries.length; i++) {
+      const prev = boundaries[i - 1]
+      const cur = boundaries[i]
+      if (prev === undefined || cur === undefined) {
+        continue
+      }
+      if (syntheticSteps.has(cur.step)) {
+        continue
+      }
+      const prevDone = new Map<string, boolean>()
+      for (const d of prev.doneDelta ?? []) {
+        prevDone.set(d.composite, d.done)
+      }
+      for (const d of cur.doneDelta ?? []) {
+        // Strict `false → true`: an ABSENT predecessor entry is NOT an edge (the
+        // composite was not sampled, so "it was not done" is not established).
+        if (d.done && prevDone.get(d.composite) === false) {
+          edges.set(d.composite, (edges.get(d.composite) ?? 0) + 1)
+        }
+      }
+    }
+    if (edges.size === 0) {
+      return null
+    }
+
+    // One `begin` per raise (the pair is adjacent begin+end); counting `end` too
+    // would double every raise and make the predicate unfirable.
+    const raised = new Map<string, number>()
+    for (const r of raises) {
+      if (r.kind !== 'raise' || r.edge !== 'begin' || r.event === undefined) {
+        continue
+      }
+      raised.set(r.event, (raised.get(r.event) ?? 0) + 1)
+    }
+
+    // Sorted so the reported witness is a deterministic function of the run and not
+    // of Map insertion order (the fingerprint is the shrinker's equality key).
+    for (const composite of Array.from(edges.keys()).sort()) {
+      const doneEvent = `done.state.${composite}`
+      if (!declared.has(doneEvent)) {
+        continue
+      }
+      const expectedCount = edges.get(composite) ?? 0
+      const actualCount = raised.get(doneEvent) ?? 0
+      if (expectedCount > actualCount) {
+        return makeViolation({
+          invariantId: 'I-5',
+          // A counting predicate spans the whole trace and has no single guilty
+          // frame, so it uses the final-scope sentinel (the I-4 convention) and
+          // carries the composite in the witness.
+          step: Number.MAX_SAFE_INTEGER,
+          witness: composite,
+          message: `composite '${composite}' entered its all-final configuration ${expectedCount} time(s) but '${doneEvent}' was raised only ${actualCount} time(s) — a declared completion event was NOT raised, so a consumer's completion handler silently never runs`,
+          observed: `${actualCount} raise(s) of '${doneEvent}'`,
+          expected: `at least ${expectedCount} raise(s) of '${doneEvent}'`,
+        })
+      }
+    }
     return null
   },
 }

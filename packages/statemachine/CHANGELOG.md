@@ -1,5 +1,118 @@
 # @vedmalex/statemachine
 
+## 1.0.0-beta.5
+
+### Minor Changes
+
+- fdf6156: Lifecycle observability channel, W3C-conformant callback ordering (BREAKING), and object payloads for the dynamic check.
+
+  **BREAKING — callback ordering now follows W3C SCXML §3.13.** Entry is ordered by
+  document order (a DFS pre-order walk of the config); exit is the exact reverse.
+  Two observable consequences:
+
+  - sibling regions now run their `onExit` in **reverse** declaration order (`r3, r2, r1`);
+    previously it was forward. This restores the LIFO property — the region that
+    acquired a paired resource first releases it last.
+  - a nested region is now traversed **contiguously** (its leaf, then that leaf's
+    descendants, then the next region); previously a depth-major walk interleaved a
+    sibling's leaf between an ancestor and its own descendant. This was invisible on
+    flat parallel regions, where level-order and pre-order coincide.
+
+  `exited.reverse()` is now exactly `entered`. The layer invariant (ancestors before
+  descendants on entry, the mirror on exit) and the SET of invoked callbacks are
+  unchanged — only their order. Migration: if any code depended on the previous
+  sibling-exit order, invert that expectation.
+
+  **New: `IMonitor.recordLifecycle?(event)` — a lifecycle observability channel.**
+  An optional, additive monitor method. The engine emits a `begin`/`end` pair around
+  every state hook (`onBeforeEnter`/`onEnter`/`onAfterEnter` and the exit trio), plus
+  `invoke` and `guard` records. Each event carries `state`, `owner` (multi-owner
+  machines stay separable), `microstep`, `seq`, and `failed`/`outcome`. A `begin`
+  without its `end` is a **hung callback** — previously undiagnosable from outside.
+  The channel is near-zero-cost when unsubscribed, its dispatch is wrapped in a sink
+  guard (a throwing monitor cannot break the drain), and it changes no behaviour.
+
+  **New: `createLifecycleTracer()` — a debugging instrument** over that channel.
+  Pass it as `StateMachineOptions.monitor` (or `tracer.wrap(existingMonitor)`) and
+  `format()` renders the callback timeline — order, nesting, per-microstep grouping,
+  failures, hung callbacks, guard coverage. Helpers: `unfinished()`, `failures()`,
+  `guardOutcomes()`, `byOwner()`, `byMicrostep()`. See `docs/lifecycle-tracing.md`.
+
+  **`checkMachine` (dynamic check) gains:**
+
+  - **object event payloads** — `EventSpec.payload(rng, snapshot)` values now reach
+    guard/action callbacks verbatim, so argument-dependent transition branches become
+    reachable. The generator draws from a forked stream, so runs without payloads
+    reproduce byte-identically.
+  - **`guardOutcomes`** — per transition, whether the guard was ever seen returning
+    true / false (a guard that never returned true is the classic dead branch).
+  - **`nonConvergingRegions`** — a parallel region that can never complete its join,
+    either structurally (no final sub-state while the composite declares
+    `done.state.<C>`) or empirically at a saturated coverage plateau.
+  - **initial-configuration checking** — user invariants are now evaluated against the
+    post-init configuration, so a machine that _starts_ in a violating state is caught.
+
+  Performance: the composite-write hot path is now O(R) in region count (two former
+  Θ(R²) scans linearised, behaviour preserved).
+
+- Engine completion fix after `errorState` recovery, owner-explicit `*For` API, real teeth for the join oracle, and delta-debugging for `checkMachine`.
+
+  **FIX (engine) — a composite could be `isDone()` without ever raising `done.state.<C>`.**
+  When a transition failed and the machine recovered into an `errorState`, the recovery
+  configuration was committed WITHOUT a completion check. If that configuration happened to
+  be all-final, `isDone(C)` reported `true` while the `done.state.<C>` join event was never
+  raised — so a completion handler waiting on the join silently never ran. Completion is a
+  property of the COMMITTED configuration, not of the path taken into it, so
+  `checkCompletion` now runs on the recovery path too. Recovery still stays recovery: the
+  attempted transition is not recorded as successful (`fired:false` is unchanged), and the
+  join stays edge-triggered (a recovery into a partially-final configuration raises nothing).
+
+  **New: owner-explicit `fireEventFor` / `fireEventDetailedFor` / `canFireEventFor` /
+  `getAvailableEventsFor`.** On a machine driving several objects, `fireEvent(event, obj)`
+  is genuinely ambiguous — a second positional argument is indistinguishable from an event
+  payload, so the call could silently resolve against the primary owner. The `*For` family
+  takes the owner as the FIRST positional argument, which removes the ambiguity
+  structurally rather than by guessing at the value's shape. A raw (non-adapted) object is
+  accepted and normalized through a cache keyed by the object itself, so it keeps its own
+  timers, invokes and history. `fireEvent` is deliberately unchanged — treating its second
+  argument as an owner would break legitimate payloads. `canFireEvent` now normalizes a raw
+  object too, instead of reading it as an adapter and returning nonsense.
+
+  **New: `checkMachine({ shrink: true })` — delta-debugging of a found violation.** A
+  violation is reported as a MINIMAL reproduction (a `script` you can paste back into
+  `checkMachine`) rather than a full run. Reduction runs over the driven op stream against
+  your live config, so closures, guards and object payloads survive intact. Every candidate
+  is decided by an actual re-run: if the finding does not reproduce, the result is reported
+  as `shrink-skipped` and the original run is kept — a minimal repro is never printed
+  without having been verified.
+
+  **Fix — false RTC alarm on a long chain of zero-delay invokes.** The simulation harness
+  gives each macrostep a bounded pumping budget. A correct machine that chains ~40 or more
+  `delay:0` invoke hops exhausted that budget and was reported as an RTC violation even
+  though it reached its final state. The harness now distinguishes "the drain was still
+  moving when the budget ran out" (`settleReason: 'budget-progressing'`, not a violation)
+  from "the drain was stuck" (`'microtask-budget'`, still a violation). The discriminator is
+  RECENCY, not "did it ever move": a legitimate hop's quiet gap is bounded by the pump's own
+  stabilisation window (measured at 16 turns on the reference fixtures), while a wedged tail
+  holds the observable fingerprint for hundreds — so a machine that makes progress and _then_
+  wedges is still reported as wedged. This adds a member to `SettleReason` and bumps the DST
+  trace header version to `'5'`.
+
+  Two consequences on the report surface: a run that exhausts the budget while progressing now
+  carries one advisory `budget-progressing` warning (never a verdict — raise `steps` to give
+  the machine more total budget), and a genuinely wedged drain now also reaches the liveness
+  verdict as `TIMEOUT_BUDGET_EXCEEDED` — that plumbing existed but had no producer. A
+  zero-delay livelock that cycles forever is reported by the warning only, and deliberately
+  so: it is provably indistinguishable from a correct machine whose loop is bounded past the
+  budget horizon, because the deciding state (context fields, closure variables) appears in no
+  observation channel. `docs/dynamic-check.md` documents the boundary.
+
+  **The join oracle now has real teeth.** Previously it could not distinguish "no join was
+  raised" from "a join was raised and matched nothing", so it was documented as a no-op. The
+  engine's single internal raise point now reports each raise on the lifecycle channel, and
+  the oracle counts join raises against observed completion edges. The set of oracles
+  documented as no-ops is now empty.
+
 ## 1.0.0-beta.4
 
 ### Minor Changes

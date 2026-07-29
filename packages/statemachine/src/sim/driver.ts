@@ -335,18 +335,25 @@ export class SimDriver<T extends object> {
       seed: cfg.prng.seed.toString(),
       configHash: configHash(cfg.config),
       engine: '@vedmalex/statemachine',
-      // '4' (was '1'→'2'→'3'): '2' added the hashed `settleReason` field (C1); '3'
-      // re-semantized its closed union (U1: the `pending ∧ inFlight==0` case that
-      // hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as WAITING_ON_INTERNAL).
+      // '5' (was '1'→'2'→'3'→'4'): '2' added the hashed `settleReason` field (C1);
+      // '3' re-semantized its closed union (U1: the `pending ∧ inFlight==0` case
+      // that hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as
+      // WAITING_ON_INTERNAL).
       // '4' (W8/V5b) POPULATES the hashed `doneDelta` field on this path for the
       // first time: the boundary frame of every step now carries the sampled
       // isDone(C) projection per declared composite. `doneDelta` was always part of
       // the frame schema and always hashed, but only coverage.ts ever set it — a
       // Simulator trace of a composite machine now hashes DIFFERENTLY than it did
-      // under '3'. Per the trace.ts version contract ("bump on closed-union/
-      // hashed-field change") that is corpus-breaking and the schema version
-      // advances. MUST stay in lockstep with public.ts `emptyHeader`.
-      version: '4',
+      // under '3'.
+      // '5' (W9/Г2) EXTENDS the `SettleReason` closed union with
+      // `'budget-progressing'`: a budget exhaustion where the machine was still
+      // observably moving no longer hashes as `'microtask-budget'`. Any trace of a
+      // machine long enough to exhaust the pump budget therefore hashes DIFFERENTLY
+      // than it did under '4'.
+      // Per the trace.ts version contract ("bump on closed-union/hashed-field
+      // change") each of these is corpus-breaking and the schema version advances.
+      // MUST stay in lockstep with public.ts `emptyHeader`.
+      version: '5',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,

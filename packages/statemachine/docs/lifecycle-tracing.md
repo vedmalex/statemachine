@@ -168,6 +168,37 @@ const tracer = createLifecycleTracer({ now: () => virtualClock })
 Pass the *same* function you gave to `StateMachineOptions.clock` and the trace
 lines up with the machine's own virtual time.
 
+## Internal event raises (`kind: 'raise'`)
+
+Besides state hooks, `invoke` work and guards, the channel records every point at
+which the **engine itself** pushes an event onto the internal queue. There are five
+such origins, distinguished by `hook`:
+
+| `hook` | Raised when |
+| --- | --- |
+| `raise.done` | a composite became all-final and the engine raises `done.state.<C>` |
+| `raise.invoke.timer` | an `invoke` delay elapsed and its `event` is raised |
+| `raise.invoke.onDone` | an `invoke` operation fulfilled |
+| `raise.invoke.onError` | an `invoke` operation rejected |
+| `raise.invoke.resume` | a timer resumed from a deserialized snapshot fired |
+
+A raise is instantaneous, so — like `invoke.abort` — it is emitted as an adjacent
+`begin`+`end` pair with no work in between and never shows a duration. On a raise
+record `event` is always present and holds the **raised** event name; `state` is the
+raise *origin*: the composite for `raise.done`, the `invoke`-owning leaf otherwise.
+
+`microstep` needs care, for the same reason as on `invoke` records. `raise.done`
+carries the current microstep (the completion scan runs inside the microstep whose
+state write produced the done configuration); the three `raise.invoke.timer` /
+`onDone` / `onError` hooks carry the microstep that **armed** the invoke, not the one
+in which the timer or promise settled; `raise.invoke.resume` carries the reserved `0`,
+because a resumed timer fires outside any microstep. In no case is it the microstep in
+which the raised event is later *processed* — that happens in its own step, and the
+transition it drives is already visible as a normal enter/exit sequence.
+
+Only engine-internal raises appear here. A caller's own `fireEvent` is not recorded —
+it is already visible to the caller.
+
 ## Limits — what this channel does **not** see
 
 These are properties of the underlying observability channel, not of the tracer.
@@ -176,7 +207,7 @@ Reading a gap here as a bug will send you chasing the wrong thing.
 - **Transition-level callbacks are invisible.** `onTransition` and the
   event-level `onBefore` / `onAfter` are *not* instrumented. Only state hooks
   (`onBeforeEnter` / `onEnter` / `onAfterEnter` / `onBeforeExit` / `onExit` /
-  `onAfterExit`), `invoke` work, and guards appear.
+  `onAfterExit`), `invoke` work, guards, and internal event raises appear.
 - **The `onError` handler is invisible**, by construction: the `end` edge is
   emitted at the settle of the *callback*, strictly before the error is routed.
   Otherwise a hung `onError` would masquerade as a hung `onEnter`.

@@ -106,6 +106,39 @@ Composites nest: a parent's `done.state` is raised only after every region — *
 
 See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, nesting, and validation.
 
+## Driving several objects with one machine
+
+One machine can drive many owner objects, but `fireEvent` cannot express that
+unambiguously: a non-`Adapter` second positional is an event **argument** — that is
+what makes `fireEvent('submit', payload)` work — so a raw object passed as an owner
+is read as a payload and the event resolves against the machine's primary owner
+instead. (When that object carries the machine's `stateAttribute`, the engine emits
+an advisory warning through the injected `logger`; the argument is still forwarded
+verbatim, so a payload that happens to have the field keeps working.)
+
+The `*For` family resolves the ambiguity structurally rather than by sniffing:
+**slot 1 is always the owner**, everything after the event name is always an
+argument.
+
+```ts
+const a = { state: 'idle' }
+const b = { state: 'idle' }
+const sm = new StateMachine(config, a)
+
+await sm.fireEventFor(b, 'go')                     // moves b; a is untouched
+await sm.fireEventFor(b, 'submit', { ok: true })   // owner first, then the args
+await sm.fireEventDetailedFor(b, 'go')             // → FireResult
+sm.canFireEventFor(b, 'go')                        // → boolean, for b
+sm.getAvailableEventsFor(b)                        // → string[], for b
+```
+
+A **raw object is accepted** — no `MemoryAdapter` ceremony — and is wrapped
+internally, once per object. Because every per-owner structure keys on the adaptee,
+the object keeps its own state, timers, `invoke`s and history whether you hand over
+the object or an `Adapter` for it.
+
+`fireEvent` itself is unchanged.
+
 ## Documentation
 
 Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)
@@ -321,12 +354,14 @@ evicted.
 
 - **Multi-runtime CI (Tier B)**: Deno + Browser smokes run with `continue-on-error: true` and are tracked for full enablement at stable 1.0.0.
 - **`checkMachine` (dynamic check)**: fuzzing, not model-checking (see
-  [`docs/dynamic-check.md`](./docs/dynamic-check.md)). Object-valued event payloads
-  are not yet driven end-to-end (arg-free fuzzing + a `no-payload` advisory today);
-  `guardOutcomes` / `nonConvergingRegions` and shrink-minimized repro traces are
-  reserved report fields. The `I-4`/`I-5` sim oracles are documented no-ops (their
-  enter-order / parallel-join-miss classes are not soundly observable from the
-  content-only trace) — the converse done-event gating IS enforced (`I-12`).
+  [`docs/dynamic-check.md`](./docs/dynamic-check.md)) — the absence of a finding is
+  never a proof of correctness. Two builtin oracles are additionally limited by what
+  the observation channel can see, and both under-report rather than false-fire:
+  `I-4` (enter/exit hierarchy order) compares only states that actually ran a hook,
+  and skips the reserved `microstep 0` used by construction / `reset` /
+  `resumeTimers`; `I-5` (parallel join) samples completion at settle boundaries, so a
+  composite that becomes all-final and is *left again* inside the same macrostep is
+  never observed done — a missing `done.state.<C>` there goes unreported.
 
 ## Known internal debt (Phase 1)
 

@@ -68,3 +68,69 @@ describe('W8/V10 — raw-object second owner is diagnosed, not silently misread'
     expect(warnings.filter((w) => w.includes('RAW object'))).toHaveLength(0)
   })
 })
+
+describe('W9/Г4 — the *For family: multi-owner without ceremony or ambiguity', () => {
+  it('drives TWO raw objects independently (owner-first slot, no MemoryAdapter needed)', async () => {
+    const a: Box = { state: 'idle' }
+    const b: Box = { state: 'idle' }
+    const sm = new StateMachine<Box, typeof cfg>(cfg, a)
+    await Promise.resolve()
+    await sm.fireEventFor(a, 'go')
+    expect(a.state).toBe('active')
+    expect(b.state).toBe('idle') // untouched
+    await sm.fireEventFor(b, 'go')
+    expect(b.state).toBe('active')
+  })
+
+  it('emits NO raw-owner warning (the ambiguity is gone structurally)', async () => {
+    const { logger, warnings } = collectingLogger()
+    const a: Box = { state: 'idle' }
+    const sm = new StateMachine<Box, typeof cfg>(cfg, a, { logger })
+    await Promise.resolve()
+    await sm.fireEventFor({ state: 'idle' } as Box, 'go')
+    expect(warnings.filter((w) => w.includes('RAW object'))).toHaveLength(0)
+  })
+
+  it('args land as ARGUMENTS, never confused with the owner', async () => {
+    const seen: unknown[] = []
+    const withArgs: StateMachineConfig<Box> = {
+      name: 'withArgs',
+      stateAttribute: 'state',
+      initialState: 'idle',
+      states: { idle: {}, active: {} },
+      events: {
+        go: { transitions: [{ from: 'idle', to: 'active', action: (_o: Box, ...rest: unknown[]) => { seen.push(...rest) } }] },
+      },
+    }
+    const owner: Box = { state: 'idle' }
+    const sm = new StateMachine<Box, typeof withArgs>(withArgs, owner)
+    await Promise.resolve()
+    await sm.fireEventFor(owner, 'go', { verdict: 'ok' }, 42)
+    expect(seen).toEqual([{ verdict: 'ok' }, 42])
+  })
+
+  it('canFireEventFor / getAvailableEventsFor answer PER OWNER', async () => {
+    const a: Box = { state: 'idle' }
+    const b: Box = { state: 'idle' }
+    const sm = new StateMachine<Box, typeof cfg>(cfg, a)
+    await Promise.resolve()
+    await sm.fireEventFor(a, 'go') // a → active, b stays idle
+    expect(sm.canFireEventFor(a, 'go')).toBe(false) // no transition out of active
+    expect(sm.canFireEventFor(b, 'go')).toBe(true)
+    expect(sm.getAvailableEventsFor(b)).toContain('go')
+    expect(sm.getAvailableEventsFor(a)).not.toContain('go')
+  })
+
+  it('the same raw owner resolves to the SAME cached adapter (per-owner state is stable)', async () => {
+    const a: Box = { state: 'idle' }
+    const b: Box = { state: 'idle' }
+    const sm = new StateMachine<Box, typeof cfg>(cfg, a)
+    await Promise.resolve()
+    // Two calls for b must share one adapter, otherwise b's own state/timers would
+    // be split across adapters and the second call would read a stale state.
+    expect(sm.canFireEventFor(b, 'go')).toBe(true)
+    await sm.fireEventFor(b, 'go')
+    expect(b.state).toBe('active')
+    expect(sm.canFireEventFor(b, 'go')).toBe(false)
+  })
+})

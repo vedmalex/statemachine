@@ -410,18 +410,25 @@ describe('W8 §3: the fault path is payload-IDENTICAL to the no-fault path', () 
  * `IMonitor.recordLifecycle` channel (W8/V3a — which lengthens the engine's
  * internal promise chain around every instrumented callback) does NOT perturb the
  * op stream, the frame sequence, or the settle outcome by a single bit.
+ *
+ * REBASED AGAIN in W9/Г2 ('4' -> '5'), for ONE declared reason: the `SettleReason`
+ * closed union gained `'budget-progressing'`, and `settleReason` is a hashed
+ * `TraceFrame` field. Attribution VERIFIED the same way: with `version` pinned back
+ * to '4' the previous table passes UNCHANGED (32/32), which proves the progress
+ * discriminator added to the settle pump does not alter behaviour on any corpus
+ * run — only the schema version moved.
  */
 const CORPUS_HASHES: ReadonlyArray<readonly [bigint, string]> = [
-  [0n, '707f775a87eddb1f'],
-  [1n, 'e791556b3b897f9b'],
-  [3n, '157135057547a00b'],
-  [4n, '0bb1dfdcd2f7bf08'],
-  [5n, '22cdc711c3c4c380'],
-  [6n, '908fd92433ffac55'],
-  [7n, '0a6a6e4d9f846605'],
-  [8n, 'fe20be683bb7a527'],
-  [42n, 'bc6c2ea2a1d98933'],
-  [12345n, '8f9bc232d12169ec'],
+  [0n, 'd93f984b365b8cdc'],
+  [1n, '7c56cb7a6d199296'],
+  [3n, '0b7090d495b71b48'],
+  [4n, 'dd43af4dbb4ece67'],
+  [5n, '18cb8fe02258588b'],
+  [6n, 'd57b4e15064fba82'],
+  [7n, '38d89edc3348febc'],
+  [8n, '430c335966f3443c'],
+  [42n, 'ecbd7ad3f08a3330'],
+  [12345n, 'bfed0e6348e5945b'],
 ]
 
 describe('W8 §4: the generated corpus replays to its PINNED traceHash', () => {
