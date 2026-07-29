@@ -109,17 +109,43 @@ Composites nest: a parent's `done.state` is raised only after every region — *
 
 See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, nesting, and validation.
 
+## Action timeouts (`transitionTimeout`)
+
+`StateMachineOptions.transitionTimeout` is a **per-action** budget, not a per-transition or per-microstep one. Every individual action call races its own deadline: guards, `onBefore` / `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and `invoke` actions.
+
+**The consequence to budget for.** One event fires one transition **per region** in a single microstep (see [Hierarchical regions, parallel states & join](#hierarchical-regions-parallel-states--join)), and each of those transitions runs its own hook chain. A microstep of N transitions × K hooks therefore gets N×K *separate* deadlines, and `transitionTimeout` does **not** bound the microstep's total duration — three regions running three 40 ms hooks each complete in ~370 ms under a 100 ms `transitionTimeout`. Read the option as "no single callback may hang longer than this", never as "an event settles within this".
+
+On expiry the call rejects with `StateMachineError('Transition timeout')` (`context.phase === 'action'`). The timed-out action is **not** cancelled — it runs to completion and its side effects still land, after the machine has already unwound. What you observe depends on which hook expired:
+
+| expired hook | observable outcome |
+| --- | --- |
+| `guard` | transition disabled; `fireEvent` resolves `false`, nothing thrown |
+| `onEnter`, with `errorState` set | machine commits `errorState`; `fireEvent` resolves `false` |
+| `onExit`, with `abortOnExitError` set | microstep aborts back to the source state; `fireEvent` resolves `false` |
+| `invoke` action (the timer form's `action`) | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
+| anything else (`onBefore`, `onTransition`, `onEnter` / `onExit` without the options above) | the error propagates out of `fireEvent`; the machine stays in the source state |
+
+An `invoke` action that **throws** takes exactly that same route, on a freshly armed timer and on one resumed from a snapshot alike: an expiry is simply one more way the action failed, and the two are distinguishable only by the error you receive, never by where it arrives or by what the machine does next. (The `recordError` channel is gated by `IErrorHandler.isEnabled()`, which defaults to enabled. Long-running `invoke` **operations** — the `src` / `onDone` / `onError` form — keep their own routing instead: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
+
+The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
+
 ## Driving several objects with one machine
 
-One machine can drive many owner objects, but `fireEvent` cannot express that
-unambiguously: a non-`Adapter` second positional is an event **argument** — that is
-what makes `fireEvent('submit', payload)` work — so a raw object passed as an owner
-is read as a payload and the event resolves against the machine's primary owner
-instead. (When it is a *different* object carrying the machine's `stateAttribute` —
-the tell-tale shape of the mistake — the engine warns through its `logger`; passing
-the machine's own owner back in is the correct common pattern and stays quiet. The
-argument is forwarded verbatim either way, so a payload that happens to have the
-field keeps working.)
+A machine is a *description*; the thing that has a state is the owner object, which
+holds it in the field named by `stateAttribute`. So one machine instance can drive any
+number of owners at once — a table of rows, a pool of sessions — and each owner's
+position is written back into that owner, through the `Adapter`. This is the mechanism
+to reach for when you have many records and one workflow; it is not what `toJSON`
+is for (see [Serialization](#serialization-tojson--fromjson)).
+
+`fireEvent` cannot express a second owner unambiguously: a non-`Adapter` second
+positional is an event **argument** — that is what makes `fireEvent('submit', payload)`
+work — so a raw object passed as an owner is read as a payload and the event resolves
+against the machine's primary owner instead. (When it is a *different* object carrying
+the machine's `stateAttribute` — the tell-tale shape of the mistake — the engine warns
+through its `logger`; passing the machine's own owner back in is the correct common
+pattern and stays quiet. The argument is forwarded verbatim either way, so a payload
+that happens to have the field keeps working.)
 
 The `*For` family resolves the ambiguity structurally rather than by sniffing:
 **slot 1 is always the owner**, everything after the event name is always an
@@ -155,29 +181,122 @@ your owner type has its own `get`/`set`, wrap it explicitly:
 object like the `*For` family does, instead of reading it as an adapter and
 returning an answer about a state it was never in.
 
-## Action timeouts (`transitionTimeout`)
+### A batch over a table
 
-`StateMachineOptions.transitionTimeout` is a **per-action** budget, not a per-transition or per-microstep one. Every individual action call races its own deadline: guards, `onBefore` / `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and `invoke` actions.
+Build the machine once, then walk the records: load, fire, save. The `state` column
+**is** the persisted machine state — there is nothing else to write back, and no
+snapshot is involved. A machine driven only through the `*For` family needs no
+construction owner at all.
 
-**The consequence to budget for.** One event fires one transition **per region** in a single microstep (see [Hierarchical regions, parallel states & join](#hierarchical-regions-parallel-states--join)), and each of those transitions runs its own hook chain. A microstep of N transitions × K hooks therefore gets N×K *separate* deadlines, and `transitionTimeout` does **not** bound the microstep's total duration — three regions running three 40 ms hooks each complete in ~370 ms under a 100 ms `transitionTimeout`. Read the option as "no single callback may hang longer than this", never as "an event settles within this".
+```ts
+type Order = { id: number; state: string }
 
-On expiry the call rejects with `StateMachineError('Transition timeout')` (`context.phase === 'action'`). The timed-out action is **not** cancelled — it runs to completion and its side effects still land, after the machine has already unwound. What you observe depends on which hook expired:
+const sm = createMachine<Order>({
+  name: 'order',
+  stateAttribute: 'state',
+  initialState: 'draft',
+  states: { draft: {}, review: {}, published: {} },
+  events: {
+    submit: { transitions: [{ from: 'draft', to: 'review' }] },
+    approve: { transitions: [{ from: 'review', to: 'published' }] },
+  },
+})
 
-| expired hook | observable outcome |
-| --- | --- |
-| `guard` | transition disabled; `fireEvent` resolves `false`, nothing thrown |
-| `onEnter`, with `errorState` set | machine commits `errorState`; `fireEvent` resolves `false` |
-| `onExit`, with `abortOnExitError` set | microstep aborts back to the source state; `fireEvent` resolves `false` |
-| `invoke` action (the timer form's `action`) | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
-| anything else (`onBefore`, `onTransition`, `onEnter` / `onExit` without the options above) | the error propagates out of `fireEvent`; the machine stays in the source state |
+for (let offset = 0; ; offset += 500) {
+  const page = await loadPage(offset)   // → Order[]
+  if (page.length === 0) break
+  for (const row of page) {
+    // Over a table of mixed states, "this row has nothing to do" is the normal
+    // case, not an error — and `fireEventFor` THROWS when no transition matches.
+    // The detailed form reports it instead: { fired: false, reason: 'no-transition' }.
+    const res = await sm.fireEventDetailedFor(row, 'submit')
+    if (res.fired) await save(row)      // row.state now holds the new state
+  }
+}
+```
 
-An `invoke` action that **throws** takes exactly that same route, on a freshly armed timer and on one resumed from a snapshot alike: an expiry is simply one more way the action failed, and the two are distinguishable only by the error you receive, never by where it arrives or by what the machine does next. (The `recordError` channel is gated by `IErrorHandler.isEnabled()`, which defaults to enabled. Long-running `invoke` **operations** — the `src` / `onDone` / `onError` form — keep their own routing instead: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
+`canFireEventFor(row, 'submit')` answers the same question without running the
+transition, and `getAvailableEventsFor(row)` lists what that row could do next.
 
-The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
+Two things to get right about the column:
+
+- It holds the machine's **active configuration verbatim** — a dotted leaf path, and
+  for parallel regions the `|`-joined set (`proc.a.run|proc.b.run`). Store back what
+  the engine wrote; do not normalize or shorten it.
+- A row driven through the `*For` family is read **as it stands**. A composite parent
+  name is *not* expanded to its `initial` leaf: a row reading `proc` offers only the
+  transitions declared from `proc` itself, and one declared from `proc.a.run` will not
+  match it. Seed a new row with the configuration a fresh machine enters, not with the
+  parent name. (Only the *construction* owner is expanded — `new StateMachine(config, row)`
+  descends into `initial` and writes the leaf path back into `row`.)
+
+### The per-record runtime that does not live in the record
+
+The `state` field is not the whole story. Five kinds of per-owner runtime are held on
+the machine in `WeakMap`s keyed by the owner object itself, and so live in process
+memory only: the history recorded for `history` states, state entry times, armed
+`invoke` timers, in-flight `invoke` operations, and invoke restart counts. None of it
+is in the record, and none of it is in a `toJSON` snapshot either — that snapshot
+covers the construction owner alone.
+
+Which side of the line you are on is decided by the config:
+
+- A machine of plain states, guards and transitions has **no** such runtime. The record
+  is fully self-describing, one machine over any number of records is exact, and a row
+  can be loaded, advanced and released freely.
+- A machine that uses `history` states or `invoke` (either form — the delay/`event`
+  timer or the long-running `src` operation) does have it, keyed on **object identity**.
+
+Both failure modes are silent. You observe wrong behaviour, not an error:
+
+- **History.** Load a row, advance it, release the object, then reload the row as a
+  fresh object, and the history keyed to the old object is gone. Re-entering a
+  `history` composite falls back to its `initial` — and any sibling regions the
+  composite remembered are gone with it, so the machine re-enters a *narrower*
+  configuration than it left. The workaround is real but narrow: keep the **same**
+  object for the whole batch rather than reloading it, and history is exact, per
+  record and independent between records.
+- **Timers.** An `invoke` timer armed on entry fires later, on its own schedule, and
+  writes into the object that armed it — after your loop has already saved that row.
+  Keeping the object alive does not fix this one: the write lands in memory and the row
+  is never persisted unless you drain the timers and save again. `load → fire → save`
+  is the wrong shape for a machine whose states arm timers; hold those owners resident
+  for as long as their timers can fire.
+
+There is no snapshot-based escape from either: `toJSON`, `saveState`, and the timer
+resumption `fromJSON` performs all read and write the construction owner alone.
 
 ## Serialization (`toJSON` / `fromJSON`)
 
 `toJSON()` writes a machine to a string; `fromJSON(json, owner, options?)` reads one back. `toSecureJSON()` / `fromSecureJSON()` are the async forms and carry exactly the same thing.
+
+`toJSON` and `toSecureJSON` **throw while an `invoke` operation is in flight**, naming the
+state and the invocation. A pending promise has no serializable continuation, so a snapshot
+taken then would restore into a machine that looks busy and is running nothing: the
+completion event that would have moved it on never arrives. Wait for your operation and
+serialize after it, or leave the state — which aborts it — and serialize from there. A
+machine that merely *declares* an operation, or whose operation has already settled,
+serializes normally: the refusal is about the moment, not about the machine. See
+[docs/persistence.md](./docs/persistence.md).
+
+**This moves or restores a machine; it does not carry a record's state.** The payload is
+a machine *description* plus one owner's position in it — `config` (every state and
+event, functions reduced to name references), the behavioural `options`, and then
+`currentState`, `historyMap` and `stateEntryTimes` **for the construction owner only**.
+Two consequences make it the wrong tool for a table of records. The config dominates the
+payload — already about three quarters of the bytes on a trivial three-state machine —
+and it is byte-identical for every record, so a snapshot per row stores one copy of the
+same machine description per row. And a row you drove through `fireEventFor` does not
+appear in the payload at all: what you get back is the *construction* owner's position.
+`fromJSON(json, row)` then **writes** that persisted `currentState` onto whatever row
+you hand it, overwriting the state that row was actually in.
+
+For many records use the multi-owner mode above — the record's own `state` field is the
+persisted state. Reach for `toJSON` when you want to move *one* machine across a process
+boundary, or bring it back after a restart. There is a third, lighter option for that
+last case — `StatePersistenceAdapter` (`saveState` / `restoreState`) moves the runtime
+without the config; the three are compared side by side in
+[`docs/persistence.md`](./docs/persistence.md).
 
 `StateMachineOptions` splits in two, and the split decides what the payload holds.
 
@@ -197,11 +316,13 @@ const sm = StateMachine.fromJSON(json, owner, {
 
 `actions` is the one you cannot skip if your config has function-valued hooks: functions serialize as a **name** (never a body — see [Breaking changes](#breaking-changes-in-100-beta5)), and restoration resolves that name against this registry. `strictActions` is not persisted either — it governs how strictly *this* read resolves those names, and a document does not get to relax the rules it is read under.
 
-### Known issue: no countdown survives a restore
+### Known issue: the per-action deadline is not restored
 
-**A deadline that was counting down when you called `toJSON` is not persisted, so after a restore every action budget starts fresh.** A `transitionTimeout` of 5 s that had already burned 4 s at save time restores as a full 5 s. This is deliberate: the deadline races a pending promise, and a pending promise cannot be resumed — there is nothing to continue counting against. Budget for it: a machine that is saved and restored repeatedly can let a single action run for longer than `transitionTimeout` in total wall-clock. The bound is per action *per run*, not across a restore.
+**A `transitionTimeout` that was counting down when you called `toJSON` is not persisted, so after a restore every action budget starts fresh.** A 5 s budget that had already burned 4 s at save time restores as a full 5 s. This is deliberate: the deadline races a pending promise, and a pending promise cannot be resumed — there is nothing to continue counting against. Budget for it: a machine that is saved and restored repeatedly can let a single action run for longer than `transitionTimeout` in total wall-clock. The bound is per action *per run*, not across a restore.
 
-Invoke **delays** are different and do resume correctly: they are recomputed from the persisted `stateEntryTimes`, so a 1000 ms timer snapshotted 400 ms in fires 600 ms after the restore. See [Replaying serialized state](#replaying-serialized-state).
+Invoke **delays** are unaffected and do resume correctly: `fromJSON` recomputes the remainder from the persisted `stateEntryTimes`, so a 1000 ms timer snapshotted 400 ms in fires 600 ms after the restore. See [Replaying serialized state](#replaying-serialized-state).
+
+A long-running `invoke` **operation** (the `src` / `onDone` / `onError` form) is not resumed either — its promise and `AbortSignal` cannot survive a document. It is skipped on restore, with a `logger.warn`, and a fresh entry into the state relaunches it.
 
 ## Documentation
 

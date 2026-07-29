@@ -98,9 +98,26 @@ deliberately not persisted either: it governs how the payload's own function nam
 resolved, so honouring it from the document would let a document relax the rules it is
 read under.
 
-**Known issue:** a deadline that was counting down when the machine was serialized does
-not survive. After a restore every action budget starts fresh. A pending promise cannot
-be resumed, so the alternative would be to fabricate one.
+**BREAKING — `toJSON` / `toSecureJSON` throw while an `invoke` operation is in flight.**
+Previously they emitted a snapshot with the `src` dropped, and the restored machine sat in
+that state with nothing running: its `onDone` never arrived. A pending promise has no
+serializable continuation — that is a property of the JavaScript runtime, not a gap in this
+library, and no amount of waiting inside the library turns it into one. The refusal names
+the state and the invocation and states the two things you can actually do: wait for the
+operation to settle and serialize after, or leave the state (which aborts it) and serialize
+from there. It is scoped to the MOMENT, not the machine — a machine that merely declares an
+operation, or whose operation has already settled, serializes exactly as before. Reading is
+unchanged: an existing payload carrying an operation marker still loads.
+
+**Known issue — scoped to the per-action deadline.** `transitionTimeout` races a pending
+promise, and a pending promise cannot be resumed, so the elapsed portion is not
+persisted: a 5 s budget that had burned 4 s at save time restores as a full 5 s, and a
+machine saved and restored repeatedly can let one action exceed `transitionTimeout` in
+total wall-clock. The bound is per action *per run*. Invoke **delays** are unaffected and
+do resume correctly — they are recomputed from the persisted `stateEntryTimes`, so a
+1000 ms timer snapshotted 400 ms in fires 600 ms after the restore. A long-running
+`invoke.src` operation is not resumed either (its promise and `AbortSignal` do not
+survive); a fresh entry relaunches it.
 
 Alongside it: `maxTurns` is now a public option on both `SimOptions` and
 `CheckOptions` (default 1024), so the advice those warnings give is actionable;

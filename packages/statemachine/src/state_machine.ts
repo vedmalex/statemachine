@@ -101,6 +101,25 @@ interface RaiseOrigin {
 }
 
 /**
+ * W3b.2 — ONE invoke OPERATION whose launch is committed and whose `src` has not
+ * finished. Held per owner (see `inFlightInvokesByOwner`) purely so serialization
+ * can name what is running when it refuses to take a snapshot; the engine never
+ * reads it to make a decision.
+ *
+ * `leaf` is the invoke-owning state; `label` is the best identity the config
+ * offers for the invocation, resolved once at launch by
+ * {@link StateMachine.describeInvokeOperation} (an explicit `id`, else the `src`
+ * function name, else the `onDone` event) so the error text can point at a
+ * specific invocation rather than at "the state".
+ *
+ * Module-local by design: nothing about it reaches the public API surface.
+ */
+interface InFlightInvoke {
+  readonly leaf: string
+  readonly label: string
+}
+
+/**
  * The BEHAVIOURAL SCALARS of {@link StateMachineOptions} — pure data that
  * changes how the machine behaves — mapped to the `typeof` their persisted form
  * must have.
@@ -378,6 +397,25 @@ export class StateMachine<
   // teardownStateTimers). Keyed (per owner, П6) by the leaf state name, one
   // controller per running operation of that leaf.
   private activeInvokesByOwner: WeakMap<object, Map<string, AbortController[]>> =
+    new WeakMap()
+  // W3b.2 — per-owner set of invoke operations that are ACTUALLY IN FLIGHT.
+  //
+  // NOT a duplicate of activeInvokesByOwner. That map is ARMED-scoped: a leaf's
+  // controllers are put there on entry and dropped only on exit / reset / re-arm,
+  // so a controller sits there, un-aborted, for the whole residency of the leaf —
+  // long after its `src` promise resolved. Reading it as "an operation is running"
+  // is wrong in the one direction that matters here: it reports a settled
+  // operation as live, and a machine whose operation has settled serializes
+  // perfectly well (see {@link assertNoInFlightInvokes}).
+  //
+  // A record is added when the operation's launch is COMMITTED (the scheduler
+  // slot is taken — from that instant a snapshot would already miss it, because
+  // nothing in the payload can re-launch it) and removed when it stops mattering
+  // to the machine's future: the promise settles, `src` throws synchronously, the
+  // launch is cancelled before `src` runs, or the operation is aborted (an
+  // aborted operation's completion event is dropped, so the machine no longer
+  // waits on it).
+  private inFlightInvokesByOwner: WeakMap<object, Set<InFlightInvoke>> =
     new WeakMap()
   // W3b.1 livelock bound: consecutive invoke-operation restarts after an
   // aborted-without-commit microstep, per source leaf. Reset on a committed
@@ -934,6 +972,21 @@ export class StateMachine<
       this.activeInvokesByOwner.set(key, m)
     }
     return m
+  }
+
+  /**
+   * W3b.2 — the current owner's set of ACTUALLY-in-flight invoke operations
+   * (created on first access). See `inFlightInvokesByOwner` for why this is not
+   * the same question as {@link invokesFor}.
+   */
+  private inFlightInvokesFor(obj?: Adapter<any>): Set<InFlightInvoke> {
+    const key = this.ownerKey(obj)
+    let s = this.inFlightInvokesByOwner.get(key)
+    if (!s) {
+      s = new Set()
+      this.inFlightInvokesByOwner.set(key, s)
+    }
+    return s
   }
 
   /**
@@ -5294,12 +5347,34 @@ export class StateMachine<
     microstep = 0,
   ): { controller: AbortController; timerId: any } {
     const controller = new AbortController()
+    // W3b.2 — the operation counts as IN FLIGHT from here, BEFORE `src` runs.
+    // The launch slot is already taken, and a snapshot written in the gap
+    // between this line and `startOp` is exactly as unfaithful as one written
+    // mid-`src`: neither carries anything that would start the operation again.
+    // `retire` is idempotent (Set.delete of an absent member is a no-op) and is
+    // called on every way out — settle, synchronous throw, cancelled launch —
+    // plus once via the abort listener, since an aborted operation's completion
+    // event is dropped and the machine no longer waits on it.
+    const record: InFlightInvoke = {
+      leaf: toStateName,
+      label: StateMachine.describeInvokeOperation(op),
+    }
+    const inFlight = this.inFlightInvokesFor(obj)
+    inFlight.add(record)
+    const retire = () => inFlight.delete(record)
+    controller.signal.addEventListener('abort', retire, { once: true })
     const startOp = () => {
       // Still in the leaf, and not already aborted by an exit that raced the
       // scheduled start.
       const currentState = this.getCurrentState(obj as any)
-      if (!currentState?.split('|').includes(toStateName)) return
-      if (controller.signal.aborted) return
+      if (!currentState?.split('|').includes(toStateName)) {
+        retire()
+        return
+      }
+      if (controller.signal.aborted) {
+        retire()
+        return
+      }
       // W8/V1b — `begin` marks the moment `src` is ACTUALLY invoked (after the
       // still-in-leaf / not-yet-aborted checks), so a scheduled-then-cancelled
       // launch never opens a pair that will not close.
@@ -5314,6 +5389,7 @@ export class StateMachine<
       try {
         result = op.src(obj.adaptee, controller.signal)
       } catch (err) {
+        retire()
         if (traced) {
           this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
             ...opCtx,
@@ -5325,6 +5401,7 @@ export class StateMachine<
       }
       Promise.resolve(result).then(
         (value) => {
+          retire()
           // W8/V1b — `end` is emitted on SETTLE, even when the operation was
           // aborted meanwhile: the work really did finish, and the dropped
           // completion event below is a separate fact. An operation whose `src`
@@ -5354,6 +5431,7 @@ export class StateMachine<
           }
         },
         (err) => {
+          retire()
           if (traced) {
             this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
               ...opCtx,
@@ -5366,6 +5444,23 @@ export class StateMachine<
     }
     const timerId = this.setTimer(startOp, 0)
     return { controller, timerId }
+  }
+
+  /**
+   * W3b.2 — the best identity the config offers for ONE invoke operation, used
+   * only to name it in {@link assertNoInFlightInvokes}'s message. Preference
+   * order is most-deliberate-first: an author-supplied `id`, then the `src`
+   * function's own name, then the `onDone` event it would raise. An operation
+   * with none of the three (an anonymous arrow with no `onDone`) is genuinely
+   * unnameable, and the message falls back to the state alone rather than
+   * inventing an index the caller cannot find in their config.
+   */
+  private static describeInvokeOperation(op: InvokeOperation<any>): string {
+    if (op.id !== undefined) return `id "${String(op.id)}"`
+    const srcName = typeof op.src === 'function' ? op.src.name : ''
+    if (srcName) return `src "${srcName}"`
+    if (op.onDone !== undefined) return `onDone "${String(op.onDone)}"`
+    return 'an anonymous src with no onDone'
   }
 
   /**
@@ -5974,6 +6069,63 @@ export class StateMachine<
   }
 
   /**
+   * W3b.2 — refuse to take a snapshot while an `invoke` OPERATION is running for
+   * the owner the snapshot is about (the primary construction owner — see
+   * {@link toJSON}).
+   *
+   * WHY A THROW AND NOT A WARN. The payload has no slot that could hold a
+   * running operation, and the restore path knows it: `resumeTimers` skips the
+   * operation form outright, because the promise and the `AbortSignal` it runs
+   * against are process-local values with no serializable form. So the snapshot
+   * that used to come back from here was not "lossy" in a way the caller could
+   * compensate for — it restored into a machine that *looks* like it is working
+   * and is running nothing, and the completion event everything downstream waits
+   * on never arrives. That is a silent hang produced by a successful-looking
+   * call, which is the one outcome worth failing loudly for.
+   *
+   * WHY THE CHECK IS ON `inFlightInvokesFor` AND NOT ON `invokesFor`, AND NOT ON
+   * THE CONFIG. A machine that merely DECLARES an operation, and a machine whose
+   * operation has already settled, both serialize perfectly well — the payload
+   * carries the operation as a body-free marker and a fresh entry relaunches it.
+   * Only the in-flight MOMENT is unserializable. `invokesFor` cannot express
+   * that: its controllers are dropped on exit, not on settle, so it reports a
+   * long-finished operation as live and would reject snapshots that are entirely
+   * sound. Do not "simplify" this back to either of those.
+   */
+  private assertNoInFlightInvokes(method: 'toJSON' | 'toSecureJSON'): void {
+    const running = [...this.inFlightInvokesFor(this.adaptee)]
+    if (running.length === 0) return
+
+    const listed = running
+      .map((r) => `  state "${r.leaf}" — ${r.label}`)
+      .join('\n')
+    const plural = running.length > 1
+
+    throw new StateMachineError(
+      `Cannot serialize with ${method}(): ${
+        plural ? `${running.length} invoke operations are` : 'an invoke operation is'
+      } in flight.\n` +
+        `${listed}\n` +
+        '\n' +
+        'A pending promise has no serializable continuation. That is a property of ' +
+        'the JavaScript runtime rather than a limit of this library: a suspended ' +
+        'computation is not a value here, so neither the promise nor the AbortSignal ' +
+        'it is running against can be written into a payload or rebuilt from one. A ' +
+        'snapshot taken at this instant would restore into a machine that sits in ' +
+        `${plural ? 'those states' : 'that state'} with nothing running, and the ` +
+        'completion event that would have moved it on never arrives.\n' +
+        '\n' +
+        'You decide when to save, so either of these works:\n' +
+        `  • Wait for the operation to settle, then serialize. The machine is ` +
+        'serializable again the moment nothing is running — a settled operation ' +
+        'is carried as a reference and relaunched on a fresh entry.\n' +
+        '  • Abort it by leaving the state (the machine aborts a leaf\'s operations ' +
+        'on exit), then serialize the state you land in.',
+      { state: running[0]!.leaf },
+    )
+  }
+
+  /**
    * Serializes the StateMachine to a JSON string.
    *
    * WHAT IS CARRIED. The config (functions as NAME references only — never a
@@ -5996,8 +6148,17 @@ export class StateMachine<
    * restore start from the restore, not from the save. (Invoke DELAYS are
    * different — those are recomputed from `stateEntryTimes` and do resume with
    * the correct remaining time.)
+   *
+   * THROWS while an `invoke` OPERATION is in flight for the primary owner. A
+   * running operation has no serializable form — a pending promise has no
+   * continuation this runtime can capture — so a snapshot taken then would
+   * restore into a machine that looks busy and is running nothing. Serialize
+   * once the operation has settled, or leave the state (which aborts it) and
+   * serialize from there. See {@link assertNoInFlightInvokes}; a DECLARED or
+   * already-SETTLED operation is not affected and serializes normally.
    */
   public toJSON(): string {
+    this.assertNoInFlightInvokes('toJSON')
     // Pre-allocate objects for better performance
     const serializedStates: Record<string, any> = {}
     const serializedEvents: Record<string, any> = {}
@@ -6042,9 +6203,14 @@ export class StateMachine<
    * code but can still forge configuration.
    *
    * It carries exactly what {@link toJSON} carries, including the behavioural
-   * scalars and the same known issue about in-flight deadlines.
+   * scalars and the same known issue about in-flight deadlines — and, being the
+   * same payload, it refuses on the same terms: it THROWS while an `invoke`
+   * OPERATION is in flight for the primary owner. Being async buys nothing here;
+   * the limit is that a pending promise has no serializable continuation, not
+   * that the caller was on the wrong side of an `await`.
    */
   public async toSecureJSON(): Promise<string> {
+    this.assertNoInFlightInvokes('toSecureJSON')
     const serializedStates: Record<string, any> = {}
     const serializedEvents: Record<string, any> = {}
 

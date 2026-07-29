@@ -149,7 +149,14 @@ describe('W3b.1 П.7 — round-trip машины с invoke-операцией н
       },
       events: {
         // Только реальный onDone-таргет; НИКАКОГО undefined-события в карте.
-        done: { transitions: [{ from: 'op', to: 'done' }] },
+        // W3b.2 — 'done' объявлено (никакого INVOKE_UNKNOWN_EVENT), но перехода
+        // ИЗ 'op' нет: операция РЕАЛЬНО стартует и РЕАЛЬНО завершается, её
+        // onDone поднимается и штатно отбрасывается, а машина ОСТАЁТСЯ в 'op'.
+        // Так снапшот по-прежнему берётся из листа с operation-invoke, но уже
+        // НЕ в момент ПОЛЁТА операции: сериализация в полёте теперь отказ (см.
+        // serialization_invoke_inflight.test.ts), и это ПРАВИЛЬНО — снапшот
+        // «в полёте» восстанавливался в машину, где не работает ничего.
+        done: { transitions: [{ from: 'done', to: 'done' }] },
       },
     }
 
@@ -158,9 +165,15 @@ describe('W3b.1 П.7 — round-trip машины с invoke-операцией н
       logger: logger as any,
     })
 
+    // Дать операции стартовать И завершиться: после этого в полёте ничего нет,
+    // а машина всё ещё в 'op' (guard выше не пустил переход).
+    await tick(30)
+    expect(original.getCurrentState()).toBe('op')
+
     // Сериализуем машину, находящуюся в листе 'op' с operation-invoke.
     const json = await original.toSecureJSON()
     const parsed = JSON.parse(json)
+    expect(JSON.parse(json).currentState).toBe('op')
 
     // (проверка 1) src обработан ЯВНО — не молча выпал. На HEAD serialize спредит
     // ...inv, src-функция теряется в JSON.stringify, и в снапшоте остаётся голый

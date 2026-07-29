@@ -88,6 +88,22 @@ receive the underlying owner object directly. The adapter wrapper stays
 internal to the machine boundary so host code does not need to unwrap it in
 each callback.
 
+**One adapter binds one owner; one machine drives many.** The active state lives in
+the owner, under the config's `stateAttribute`, and is read and written through this
+contract — so a second owner needs only a second adapter, not a second machine. Drive
+it through the `*For` family (`fireEventFor(owner, event, …)` and siblings), which
+accepts a raw object and wraps it in a `MemoryAdapter` internally, cached per object.
+See "Driving several objects with one machine" in the README.
+
+**The adaptee's identity is load-bearing.** Every per-owner structure the engine keeps
+— history for `history` states, state entry times, armed `invoke` timers, in-flight
+`invoke` operations, invoke restart counts — is held in a `WeakMap` keyed by
+`adapter.adaptee`. Two adapters over the *same* object therefore share one set of
+records, which is what makes wrapping-on-demand safe; two adapters over *equal but
+distinct* objects do not. An implementation whose `adaptee` getter returns a fresh
+object per call (a projection, a clone, a proxy created on read) silently loses that
+runtime on every access. Return a stable reference.
+
 ## EP-5 — ILogger (logging)
 
 **Contract** (from `src/types.ts`):
@@ -119,6 +135,15 @@ export interface StatePersistenceAdapter {
 shape (NOT optional). The `state` argument to `save` IS optional (`state?: ...`) but
 if provided, the inner shape must include all 3 fields. async; method named `restore`
 (NOT `load`). See `examples/integration/persistence-adapter/`.
+
+**Scope: the construction owner only.** `machine.saveState()` reads the current state,
+history map and entry times of the owner the machine was constructed with, and
+`machine.restoreState()` writes them back to that same owner and re-arms its timers. A
+record driven through the `*For` family is not covered by either — it does not appear
+in the saved shape, and a restore does not touch it. The same is true of `toJSON` /
+`fromJSON`. For many records, the persisted state is the record's own `stateAttribute`
+field and this EP is not involved; see "Driving several objects with one machine" in
+the README, including the per-record runtime that no persistence path carries.
 
 ## EP-7 — validateConfig (config validation)
 
