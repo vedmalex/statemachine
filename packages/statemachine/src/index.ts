@@ -82,6 +82,9 @@ export type {
   KeysOf,
   ExtractAdaptee,
   ErrorContext,
+  // W8: the payload type of the optional `IMonitor.recordLifecycle` observability
+  // channel — a consumer implementing that method must be able to name it.
+  LifecycleEvent,
 } from './types'
 
 /**
@@ -109,6 +112,44 @@ export type { MonitoringConfig } from './monitoring'
  * inject through `StateMachineOptions.monitor`.
  */
 export { StateMachineMonitor, createDefaultMonitor, HealthStatus } from './monitoring'
+
+// === W8/V2 — lifecycle TRACER (consumer-side debugging instrument) ===
+// The raw `IMonitor.recordLifecycle` channel is a time-free, un-aggregated
+// stream. The tracer is the consumer-side half: it pairs begin/end edges,
+// stamps subscriber time, and renders the callback timeline — so "why was my
+// onExit never called?" / "which callback is hung?" is a `format()` call rather
+// than a hundred lines of bespoke bookkeeping.
+
+/**
+ * @category Unstable
+ * @unstable — lifecycle tracer factory. Pass the result straight to
+ * `StateMachineOptions.monitor`, or decorate an existing monitor with
+ * `tracer.wrap(myMonitor)`.
+ *
+ * @see docs/lifecycle-tracing.md
+ *
+ * @example
+ * ```ts
+ * const tracer = createLifecycleTracer()
+ * const sm = new StateMachine(config, owner, { monitor: tracer })
+ * await sm.fireEvent('go')
+ * console.log(tracer.format())
+ * ```
+ */
+export { createLifecycleTracer } from './lifecycle-tracer'
+
+/**
+ * @category Unstable
+ * @unstable — lifecycle tracer surface and its payload / option shapes.
+ */
+export type {
+  LifecycleTracer,
+  LifecycleRecord,
+  LifecycleTracerOptions,
+  LifecycleTracerStats,
+  LifecycleFormatOptions,
+  GuardCoverage,
+} from './lifecycle-tracer'
 
 // === П13/EO-8 — logger RUNTIME surface ===
 

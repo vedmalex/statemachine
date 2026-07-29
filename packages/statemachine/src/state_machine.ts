@@ -32,6 +32,7 @@ import {
   type ITimerScheduler,
   isAdapter,
   type KeysOf,
+  type LifecycleEvent,
   MemoryAdapter,
   type MethodsOf,
   type PropertiesOf,
@@ -53,6 +54,13 @@ import {
  * Doubled error counters are fatal for the quantitative simulator oracles (W5).
  */
 const RUNTIME_ERROR_REPORTED = Symbol('mb3.runtimeErrorReported')
+
+/**
+ * W8/V1 — `LifecycleEvent.hook` labels for the enter-hook slots, positionally
+ * aligned with the `enterActions` array in `executeEnterActions`. Module-level so
+ * an unsubscribed machine allocates nothing for it.
+ */
+const ENTER_HOOK_NAMES = ['onBeforeEnter', 'onEnter', 'onAfterEnter'] as const
 
 /**
  * Prototype-chain builtin names that must NEVER be call-time-resolved as an
@@ -323,6 +331,37 @@ export class StateMachine<
       >
     | undefined
 
+  // ── W8/V1: public lifecycle observability channel ───────────────────────────
+  /**
+   * W8/V1 — near-zero gate. Resolved ONCE in the constructor (the monitor is
+   * injected there and never reassigned), so an unsubscribed machine pays a
+   * single boolean test per instrumented callback and builds NO event object,
+   * takes NO extra promise hop, and allocates nothing. Every emission site is
+   * wrapped in `if (this.lifecycleEnabled)`.
+   */
+  private lifecycleEnabled = false
+  /** W8/V1 — per-machine monotonic record counter (`LifecycleEvent.seq`). */
+  private lifecycleSeq = 0
+  /**
+   * W8/V1 — per-machine monotonic microstep id (`LifecycleEvent.microstep`).
+   * Incremented at the START of {@link computeEnabledSet}, i.e. before the first
+   * guard of an event-driven selection attempt, so a guard and the enter/exit
+   * hooks of the microstep it selects share ONE id. Starts at 0 and is
+   * pre-incremented, so `0` is RESERVED for the paths that have no microstep at
+   * all (construction / reset / resumeTimers).
+   */
+  private microstepCounter = 0
+  /**
+   * W8/V1 — id of the microstep currently being selected / applied. Set by
+   * {@link computeEnabledSet} and read by the guard emission site and by
+   * {@link applyMicrostep}, which run strictly INSIDE that same run-to-completion
+   * step (a nested drain is structurally impossible: `fireEvent` from a callback
+   * is rejected as reentrant and `raiseEvent` only queues). Each reader still
+   * copies it into a local before its first `await`, so even a future nesting
+   * cannot retag an in-flight record.
+   */
+  private currentMicrostep = 0
+
   // Event Queue Infrastructure (SCXML Run-to-Completion)
   private externalQueue: QueuedEvent<TOwner>[] = []
   private internalQueue: QueuedEvent<TOwner>[] = []
@@ -397,6 +436,10 @@ export class StateMachine<
     // Если передали - используем, если нет - fallback на легковесные версии
     this.logger = options?.logger ?? DefaultEngineLogger
     this.monitor = options?.monitor ?? createDefaultMonitor()
+    // W8/V1 — cache the lifecycle subscription once: `monitor` is never
+    // reassigned after construction, and this keeps the unsubscribed hot path at
+    // a single boolean test (see {@link lifecycleEnabled}).
+    this.lifecycleEnabled = typeof this.monitor.recordLifecycle === 'function'
     this.schedulerProvided = options?.scheduler !== undefined
     this.scheduler = options?.scheduler ?? createDefaultScheduler()
     this.clock = options?.clock ?? Date.now
@@ -571,6 +614,142 @@ export class StateMachine<
   private ownerKey(obj?: Adapter<any>): object {
     const raw = (obj?.adaptee ?? this.adaptee?.adaptee) as object | undefined
     return raw ?? this
+  }
+
+  // ── W8/V1: lifecycle observability emission ─────────────────────────────────
+  /**
+   * W8/V1 — build and dispatch ONE {@link LifecycleEvent}. The SOLE call site of
+   * `monitor.recordLifecycle` in the engine, so the SINK GUARD below covers every
+   * emission by construction.
+   *
+   * The guard swallows a failure of the SINK only. It never sees — and therefore
+   * never swallows — the observed callback's own error: that is raised by
+   * `callAction` and routed by `processError` on a separate path.
+   *
+   * CALLERS MUST GATE on {@link lifecycleEnabled} before calling, so an
+   * unsubscribed machine never even reaches the argument evaluation.
+   */
+  private emitLifecycle(
+    kind: LifecycleEvent['kind'],
+    hook: string,
+    state: string,
+    owner: object,
+    microstep: number,
+    edge: LifecycleEvent['edge'],
+    extra?: { event?: string; failed?: boolean; outcome?: boolean; transition?: string },
+  ): void {
+    const record: LifecycleEvent = {
+      kind,
+      hook,
+      state,
+      owner,
+      microstep,
+      seq: this.lifecycleSeq++,
+      edge,
+      ...(extra?.event !== undefined ? { event: extra.event } : {}),
+      ...(extra?.failed !== undefined ? { failed: extra.failed } : {}),
+      ...(extra?.outcome !== undefined ? { outcome: extra.outcome } : {}),
+      ...(extra?.transition !== undefined ? { transition: extra.transition } : {}),
+    }
+    try {
+      this.monitor.recordLifecycle?.(record)
+    } catch {
+      /* a monitor sink must never break the drain */
+    }
+  }
+
+  /**
+   * W8/V1 — run ONE engine-invoked callback through {@link callAction} with a
+   * `begin` / `end` lifecycle pair around it, preserving the caller's error
+   * routing BYTE-FOR-BYTE.
+   *
+   * Two invariants shape the shape of the chain:
+   *
+   * 1. When nothing is subscribed the call is the ORIGINAL
+   *    `callAction(...).catch(route)` expression — not merely "cheap", but the
+   *    IDENTICAL promise chain, so the number of microtask hops before the error
+   *    handler runs is unchanged and no existing timing-sensitive behaviour can
+   *    shift.
+   * 2. When subscribed, `end` is emitted at the settle of the CALLBACK, in a
+   *    `.catch` that RETHROWS, so the caller's `route` still receives the very
+   *    same error afterwards. Emitting after `route` would attribute a hung /
+   *    slow `onError` to the callback it recovers.
+   */
+  private async runLifecycleAction(
+    obj: Adapter<TOwner>,
+    action: ActionOrString<TOwner>,
+    callArgs: any[],
+    route: (error: any) => unknown,
+    kind: LifecycleEvent['kind'],
+    hook: string,
+    state: string,
+    microstep: number,
+    eventName?: string,
+  ): Promise<void> {
+    if (!this.lifecycleEnabled) {
+      await this.callAction(obj, action, ...callArgs).catch(route)
+      return
+    }
+    const owner = this.ownerKey(obj)
+    const ctx = eventName !== undefined ? { event: eventName } : undefined
+    this.emitLifecycle(kind, hook, state, owner, microstep, 'begin', ctx)
+    await this.callAction(obj, action, ...callArgs)
+      .then(() => {
+        this.emitLifecycle(kind, hook, state, owner, microstep, 'end', {
+          ...ctx,
+          failed: false,
+        })
+      })
+      .catch((error) => {
+        this.emitLifecycle(kind, hook, state, owner, microstep, 'end', {
+          ...ctx,
+          failed: true,
+        })
+        throw error
+      })
+      .catch(route)
+  }
+
+  /**
+   * W8/V1b — run ONE invoke ACTION with a `begin` / `end` lifecycle pair, WITHOUT
+   * touching its error routing (the invoke lanes contain their own try/catch and
+   * do not use `processError`, so the error is simply rethrown to them).
+   *
+   * This is the path that closes the ISS-030 observability gap: a STRING-method
+   * invoke action is resolved and called by `callAction` without any `bracketAsync`
+   * wrapper, so it was previously invisible to every observability surface. The
+   * channel wraps the CALL, not the action value, so a string action and an inline
+   * function action are equally observable.
+   *
+   * When nothing is subscribed this is the ORIGINAL bare `await callAction(...)`.
+   */
+  private async runTracedInvokeAction(
+    obj: Adapter<TOwner>,
+    action: ActionOrString<TOwner>,
+    state: string,
+    microstep: number,
+    eventName?: string,
+  ): Promise<void> {
+    if (!this.lifecycleEnabled) {
+      await this.callAction(obj, action)
+      return
+    }
+    const owner = this.ownerKey(obj)
+    const ctx = eventName !== undefined ? { event: eventName } : undefined
+    this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'begin', ctx)
+    try {
+      await this.callAction(obj, action)
+      this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'end', {
+        ...ctx,
+        failed: false,
+      })
+    } catch (error) {
+      this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'end', {
+        ...ctx,
+        failed: true,
+      })
+      throw error
+    }
   }
 
   /** П6 — the current owner's per-state timer map (created on first access). */
@@ -1306,6 +1485,13 @@ export class StateMachine<
     // Per-microstep guard memo (see field docs): each candidate's guard runs at
     // most once even when it governs several leaves.
     this.microstepGuardCache = new Map()
+    // W8/V1 — the microstep BEGINS here, at the first guard evaluation, NOT at
+    // {@link applyMicrostep}: guards run during selection, before the transition
+    // set exists, and a selection attempt that ends with NO enabled transition is
+    // still a distinct microstep whose guard records must not be folded into the
+    // previous (committed) one. Incrementing here makes a guard and the enter /
+    // exit hooks it selects share ONE id, which is what a consumer correlates on.
+    this.currentMicrostep = ++this.microstepCounter
 
     // Active leaves in canonical documentIndex order (W2a) so region priority
     // is deterministic and independent of the activation path.
@@ -1486,6 +1672,31 @@ export class StateMachine<
    * @example
    * const success = await sm.fireEvent('submit', payload);
    */
+  /**
+   * W8/V10 diagnostic. A non-Adapter 2nd positional is an EVENT ARGUMENT, not an
+   * owner — that is what makes `fireEvent(event, arg1, arg2)` work without an
+   * adapter, so the owner stays the primary adaptee. A MULTI-OWNER caller who
+   * passes a RAW object means it as the owner, but it is indistinguishable from a
+   * payload: the event then resolves against the PRIMARY adaptee and typically
+   * fails with a baffling `Invalid event: X for state: Y` naming a state the
+   * caller's object was never in. Detect the tell-tale shape (a plain object
+   * carrying this machine's `stateAttribute`) and say so. ADVISORY ONLY — the
+   * argument is still forwarded verbatim, so a legitimate payload that happens to
+   * carry that field keeps working.
+   */
+  private warnIfRawOwnerMisuse(obj: unknown, eventName: string): void {
+    if (typeof obj !== 'object' || obj === null) return
+    if (!(this.stateAttribute in (obj as Record<string, unknown>))) return
+    // The COMMON and correct pattern `new StateMachine(cfg, obj)` +
+    // `sm.fireEvent(e, obj)` passes the machine's OWN owner back in. The owner
+    // resolved from it is the same object either way, so there is nothing to warn
+    // about — only a DIFFERENT raw object is the multi-owner mistake.
+    if (this.adaptee !== undefined && obj === this.ownerKey(this.adaptee)) return
+    this.logger?.warn?.(
+      `fireEvent('${eventName}'): the 2nd positional argument is a RAW object carrying '${String(this.stateAttribute)}'. It is passed as an EVENT ARGUMENT, not as the owner, so the event resolves against this machine's primary owner. For multi-owner use wrap it: fireEvent(event, new MemoryAdapter(obj)).`,
+    )
+  }
+
   public async fireEvent(
     eventName: keyof SMConfig['events'] | '*',
     ...args: any[]
@@ -1503,6 +1714,7 @@ export class StateMachine<
           event: String(eventName),
         })
     } else if (!isAdapter(obj)) {
+      this.warnIfRawOwnerMisuse(obj, String(eventName))
       args.unshift(obj)
       if (this.adaptee) targetObj = this.adaptee
       else
@@ -1545,6 +1757,7 @@ export class StateMachine<
           event: String(eventName),
         })
     } else if (!isAdapter(obj)) {
+      this.warnIfRawOwnerMisuse(obj, String(eventName))
       args.unshift(obj)
       if (this.adaptee) targetObj = this.adaptee
       else
@@ -3239,10 +3452,27 @@ export class StateMachine<
    * ancestor is never re-entered nor exited (no onEnter/onExit re-fire, no
    * timer re-arm/leak).
    *
-   * - `enterStates` = new ancestry MINUS old, sorted ascending by depth then
-   *   document (insertion) order -> root-to-leaf entry.
-   * - `exitStates` = old ancestry MINUS new, sorted descending by depth ->
-   *   leaf-to-root exit.
+   * ORDER (W8/V11 — W3C SCXML §3.13, canonical):
+   * - `enterStates` = new ancestry MINUS old, sorted ASCENDING by the compiled
+   *   model's `documentIndex` = DOCUMENT ORDER (DFS preorder of the config
+   *   tree) -> ancestor-before-descendant AND each region walked contiguously.
+   * - `exitStates` = old ancestry MINUS new, sorted DESCENDING by the same
+   *   `documentIndex` = REVERSE DOCUMENT ORDER -> descendant-before-ancestor
+   *   AND sibling regions unwound back-to-front (r3, r2, r1).
+   *
+   * `documentIndex` IS the DFS preorder rank (see model.ts `compileModel`), so
+   * ONE sort key delivers both the layer relation (an ancestor is always
+   * assigned a smaller index than any of its descendants, because the index is
+   * handed out on ENTERING the node) and the sibling/traversal shape. It
+   * replaces the pre-V11 `(depth, insertion-order)` key, which produced a
+   * DEPTH-MAJOR (level-order) interleaving across parallel regions and a
+   * FORWARD sibling order on exit — both divergent from §3.13.
+   *
+   * A state absent from the compiled model (defensive: `ancestorChain` only
+   * ever yields states registered by `processStates`, which walks the SAME
+   * config `compileModel` does) falls back to a FINITE sentinel rank, then to
+   * the depth axis, then to collection order — deterministic, never NaN, and
+   * still layer-correct among such nodes.
    *
    * Consumed by BOTH R1 (applyTransition / setInitialState / reset) and R2.
    */
@@ -3273,8 +3503,13 @@ export class StateMachine<
       return depth
     }
 
-    // Preserve document (insertion) order for equal depth via a stable sort on
-    // the original collection order.
+    // Canonical rank = the compiled model's documentIndex (DFS preorder). The
+    // sentinel MUST be finite: `Infinity - Infinity` is NaN, which would make
+    // the comparator incoherent for two unranked states.
+    const UNRANKED = Number.MAX_SAFE_INTEGER
+    const rankOf = (state: string): number =>
+      this.model?.documentIndexOf(state) ?? UNRANKED
+
     const enterRaw: string[] = []
     for (const state of newAncestry) {
       if (!oldAncestry.has(state)) enterRaw.push(state)
@@ -3285,12 +3520,28 @@ export class StateMachine<
     }
 
     const enterStates = enterRaw
-      .map((state, index) => ({ state, index, depth: depthOf(state) }))
-      .sort((a, b) => a.depth - b.depth || a.index - b.index)
+      .map((state, index) => ({
+        state,
+        index,
+        depth: depthOf(state),
+        rank: rankOf(state),
+      }))
+      // ENTRY = document order (ascending documentIndex).
+      .sort(
+        (a, b) => a.rank - b.rank || a.depth - b.depth || a.index - b.index,
+      )
       .map((entry) => entry.state)
     const exitStates = exitRaw
-      .map((state, index) => ({ state, index, depth: depthOf(state) }))
-      .sort((a, b) => b.depth - a.depth || a.index - b.index)
+      .map((state, index) => ({
+        state,
+        index,
+        depth: depthOf(state),
+        rank: rankOf(state),
+      }))
+      // EXIT = reverse document order (descending documentIndex).
+      .sort(
+        (a, b) => b.rank - a.rank || b.depth - a.depth || a.index - b.index,
+      )
       .map((entry) => entry.state)
 
     return { enterStates, exitStates }
@@ -3652,6 +3903,10 @@ export class StateMachine<
       error?: Error
     }> = []
 
+    // W8/V1c — copy the microstep id BEFORE the first `await` so a guard record
+    // can never be retagged by a later microstep (see {@link currentMicrostep}).
+    const guardMicrostep = this.currentMicrostep
+
     // Descendant-dominance as ORDER (§4, W3-B.1): a dominating descendant is
     // ordered BEFORE the ancestor it dominates (never a comparator branch —
     // dominance is a PARTIAL order; a stable topological reorder is used below).
@@ -3757,11 +4012,41 @@ export class StateMachine<
       let passed = false
       let threw = false
       let guardError: Error | undefined
+      // W8/V1c — emit ONLY around a REAL evaluation. The cache-hit branch above
+      // returns early, so a candidate governing several leaves still produces
+      // exactly ONE guard pair per microstep — the channel reports guard
+      // EXECUTIONS, matching the engine's "each guard runs at most once per
+      // microstep" contract rather than the number of times it was consulted.
+      const guardOwner = this.lifecycleEnabled
+        ? this.ownerKey(obj as unknown as Adapter<any>)
+        : (undefined as unknown as object)
+      if (this.lifecycleEnabled) {
+        this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'begin', {
+          transition: label,
+        })
+      }
       try {
         passed = Boolean(
           await this.callAction(obj as any, transition.guard, ...args),
         )
+        if (this.lifecycleEnabled) {
+          this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'end', {
+            transition: label,
+            failed: false,
+            outcome: passed,
+          })
+        }
       } catch (error) {
+        if (this.lifecycleEnabled) {
+          // A THROWING guard leaves the transition DISABLED, so the outcome the
+          // consumer must count for coverage is `false` — alongside `failed:true`,
+          // which distinguishes it from an honest rejection.
+          this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'end', {
+            transition: label,
+            failed: true,
+            outcome: false,
+          })
+        }
         threw = true
         // F7: a guard EXCEPTION must reach the OBSERVABLE monitor.recordError
         // channel (context phase:'guard') — invisible otherwise to a consumer's
@@ -3918,6 +4203,12 @@ export class StateMachine<
       phase: 'transition',
     }
 
+    // W8/V1 — the id assigned when this microstep's selection began
+    // ({@link computeEnabledSet}), copied before the first `await` so the whole
+    // exit → enter → commit → arm span carries ONE stable id, including when the
+    // microstep aborts and its enter records must be discarded by the consumer.
+    const microstep = this.currentMicrostep
+
     // Resolve the fully-committed target configuration (region expansion +
     // conflict removal + HISTORY restoration) BEFORE any action runs, and derive
     // the enter/exit sets from it. Folding each fired transition's target over a
@@ -3985,7 +4276,7 @@ export class StateMachine<
             finalConfig,
             String(eventName),
           )
-          await this.executeExitActions(obj, exitStateName, args, context, exitCtx)
+          await this.executeExitActions(obj, exitStateName, args, context, exitCtx, microstep)
         }
       } catch (error) {
         if (this.abortOnExitError) return { kind: 'abort-exit' }
@@ -4016,7 +4307,7 @@ export class StateMachine<
       // throw / timeout aborts before any target timer is armed (EO-4).
       try {
         for (const enterStateName of enterStates) {
-          await this.executeEnterActions(obj, enterStateName, args, context, false)
+          await this.executeEnterActions(obj, enterStateName, args, context, false, microstep)
         }
       } catch (error) {
         if (this.errorState) return { kind: 'error-state' }
@@ -4066,7 +4357,7 @@ export class StateMachine<
         // operation is RESTARTABLE (fresh signal, no double-fire trap), so
         // relaunch the operations of every still-active exited source leaf.
         for (const s of exitStates) {
-          this.rearmInvokeOperationsAfterAbort(obj, s)
+          this.rearmInvokeOperationsAfterAbort(obj, s, microstep)
         }
         return undefined
       }
@@ -4084,7 +4375,7 @@ export class StateMachine<
         // abortOnExitError / onTransition / onAfter. Bounded to avoid the
         // deterministic-throw livelock (see rearmInvokeOperationsAfterAbort).
         for (const s of exitStates) {
-          this.rearmInvokeOperationsAfterAbort(obj, s)
+          this.rearmInvokeOperationsAfterAbort(obj, s, microstep)
         }
         throw result.error
       }
@@ -4119,7 +4410,7 @@ export class StateMachine<
         }
         this.commitConfiguration(obj, errorConfig, errSets.exitStates)
         for (const s of errSets.exitStates) this.teardownStateTimers(s, obj)
-        for (const s of errSets.enterStates) this.armStateInvoke(obj, s)
+        for (const s of errSets.enterStates) this.armStateInvoke(obj, s, microstep)
         // W4.1 #3: signal error-state recovery distinctly. The requested target
         // did NOT fire — the caller reports fired:false so the detailed channel
         // matches the monitor's recordTransition(false) above and the machine's
@@ -4137,12 +4428,24 @@ export class StateMachine<
       // then arm invoke timers for the entered leaves — from the ACTUALLY-written
       // configuration (never the regional default — T3 deep/shallow history).
       for (const s of exitStates) this.teardownStateTimers(s, obj)
-      for (const s of enterStates) this.armStateInvoke(obj, s)
+      for (const s of enterStates) this.armStateInvoke(obj, s, microstep)
 
       // done.state.<C> innermost-first for composites that just became all-final.
       this.checkCompletion(obj as any, currentState, finalConfig)
 
-      this.monitor.recordTransition(Date.now() - transitionStartTime, true)
+      // W8/V5a — ADDITIVE: the SUCCESS path now carries the same
+      // {@link TransitionContext} the two REFUSAL sites already pass (:1322 guard-
+      // rejected, :1402 aborted, :4376 errorState). Without it the monitor could see
+      // WHICH transitions committed but never WHY: an INTERNALLY raised event
+      // (`done.state.<C>`, an invoke `onDone`) never appears on any external surface,
+      // so a `recordTransition(success)` was an anonymous state write. The third
+      // parameter has always been optional (types.ts `IMonitor.recordTransition`) and
+      // every existing monitor ignores extra arguments, so this is purely additive.
+      this.monitor.recordTransition(Date.now() - transitionStartTime, true, {
+        fromState: currentState,
+        toState: finalConfig,
+        eventName: String(eventName),
+      })
       return { kind: 'ok' }
     } finally {
       this._isTransitioning = false
@@ -4191,6 +4494,9 @@ export class StateMachine<
     // W3b (SPEC §6а, decision «б») — supplemental context appended as the LAST
     // argument to `onExit` (never replacing the event payload).
     exitCtx: ExitContext,
+    // W8/V1 — id of the microstep these exit hooks belong to (0 = no microstep;
+    // see {@link microstepCounter}). Observability only: never read by the engine.
+    microstep = 0,
   ): Promise<void> {
     // W3b (SPEC §6а, decision «а») — abort any in-flight invoke operations of
     // this leaf BEFORE its onExit runs, so the exit handler observes
@@ -4200,6 +4506,18 @@ export class StateMachine<
     const controllers = this.invokesFor(obj).get(fromStateName)
     if (controllers) {
       for (const controller of controllers) controller.abort()
+      // W8/V1b — an abort is an instantaneous POINT, so it is reported as an
+      // ADJACENT begin+end pair (the `edge` union has no 'point' member). Without
+      // it an in-flight tracker cannot tell "cancelled" from "still running":
+      // an aborted operation's own settle may never arrive.
+      if (this.lifecycleEnabled) {
+        const owner = this.ownerKey(obj)
+        const abortCtx = { event: exitCtx.event }
+        for (let i = 0; i < controllers.length; i++) {
+          this.emitLifecycle('invoke', 'invoke.abort', fromStateName, owner, microstep, 'begin', abortCtx)
+          this.emitLifecycle('invoke', 'invoke.abort', fromStateName, owner, microstep, 'end', abortCtx)
+        }
+      }
     }
 
     const fromState = this.states.get(fromStateName)
@@ -4217,22 +4535,37 @@ export class StateMachine<
 
     // Execute exit actions in sequence. Only `onExit` receives the ExitContext
     // as a trailing argument (SPEC §6а): onExit(adaptee, ...payload, exitCtx).
-    await this.runExitAction(obj, fromState, fromState.onBeforeExit, args, exitErrorContext)
-    await this.runExitAction(obj, fromState, fromState.onExit, [...args, exitCtx], exitErrorContext)
-    await this.runExitAction(obj, fromState, fromState.onAfterExit, args, exitErrorContext)
+    await this.runExitAction(obj, fromState, fromStateName, 'onBeforeExit', fromState.onBeforeExit, args, exitErrorContext, microstep)
+    await this.runExitAction(obj, fromState, fromStateName, 'onExit', fromState.onExit, [...args, exitCtx], exitErrorContext, microstep)
+    await this.runExitAction(obj, fromState, fromStateName, 'onAfterExit', fromState.onAfterExit, args, exitErrorContext, microstep)
   }
 
-  /** W3b helper — run one exit hook with its error routing (or skip if absent). */
+  /**
+   * W3b helper — run one exit hook with its error routing (or skip if absent).
+   * W8/V1 — also the emission point of the hook's `exit` begin/end pair; error
+   * routing is delegated to {@link runLifecycleAction} unchanged.
+   */
   private async runExitAction(
     obj: Adapter<TOwner>,
     fromState: State<TOwner>,
+    fromStateName: string,
+    hook: string,
     action: ActionOrString<TOwner> | undefined,
     callArgs: any[],
     exitErrorContext: ErrorContext,
+    microstep: number,
   ): Promise<void> {
     if (!action) return
-    await this.callAction(obj, action, ...callArgs).catch(
+    await this.runLifecycleAction(
+      obj,
+      action,
+      callArgs,
       this.processError(obj, exitErrorContext, fromState.onError, this.onError),
+      'exit',
+      hook,
+      fromStateName,
+      microstep,
+      exitErrorContext.event,
     )
   }
 
@@ -4302,6 +4635,11 @@ export class StateMachine<
     // / reset / resume paths keep the default (true): the configuration is
     // already committed when they enter, so arming inline stays correct.
     armTimers = true,
+    // W8/V1 — id of the microstep these enter hooks belong to. The default `0` is
+    // the RESERVED "no microstep" id used by the construction / reset / resume
+    // paths, which enter a configuration outside any event-driven microstep (see
+    // {@link microstepCounter}). Observability only: never read by the engine.
+    microstep = 0,
   ): Promise<void> {
     const toState = this.states.get(toStateName)
     if (!toState) return
@@ -4315,16 +4653,25 @@ export class StateMachine<
       toState.onAfterEnter,
     ]
 
-    for (const action of enterActions) {
+    for (let i = 0; i < enterActions.length; i++) {
+      const action = enterActions[i]
       if (action) {
-        await this.callAction(obj, action, ...args).catch(
+        await this.runLifecycleAction(
+          obj,
+          action,
+          args,
           this.processError(obj, enterContext, toState.onError, this.onError),
+          'enter',
+          ENTER_HOOK_NAMES[i] as string,
+          toStateName,
+          microstep,
+          enterContext.event,
         )
       }
     }
 
     if (armTimers) {
-      this.armStateInvoke(obj, toStateName)
+      this.armStateInvoke(obj, toStateName, microstep)
     }
   }
 
@@ -4336,7 +4683,14 @@ export class StateMachine<
    * {@link executeEnterActions} so the microstep can arm strictly AFTER the point
    * of no return, while enter ACTIONS still run before it.
    */
-  private armStateInvoke(obj: Adapter<TOwner>, toStateName: string): void {
+  private armStateInvoke(
+    obj: Adapter<TOwner>,
+    toStateName: string,
+    // W8/V1b — the microstep that ARMED these invokes. Captured into the launch /
+    // fire closures so an operation that starts and settles LONG after the
+    // microstep committed is still attributable to the entry that armed it.
+    microstep = 0,
+  ): void {
     const toState = this.states.get(toStateName)
     if (!toState || !toState.invoke || toState.invoke.length === 0) return
 
@@ -4393,6 +4747,7 @@ export class StateMachine<
           obj,
           toStateName,
           invocation,
+          microstep,
         )
         controllers.push(controller)
         timers.push(timerId)
@@ -4419,7 +4774,13 @@ export class StateMachine<
         if (currentState?.split('|').includes(toStateName)) {
           try {
             if (timer.action) {
-              await this.callAction(obj, timer.action)
+              await this.runTracedInvokeAction(
+                obj,
+                timer.action,
+                toStateName,
+                microstep,
+                timer.event !== undefined ? String(timer.event) : undefined,
+              )
             }
             this.raiseEvent(timer.event as string, obj as any)
             this.scheduleProcessing()
@@ -4454,6 +4815,10 @@ export class StateMachine<
     obj: Adapter<TOwner>,
     toStateName: string,
     op: InvokeOperation<TOwner>,
+    // W8/V1b — the microstep that armed this operation, carried into the launch
+    // closure so a long-running `src` settling many microsteps later is still
+    // attributed to the entry that started it.
+    microstep = 0,
   ): { controller: AbortController; timerId: any } {
     const controller = new AbortController()
     const startOp = () => {
@@ -4462,15 +4827,41 @@ export class StateMachine<
       const currentState = this.getCurrentState(obj as any)
       if (!currentState?.split('|').includes(toStateName)) return
       if (controller.signal.aborted) return
+      // W8/V1b — `begin` marks the moment `src` is ACTUALLY invoked (after the
+      // still-in-leaf / not-yet-aborted checks), so a scheduled-then-cancelled
+      // launch never opens a pair that will not close.
+      const traced = this.lifecycleEnabled
+      const owner = traced ? this.ownerKey(obj) : (undefined as unknown as object)
+      const opCtx =
+        op.onDone !== undefined ? { event: String(op.onDone) } : undefined
+      if (traced) {
+        this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'begin', opCtx)
+      }
       let result: Promise<unknown>
       try {
         result = op.src(obj.adaptee, controller.signal)
       } catch (err) {
+        if (traced) {
+          this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
+            ...opCtx,
+            failed: true,
+          })
+        }
         this.handleInvokeRejection(obj, op, controller, err, toStateName)
         return
       }
       Promise.resolve(result).then(
         (value) => {
+          // W8/V1b — `end` is emitted on SETTLE, even when the operation was
+          // aborted meanwhile: the work really did finish, and the dropped
+          // completion event below is a separate fact. An operation whose `src`
+          // never settles correctly shows as a `begin` with no `end`.
+          if (traced) {
+            this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
+              ...opCtx,
+              failed: false,
+            })
+          }
           // Cancelled (leaf left before settle) → drop the completion event.
           if (controller.signal.aborted) return
           if (op.onDone) {
@@ -4479,6 +4870,12 @@ export class StateMachine<
           }
         },
         (err) => {
+          if (traced) {
+            this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
+              ...opCtx,
+              failed: true,
+            })
+          }
           this.handleInvokeRejection(obj, op, controller, err, toStateName)
         },
       )
@@ -4502,6 +4899,9 @@ export class StateMachine<
   private rearmInvokeOperationsAfterAbort(
     obj: Adapter<TOwner>,
     stateName: string,
+    // W8/V1b — the ABORTED microstep whose rollback triggers this relaunch; the
+    // relaunched operation's records are attributed to it.
+    microstep = 0,
   ): void {
     const toState = this.states.get(stateName)
     if (!toState || !toState.invoke || toState.invoke.length === 0) return
@@ -4557,6 +4957,7 @@ export class StateMachine<
         obj,
         stateName,
         invocation,
+        microstep,
       )
       controllers.push(controller)
       timers.push(timerId)
@@ -4961,7 +5362,17 @@ export class StateMachine<
               }
 
               if (invocation.action && this.adaptee) {
-                await this.callAction(this.adaptee as any, invocation.action)
+                // W8/V1b — microstep 0: a RESUMED timer fires outside any
+                // event-driven microstep (see {@link microstepCounter}).
+                await this.runTracedInvokeAction(
+                  this.adaptee as any,
+                  invocation.action,
+                  stateName,
+                  0,
+                  invocation.event !== undefined
+                    ? String(invocation.event)
+                    : undefined,
+                )
               }
               // П3: an invoke-generated event is engine-internal, so it goes on
               // the INTERNAL queue (like the primary invoke path in

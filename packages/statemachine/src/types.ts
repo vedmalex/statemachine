@@ -101,6 +101,150 @@ export interface MonitorMetricsSnapshot {
 }
 
 /**
+ * @unstable — W8/V1 public LIFECYCLE OBSERVABILITY record: one `begin` or `end`
+ * edge of ONE engine-invoked callback (state enter/exit hook, invoke action /
+ * operation, transition guard).
+ *
+ * ## Why it exists
+ * The ORDER and the FACT of enter/exit callback invocation were not observable
+ * from outside the machine at all: a consumer could not answer "why was my
+ * `onExit` never called?", "in which order did the regions enter?", or "which
+ * callback is hung?". This channel makes the drain's callback timeline a
+ * first-class, subscribable stream.
+ *
+ * ## Delivery contract
+ * Delivery is SYNCHRONOUS, inside the drain, on {@link IMonitor.recordLifecycle}.
+ * There is deliberately NO `ts` / `durationMs` field: the subscriber stamps its
+ * own clock (and a simulation plane, where `Date.now` is forbidden, stamps a
+ * virtual one), so the record itself stays fully deterministic.
+ *
+ * Every dispatch is wrapped in a SINK GUARD: a `recordLifecycle` implementation
+ * that throws can NEVER break the drain. The guard swallows sink failures only —
+ * it never swallows the callback's own error, which continues to route through
+ * `onError` / `monitor.recordError` byte-for-byte unchanged.
+ *
+ * ## Pairing
+ * A callback that STARTS emits `edge:'begin'`; when that same callback SETTLES it
+ * emits `edge:'end'`. A `begin` with no matching `end` therefore means the
+ * callback never settled — a HUNG callback (that is the intended diagnosis, not a
+ * bug in the channel). `failed:true` on an `end` means the callback THREW.
+ *
+ * The `end` edge is emitted at the settle of the CALLBACK ITSELF — strictly
+ * BEFORE the error is routed into `processError` / `onError`. Emitting after
+ * error routing would let a hung `onError` masquerade as a hung `onEnter`.
+ *
+ * `invoke.abort` is the one exception to "begin starts something": an abort is an
+ * instantaneous POINT, so it is emitted as an ADJACENT `begin`+`end` pair with no
+ * work in between (`edge` has no `'point'` member and the union is kept narrow).
+ *
+ * ## What this channel does NOT see
+ * - the TRANSITION's own callbacks: `onTransition`, the event-level `onBefore` /
+ *   `onAfter`. Only STATE hooks, invoke work and guards are instrumented.
+ * - the `onError` handler itself (by construction — see the pairing note above).
+ * - the `errorState` fallback path emits NO `enter` events: that recovery commits
+ *   the error configuration DIRECTLY, bypassing the enter-hook executor. This is
+ *   EXPECTED, not an anomaly — a consumer or oracle must NOT read the missing
+ *   `enter` records as "the error state was never entered".
+ * - `invoke.cond` predicates (evaluated at arm time, outside the callback lane).
+ *
+ * ## Relationship to the error channel
+ * ONE throwing callback produces BOTH a `failed:true` `end` record here AND a
+ * separate `monitor.recordError`. They are two views of the SAME failure — a
+ * consumer that adds them up will double-count.
+ *
+ * ## Hierarchy
+ * For `kind:'enter'|'exit'|'invoke'`, `state` is the FULL dot-path of the state.
+ * Ancestry is recovered by dot-parsing it (`'parent.r1.child'`); `regionKey` /
+ * `depth` are deliberately NOT duplicated into the record.
+ *
+ * EXCEPTION — for `kind:'guard'`, `state` is the transition's `from` SELECTOR,
+ * which may be a wildcard (`'*'`, `'p.*'`) or a multi-source list (`'a|b'`) and
+ * is therefore NOT always a dot-path. Key guard records by {@link
+ * LifecycleEvent.transition}, and dot-parse `state` only after checking `kind`.
+ *
+ * ## Stability
+ * `kind` and `hook` form an EXTENSIBLE union — new members will be added without
+ * a major bump. Do NOT write an exhaustive `switch` over them; always keep a
+ * default branch.
+ */
+export interface LifecycleEvent {
+  /**
+   * Coarse family of the instrumented callback. EXTENSIBLE — never switch
+   * exhaustively.
+   */
+  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard'
+  /**
+   * Precise callback slot. EXTENSIBLE. Currently one of `'onBeforeEnter'`,
+   * `'onEnter'`, `'onAfterEnter'`, `'onBeforeExit'`, `'onExit'`, `'onAfterExit'`,
+   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'guard'`.
+   */
+  readonly hook: string
+  /**
+   * Full dot-path of the state the callback belongs to (for `kind:'guard'`, the
+   * transition's `from` selector). Hierarchy = dot-parsing of this string.
+   */
+  readonly state: string
+  /**
+   * The OWNER object this callback ran for, by REFERENCE identity (never
+   * serialize it). One machine can drive MANY objects (`attachToObject`), and
+   * without this discriminator the traces of two owners interleave into one
+   * unreadable stream. For an owner-less internal path this is the machine
+   * instance itself, used as a stable sentinel.
+   */
+  readonly owner: object
+  /**
+   * Monotonic per-machine id of the microstep this callback belongs to.
+   *
+   * The boundary MATTERS: enter hooks run BEFORE the point of no return, so an
+   * ABORTED microstep (a throw under `abortOnExitError`, a contradictory target,
+   * a `transitionTimeout`) has already emitted `enter` records for a state that
+   * was never committed. Grouping by `microstep` lets a consumer discard exactly
+   * those records.
+   *
+   * The counter is incremented once per event-driven selection attempt (at the
+   * start of the OTS computation, so a guard and the enter/exit hooks it selects
+   * share ONE id). Paths that have no microstep at all — initial construction,
+   * `reset`, `resumeTimers` — report `0`, a reserved id the counter never
+   * produces (it starts at 1).
+   *
+   * IDs are NOT DENSE: a selection attempt that enables nothing consumes an id
+   * and emits no hook records, so gaps in the id sequence are normal. Do not
+   * infer "records are missing" from a gap.
+   *
+   * INVOKE ASYMMETRY: an `invoke` record carries the microstep of the step that
+   * ARMED the operation, while its `invoke.abort` carries the microstep of the
+   * EXIT step that cancelled it — so an operation's begin and its abort
+   * legitimately report DIFFERENT ids. Pair them by `owner` + `state` +
+   * adjacency, not by `microstep`.
+   */
+  readonly microstep: number
+  /** Per-machine monotonic record counter; the total order of this stream. */
+  readonly seq: number
+  /**
+   * Which edge of the callback this record is. Named `edge` (NOT `phase`) to
+   * avoid colliding with the unrelated {@link ErrorContext.phase}.
+   */
+  readonly edge: 'begin' | 'end'
+  /** Name of the event that drove this microstep, when there is one. */
+  readonly event?: string
+  /** Present on `edge:'end'`: `true` when the callback THREW / rejected. */
+  readonly failed?: boolean
+  /**
+   * Present on `kind:'guard'`, `edge:'end'`: the predicate's boolean result. A
+   * guard that THREW reports `failed:true` and `outcome:false` (the transition
+   * stays disabled).
+   */
+  readonly outcome?: boolean
+  /**
+   * Present on `kind:'guard'`: the `"<from> -> <to>"` transition label — the SAME
+   * vocabulary as {@link ErrorContext.transition}. Required to key guard COVERAGE:
+   * two transitions leaving the same source are otherwise indistinguishable by
+   * `state` alone.
+   */
+  readonly transition?: string
+}
+
+/**
  * @unstable — observability injection contract.
  * EXPANDED additively in TASK-004 per TD-T4-2: third param of `recordTransition`
  * is parameter-optional; `recordEvent?` and `getMetrics?` are interface-optional.
@@ -111,6 +255,29 @@ export interface IMonitor {
   recordError(error: Error, context?: ErrorContext): void
   recordEvent?(eventName: string, duration: number): void
   getMetrics?(): MonitorMetricsSnapshot
+  /**
+   * @unstable — W8/V1 lifecycle observability sink (OPTIONAL, additive: a monitor
+   * that omits it keeps the exact previous contract, and the engine then does NO
+   * lifecycle work at all — the channel is near-zero-cost when unsubscribed).
+   *
+   * Called SYNCHRONOUSLY from inside the drain for each `begin` / `end` edge of an
+   * engine-invoked callback. See {@link LifecycleEvent} for the full contract:
+   * pairing, the hung-callback signature, `microstep` grouping, multi-owner
+   * discrimination, and what the channel deliberately does NOT observe.
+   *
+   * An implementation that THROWS cannot break the machine — every dispatch is
+   * wrapped in a sink guard and the failure is swallowed. Keep it cheap and
+   * side-effect-free anyway: it runs on the hot path, inside the run-to-completion
+   * drain, and any work done here delays the callbacks it is observing.
+   *
+   * PRESENCE IS SAMPLED ONCE, at machine construction: the monitor you pass to
+   * `StateMachineOptions.monitor` must ALREADY define this method. Attaching it
+   * later (e.g. `sm.getMonitor().recordLifecycle = fn`) is a silent no-op — the
+   * engine cached "unsubscribed" and skips the channel entirely. Removing it
+   * later is safe (the dispatch is optional-chained), it merely wastes the event
+   * construction.
+   */
+  recordLifecycle?(event: LifecycleEvent): void
 }
 
 /** @unstable — error-handler injection contract; surfaces methods consumed by host integrations. */
