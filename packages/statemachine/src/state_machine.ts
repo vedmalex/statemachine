@@ -1,5 +1,6 @@
 import {
   type ContextTrackerKind,
+  claimContextTrackerDisclosure,
   createDefaultContextTracker,
 } from './context_tracker'
 import { securityLogger, stateMachineLogger } from './logger'
@@ -522,13 +523,19 @@ export class StateMachine<
       const resolved = createDefaultContextTracker()
       this.drainContext = resolved.tracker
       this._contextTrackerKind = resolved.kind
-      if (resolved.kind === 'none') {
-        // DISCLOSE the degradation exactly once, at construction. WARN is the
-        // default logger level, so this is visible with no consumer setup and
+      if (resolved.kind === 'none' && claimContextTrackerDisclosure()) {
+        // DISCLOSE the degradation exactly once PER PROCESS. WARN is the default
+        // logger level, so this is visible with no consumer setup and
         // silenceable through `setDefaultLogLevel`. Deliberately NOT routed
         // through `monitor.recordError`: a construction-time environment
         // capability is not a runtime error, and counting it as one would
         // pollute the sim's quantitative oracles.
+        //
+        // The latch lives in context_tracker.ts beside the memoised detection it
+        // describes. Before it, "exactly once" meant once per CONSTRUCTION, so an
+        // application building a machine per request repeated an unchanging
+        // environment warning on every request — the fact is process-scoped and the
+        // detection behind it was already memoised, so only the emission was not.
         this.logger.warn(
           'Precise reentrancy detection is unavailable in this runtime (no ' +
             'AsyncLocalStorage, no AsyncContext.Variable). The machine works and ' +

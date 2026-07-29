@@ -203,7 +203,11 @@ interface CheckReport {
 - **`warnings`** are typed (`no-payload`, `timer-escape`, `dead-events-at-plateau`,
   `uncovered-at-plateau`, `dead-guard-at-plateau`, `non-converging-region`,
   `residual-rejection`, `init-check-skipped`, `shrink-skipped`,
-  `budget-progressing`, `budget-frozen`) so you can triage or relax by kind.
+  `budget-progressing`, `budget-frozen`, `rtc-unobserved`, `lifecycle-truncated`)
+  so you can triage or relax by kind. The last four are OBSERVABILITY findings —
+  they say how much of the run got checked, not that anything was rejected — and
+  each keeps its own kind rather than collapsing into `residual-rejection`, which
+  names a completely different and much more alarming condition.
 
 ### Reproducing a finding
 
@@ -284,13 +288,29 @@ Override with `onRealTimerEscape: 'ignore' | 'warn' | 'fail'`.
 ## Run-to-completion and the settle budget
 
 Every step ends by draining the machine to quiescence: queues empty, nothing in
-flight, no timer pending. The drain is bounded — it pumps microtasks for at most
-`maxTurns` turns, **default 1024** — so a wedged machine can never hang the run. A
-boundary that did not reach quiescence records *why*, as `settleReason` on its
-trace frame.
+flight, no timer pending. The drain's microtask **pump** is bounded — at most
+`maxTurns` turns, **default 1024** — so no amount of internal microtask churn can
+spin the run forever. A boundary that did not reach quiescence records *why*, as
+`settleReason` on its trace frame.
 
-Two of those reasons say the harness ran out of budget. **Neither is a verdict.**
-Both are advisory warnings, and `ok` is unaffected by either:
+That bound covers the pump, and **not** the `fireEvent` call the step makes before
+it. The driver awaits `sm.fireEvent(...)` with no deadline of its own, so a
+transition whose `onEnter` never resolves parks that await and the step never
+returns. Nothing rescues it: the virtual clock only advances inside a settle, and
+the settle is downstream of the await that is parked, so a configured
+`transitionTimeout` never gets its timer processed and `mode: 'liveness'` never
+reaches its clock jump. Measured — a machine with
+`stuck: { onEnter: () => new Promise(() => {}) }` never returned from `step()` in
+any of the four combinations (`safety`/`liveness` × with/without
+`transitionTimeout: 50`). **The real property is: the pump cannot spin forever;
+a callback that never settles can still hang the run.** The defence is on your
+side of the boundary — every `onEnter` / `onExit` / guard / invoke action must
+eventually settle, and `transitionTimeout` bounds them under the *engine's* own
+drain (where it does work, converting a hung callback into an observable reject),
+not under a simulator step already parked on the fire.
+
+Three of the settle reasons say the harness stopped watching. **None is a
+verdict.** All three are advisory warnings, and `ok` is unaffected by any of them:
 
 - **`budget-progressing`** — the pump ran out while the machine was *still*
   observably moving. A long legal chain of zero-delay `invoke` hops does exactly
@@ -308,14 +328,78 @@ at half `maxTurns` so a small per-call budget cannot make the test trivially tru
 16 turns is the largest gap **measured** on the zero-delay chain fixtures, not a
 bound anything guarantees, which is precisely why the result is advisory.
 
-The other reasons describe a settle waiting on *time* rather than on the budget,
-and those the pump reaches at its own early break, **inside** budget — they are
-things it observed, not things it ran out of time to disprove. `WAITING_ON_TIMER`
-(nothing pending, only a future timer) and `WAITING_ON_TRANSITION_TIMEOUT` (a
-genuine in-flight async action racing a future deadline) are legitimate and
-excluded; `WAITING_ON_INTERNAL` — queued or in-progress work with no in-flight
-async behind it, alongside an armed timer — is a real run-to-completion concern and
-is where `I-3`'s teeth live.
+- **`rtc-unobserved`** (`settleReason: 'WAITING_ON_INTERNAL'`) — the pump stopped at
+  its *early* break: work still pending, a future timer armed somewhere, and nothing
+  the harness can see in flight. Read it as a pointer to one macrostep, never as a
+  verdict; the section below says why.
+
+`WAITING_ON_TIMER` (nothing pending, only a future timer) and
+`WAITING_ON_TRANSITION_TIMEOUT` (a genuine in-flight async action racing a future
+deadline) describe a settle waiting on *time*. Both are legitimate, both are
+excluded from every oracle, and neither raises a warning.
+
+### Why `WAITING_ON_INTERNAL` cannot convict either
+
+It was the last reason that could, through `I-3`, and it was justified on the
+grounds that the pump reaches it at its own *early* break — `pending && stuck >= 16
+&& a timer is armed` — rather than by exhausting the budget: something the harness
+observed, not something it ran out of time to disprove. That argument does not
+survive contact with the engine.
+
+The break's entire observational content is *the fingerprint has not moved for 16
+turns and some timer is armed*. That is the same frozen-prefix object a budget
+exhaustion produces, over a window 64× smaller, and the armed timer can belong to a
+completely unrelated parallel region. And `stuck` counts turns over the frozen
+`queueDepth | isProcessingEvents | inFlightAsyncCount` fingerprint — which stays
+frozen across an **entire ordinary microstep**, because the engine awaits once per
+hook slot per state even where you defined no hook. One *legitimate* microstep's
+frozen-turn count is therefore a function of your machine's own width, unbounded and
+config-dependent, measured at roughly one turn per hook-free region and about eight
+per synchronous hook. A fixed 16-turn window against an unbounded legitimate chain
+is refuted by any correct machine whose legitimate chain runs 17 turns.
+
+Measured, through `runSimulation` (seed `'1'`, `steps: 2`, `mode: 'safety'`). Take a
+parallel composite where one region steps `h1 -(invoke delay:0)-> slow` and one
+*other* region merely holds `invoke: [{ event: 'never', delay: 100000 }]` — an armed
+timer that never fires under `'safety'` and that nothing else touches:
+
+```
+slow.onEnter SYNCHRONOUS            ok=false  I-3  WAITING_ON_INTERNAL
+slow.onEnter async, 1 microtask     ok=false  I-3  WAITING_ON_INTERNAL
+slow.onEnter async, 3 / 5 / 20      ok=false  I-3  WAITING_ON_INTERNAL
+the same machine, no sibling timer  ok=true        (clean)
+```
+
+Every one of those reaches `slow` in the same trace. Note the first row: the hook is
+*synchronous*, so there is no async span of any kind to observe — no in-flight
+counter of any design could have separated it. The deciding variable was an
+unrelated region's deadline plus an internal constant.
+
+The general shape: `stuck` is a proxy for *the engine has no scheduled
+continuation*, and that is not observable from outside. Every fixed-window proxy for
+it is a truncation, and every truncation is refuted by a correct machine whose
+legitimate frozen chain is one turn longer than the window.
+
+**What would make it decidable** — so this reads as a scoped gap rather than a
+shrug. Two things, together: live spans covering *every* engine `await` of user code
+(the lifecycle channel already brackets enter/exit hooks, guards and invoke actions,
+but not the transition-level `onTransition` nor the event-level `onBefore` /
+`onAfter`), and an engine progress heartbeat with a **code-constant** gap bound —
+so "no progress for N turns" could be compared against a number the engine
+guarantees rather than one the machine's width determines. Neither exists today.
+
+`I-3` (run-to-completion) is consequently **opt-in**, not part of the default oracle
+set. With every documented settle reason excluded it has no witness a real machine
+can produce, and an inert oracle carrying a default badge inflates both `oraclesRun`
+and the assurance a green run implies. Removing it costs nothing measurable: the
+zero-false-positive corpus that was cited as the standing guard for its promotion
+records 438 frames of which 6 are non-quiescent, and every one of those is
+`WAITING_ON_TIMER` — the corpus never entered the region the teeth lived in. The
+real hang class stays covered by the engine's own `transitionTimeout` and by the
+liveness plane's virtual-time budget. If you still want those frames flagged, pass
+it explicitly through `runSimulation`'s `invariants` option — the registry is
+exported as `INVARIANTS`, so `invariants: INVARIANTS.filter((i) => i.id === 'I-3')`
+selects it.
 
 ### `maxTurns`
 
@@ -346,6 +430,18 @@ exactly what a wedge looks like. Under the earlier rule this machine passed at
 `N = 100` and failed at `N = 1000`, with an `I-3` violation and a
 `TIMEOUT_BUDGET_EXCEEDED` livelock. The only thing that changed between those two
 runs was the internal turn budget.
+
+"No timer is armed" is true of *that* fixture and false of the class, and the
+difference is the more important fact. **Arm one unrelated timer anywhere and the
+same machine moves from a warning to a conviction** — because the pump then leaves
+by its early, 16-turn break instead of by budget exhaustion, and that break used to
+convict. Put the same `slow` in one region of a parallel composite whose *other*
+region merely holds `invoke: [{ event: 'never', delay: 100000 }]`, and the run
+reported `ok:false` with an `I-3` violation for a **synchronous** `onEnter`, and for
+an async one awaiting 1, 3, 5 or 20 microtasks — while the identical machine without
+that sibling region was clean. The deciding variable was never the hook. The
+"Why `WAITING_ON_INTERNAL` cannot convict either" section above closed that path,
+and it is the reason `I-3` is opt-in.
 
 **A zero-delay livelock.** `A -(invoke delay:0, raise e)-> B -(invoke delay:0,
 raise e)-> A`, forever. Genuinely broken — and still not convictable, because the
@@ -384,8 +480,28 @@ path is not evidence about that path.
 
 Separately: a machine that drives itself through unbounded zero-delay `invoke` hops
 is outside the macrostep contract to begin with. A macrostep is meant to converge;
-`checkMachine` bounds the drain so such a machine cannot hang the run, but it does
-not promise to classify one.
+`checkMachine` bounds the drain so such a machine cannot spin the pump forever, but
+it does not promise to classify one — and, per the note at the top of this section,
+a callback that never settles is a different thing that the bound does not reach.
+
+---
+
+## A throwing `invoke` action now fails the run
+
+An `invoke` action that throws is routed to `monitor.recordError`, and the simulator
+turns any `errorCount > 0` on a fault-free run into a synthetic `engine-error`
+violation that forces `ok: false`. That routing reaches call sites it did not reach
+before, so a machine that was **silently green** here can now be red without you
+having changed it.
+
+The tightening is deliberate — an action that throws is a defect the run should not
+swallow — but it is a behaviour change worth stating plainly. Measured: a
+timer-form `invoke: [{ delay: 0, event: 'n1', action: () => { throw … } }]` reports
+`ok:false` with `engine runtime error during simulation: engine recorded 1 runtime
+error(s) via monitor.recordError`, even though the machine still reaches the target
+state (the invoke's event is raised regardless of the action's outcome). If you see
+this on a machine you believe is correct, the throw is real — look at the action,
+not at the harness.
 
 ---
 

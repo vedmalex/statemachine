@@ -174,6 +174,32 @@ export type WarningKind =
    * Advisory (never a {@link FailCause}, never flips `ok`).
    */
   | 'budget-frozen'
+  /**
+   * A macrostep stopped with work pending and a future timer armed while nothing
+   * the harness can observe was in flight (`settleReason:'WAITING_ON_INTERNAL'`).
+   *
+   * Advisory for the same reason as the two budget kinds — it is a truncated
+   * observation over a 16-turn window. The settle fingerprint is frozen for a whole
+   * ordinary microstep (the engine awaits once per hook slot per state even where no
+   * hook is defined), so a legitimate microstep freezes it for a number of turns
+   * that grows with the machine's width, against a fixed break window. Read it as a
+   * pointer to the macrostep worth inspecting, not a verdict.
+   * Advisory (never a {@link FailCause}, never flips `ok`).
+   */
+  | 'rtc-unobserved'
+  /**
+   * An OBSERVATION BUFFER hit its cap and stopped retaining records, so a
+   * lifecycle-keyed oracle saw only a PREFIX of the run
+   * ({@link SimWarning} `lifecycle-truncated`).
+   *
+   * Carried through under its OWN kind rather than the `residual-rejection`
+   * catch-all: a truncated observation plane is a statement about how much of the
+   * run was CHECKED, and naming it "residual rejection" would report a completely
+   * different and much more alarming condition than the one observed — the exact
+   * laundering already fixed for the two budget kinds.
+   * Advisory (never a {@link FailCause}, never flips `ok`).
+   */
+  | 'lifecycle-truncated'
 
 /**
  * The owner source. A SINGLE live owner reused across N runs breaks run
@@ -1915,12 +1941,22 @@ function mapSimWarning(w: SimWarning): CheckWarning {
   if (w.kind === 'timer-escape') {
     return { kind: 'timer-escape', detail: w.message }
   }
-  // Keep the two warning surfaces consistent — neither budget finding may be
+  // Keep the two warning surfaces consistent — no OBSERVABILITY finding may be
   // laundered into the 'residual-rejection' catch-all, which would name a
   // completely different (and much more alarming) condition than the one
-  // observed. Both stay ADVISORY: neither kind is in DEGRADATION_KINDS, so
-  // neither can reach the `degradation` FailCause either.
-  if (w.kind === 'budget-progressing' || w.kind === 'budget-frozen') {
+  // observed. All stay ADVISORY: none of these kinds is in DEGRADATION_KINDS, so
+  // none can reach the `degradation` FailCause either.
+  //
+  // `lifecycle-truncated` and `rtc-unobserved` are here for exactly the reason the
+  // two budget kinds are: a truncated observation window and a settle that stopped
+  // without a readable cause are statements about what the RUN managed to check,
+  // not about a rejected event.
+  if (
+    w.kind === 'budget-progressing' ||
+    w.kind === 'budget-frozen' ||
+    w.kind === 'rtc-unobserved' ||
+    w.kind === 'lifecycle-truncated'
+  ) {
     return { kind: w.kind, detail: w.message }
   }
   return { kind: 'residual-rejection', detail: w.message }

@@ -310,6 +310,29 @@ export interface SimWarning {
      * `count` carries how many boundaries hit it.
      */
     | 'budget-frozen'
+    /**
+     * A settle stopped at the pump's EARLY break with pending work, an armed
+     * future timer, and nothing the harness can observe in flight
+     * (`settleReason:'WAITING_ON_INTERNAL'`).
+     *
+     * Advisory only, and for exactly the same reason as the two budget kinds: it
+     * is a TRUNCATED observation, just over a 16-turn window instead of a 1024-turn
+     * one. The settle fingerprint (`queueDepth|isProcessingEvents|inFlightAsyncCount`)
+     * freezes across an ENTIRE ordinary microstep — the engine awaits once per hook
+     * slot per state even where no hook is defined — so one LEGITIMATE microstep's
+     * frozen-turn count grows with the machine's own width. Measured: a parallel
+     * composite whose only extra ingredient is an unrelated sibling region holding
+     * `invoke: [{event:'never', delay:100000}]` reports this for a SYNCHRONOUS
+     * `onEnter`, and for an async one awaiting 1, 3, 5 or 20 microtasks; without
+     * that sibling timer the identical machine is clean.
+     *
+     * What it is still worth reading: it names the ONE macrostep where the drain
+     * stopped moving while a deadline was armed. If a machine reports it at every
+     * `steps`/`maxTurns` you try AND never advances past that configuration, that is
+     * the place to look. Emitted at most ONCE per run; `count` carries how many
+     * SETTLES hit it.
+     */
+    | 'rtc-unobserved'
   readonly message: string
   readonly count?: number
 }
@@ -370,18 +393,37 @@ export interface SimResult {
  *  - I-9 is INCLUDED (W5b): after the A3 fix it only fires on a QUIESCENT boundary
  *    whose combined queue exceeds an explicitly-configured `maxQueueDepth`, and it
  *    is VACUOUS when no bound is set (the default path sets none) — sound and inert.
- *  - I-3 is now INCLUDED (W8/V8) — ISS-030 CLOSED. C1 + U1 had already made
- *    WAITING_ON_TIMER and (precise, inFlight>0) WAITING_ON_TRANSITION_TIMEOUT sound
- *    exclusions; the one reachable false-positive left was ISS-030: a STRING-METHOD
- *    invoke action is resolved INSIDE `callAction`, past the config-layer wrap
- *    boundary, so `bracketAsync` could not see it and a correct machine awaiting one
- *    settled as `pending ∧ inFlight===0` → WAITING_ON_INTERNAL → I-3 fires on a
- *    CORRECT machine. The W8/V1b lifecycle channel wraps the CALL instead of the
- *    action VALUE, so `invoke.action` begin/end pairs cover the string-method form
- *    identically; driver.ts composes that count into `Env.inFlightAsyncCount`, and
- *    such a boundary is now classified WAITING_ON_TRANSITION_TIMEOUT (excluded) or
- *    reaches true quiescence. Guarded by the §4а.2 zero-false-positive corpus, which
- *    carries string-method-invoke and composite-join machines specifically for this.
+ *  - I-3 is EXCLUDED — it was promoted here in W8/V8 and that promotion is now
+ *    REVERTED. The promotion rested on `WAITING_ON_INTERNAL` being a POSITIVE
+ *    observation, distinct from a budget truncation because the pump reaches it at
+ *    its own early break (settle.ts exit (b)) rather than by running out of turns.
+ *    That premise is false. Exit (b) fires on `stuck >= QUIET_FLUSH` with QUIET_FLUSH
+ *    = 16, and `stuck` counts turns over the frozen
+ *    `queueDepth|isProcessingEvents|inFlightAsyncCount` fingerprint — which is frozen
+ *    across an ENTIRE ordinary microstep, because the engine awaits once per hook
+ *    slot per state even where no hook is defined. A legitimate microstep's frozen
+ *    length is therefore O(#states + #hooks): a property of the MACHINE's width, not
+ *    a constant, so a fixed 16-turn window is refuted by any correct machine whose
+ *    legitimate frozen chain is 17 turns long. Measured through this very surface
+ *    (seed '1', steps 2, mode 'safety'): a parallel composite whose sibling region
+ *    holds only `invoke:[{event:'never', delay:100000}]` was `ok:false` with an I-3
+ *    violation for a SYNCHRONOUS `onEnter` and for an async one awaiting 1, 3, 5 or
+ *    20 microtasks, while the identical machine without that sibling timer was clean.
+ *
+ *    With `WAITING_ON_INTERNAL` demoted to the `rtc-unobserved` warning, I-3 has NO
+ *    machine-reachable witness left (its other branch, a non-quiescent boundary with
+ *    no `settleReason` at all, cannot occur: every `quiescent:false` return in
+ *    `settleMacrostep` sets one). An inert oracle wearing a default badge inflates
+ *    `oraclesRun` and the assurance a green run implies, so it is removed rather than
+ *    left in. I-3 remains available by explicit opt-in.
+ *
+ *    Cost of the removal, measured rather than assumed: the §4а.2 zero-false-positive
+ *    corpus cited as the standing guard for the promotion records 438 frames of which
+ *    6 are non-quiescent, and EVERY one of those is `WAITING_ON_TIMER` — the corpus
+ *    never enters the region the teeth lived in, so it never exercised them. The real
+ *    hang class stays covered by the engine's own `transitionTimeout` (which converts
+ *    a hung callback into an observable reject) and by the liveness plane's
+ *    virtual-time budget.
  *  - I-4 is INCLUDED (W8/V3a): it reads the CAPTURED lifecycle stream and fires only
  *    on a genuine in-microstep ancestor/descendant inversion. It is VACUOUS when no
  *    lifecycle plane is present, so it cannot fabricate a violation.
@@ -399,7 +441,6 @@ export interface SimResult {
  */
 const DEFAULT_BUILTIN_INVARIANT_IDS: ReadonlySet<string> = new Set([
   'I-2',
-  'I-3',
   'I-4',
   'I-5',
   'I-6',
@@ -971,9 +1012,19 @@ export class Simulator<T extends object = object> {
     // because the follow-up question differs. Each is DEDUPED to one warning per
     // run — a long chain trips its boundary on every step, and N identical
     // warnings would bury the report — with `count` carrying the multiplicity.
-    const progressingFrames = trace.frames.filter(
-      (f) => f.settleReason === 'budget-progressing',
-    ).length
+    //
+    // The multiplicity is counted in SETTLES, not FRAMES. A step stamps its ONE
+    // recorded `settleReason` onto EVERY frame it emitted (the boundary frame plus
+    // one per state-write captured during the drain), so counting frames reported a
+    // single non-quiescent macrostep as 2, 3 or more occurrences purely as a
+    // function of how many transitions happened to land in it. At most one reason is
+    // recorded per step (`result.reason ?? preFire.reason` in driver.ts), so the
+    // number of DISTINCT steps carrying it is exactly the number of settles.
+    const settlesWithReason = (reason: string): number =>
+      new Set(
+        trace.frames.filter((f) => f.settleReason === reason).map((f) => f.step),
+      ).size
+    const progressingFrames = settlesWithReason('budget-progressing')
     if (progressingFrames > 0) {
       warnings.push({
         kind: 'budget-progressing',
@@ -982,13 +1033,30 @@ export class Simulator<T extends object = object> {
         count: progressingFrames,
       })
     }
-    const frozenFrames = trace.frames.filter((f) => f.settleReason === 'microtask-budget').length
+    const frozenFrames = settlesWithReason('microtask-budget')
     if (frozenFrames > 0) {
       warnings.push({
         kind: 'budget-frozen',
         message:
           'the per-macrostep turn budget was exhausted and the machine had already stopped moving before it ran out: no queue, processing-flag or in-flight-async change was observed in the turns leading up to the cutoff. This harness CANNOT tell a genuine wedge from a hook doing a large amount of internal work — an awaited `onEnter`/`onExit` is not tracked as in-flight async, so a finite one freezes exactly the same observables as an infinite one. Raise `maxTurns` (default 1024) to distinguish them: a finite hook eventually completes and the run goes quiescent, a genuine wedge reports this at every budget you try.',
         count: frozenFrames,
+      })
+    }
+    // The SAME demotion, one window smaller. `WAITING_ON_INTERNAL` was the last
+    // reason that could still convict (through I-3), on the grounds that the pump
+    // reached it at its own early break rather than by running out of budget. That
+    // distinction does not survive contact with the engine: the break condition is
+    // `stuck >= 16` over a fingerprint that is frozen for an ENTIRE ordinary
+    // microstep, and a legitimate microstep's frozen length grows with the number of
+    // states and hook slots it touches. It is a truncation like the other two, so it
+    // reports like the other two.
+    const unobservedSettles = settlesWithReason('WAITING_ON_INTERNAL')
+    if (unobservedSettles > 0) {
+      warnings.push({
+        kind: 'rtc-unobserved',
+        message:
+          'a macrostep stopped with work still pending and a future timer armed, and nothing the harness can observe was in flight (`settleReason: WAITING_ON_INTERNAL`). This CANNOT convict the machine: the settle fingerprint (queue depth | processing flag | in-flight async) stays frozen for a whole ordinary microstep — the engine awaits once per hook slot per state even where you defined no hook — so a legitimate microstep freezes it for a number of turns that grows with the width of your machine, while the break window is a fixed 16. A parallel composite whose sibling region merely holds an armed timer reports this for a SYNCHRONOUS onEnter. Read it as a POINTER, not a verdict: if the machine also never advances past that configuration at any `steps` or `maxTurns` you try, that macrostep is where to look.',
+        count: unobservedSettles,
       })
     }
     if (guardReport.timerEscapes > 0) {

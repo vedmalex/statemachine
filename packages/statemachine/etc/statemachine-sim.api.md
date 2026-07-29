@@ -1668,7 +1668,30 @@ export interface SimWarning {
     * them: a finite hook eventually completes. Emitted at most ONCE per run;
     * `count` carries how many boundaries hit it.
     */
-    | 'budget-frozen';
+    | 'budget-frozen'
+    /**
+    * A settle stopped at the pump's EARLY break with pending work, an armed
+    * future timer, and nothing the harness can observe in flight
+    * (`settleReason:'WAITING_ON_INTERNAL'`).
+    *
+    * Advisory only, and for exactly the same reason as the two budget kinds: it
+    * is a TRUNCATED observation, just over a 16-turn window instead of a 1024-turn
+    * one. The settle fingerprint (`queueDepth|isProcessingEvents|inFlightAsyncCount`)
+    * freezes across an ENTIRE ordinary microstep — the engine awaits once per hook
+    * slot per state even where no hook is defined — so one LEGITIMATE microstep's
+    * frozen-turn count grows with the machine's own width. Measured: a parallel
+    * composite whose only extra ingredient is an unrelated sibling region holding
+    * `invoke: [{event:'never', delay:100000}]` reports this for a SYNCHRONOUS
+    * `onEnter`, and for an async one awaiting 1, 3, 5 or 20 microtasks; without
+    * that sibling timer the identical machine is clean.
+    *
+    * What it is still worth reading: it names the ONE macrostep where the drain
+    * stopped moving while a deadline was armed. If a machine reports it at every
+    * `steps`/`maxTurns` you try AND never advances past that configuration, that is
+    * the place to look. Emitted at most ONCE per run; `count` carries how many
+    * SETTLES hit it.
+    */
+    | 'rtc-unobserved';
     // (undocumented)
     readonly message: string;
 }
@@ -2017,7 +2040,33 @@ export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-platea
 * apart — a finite hook eventually completes.
 * Advisory (never a {@link FailCause}, never flips `ok`).
 */
-| 'budget-frozen';
+| 'budget-frozen'
+/**
+* A macrostep stopped with work pending and a future timer armed while nothing
+* the harness can observe was in flight (`settleReason:'WAITING_ON_INTERNAL'`).
+*
+* Advisory for the same reason as the two budget kinds — it is a truncated
+* observation over a 16-turn window. The settle fingerprint is frozen for a whole
+* ordinary microstep (the engine awaits once per hook slot per state even where no
+* hook is defined), so a legitimate microstep freezes it for a number of turns
+* that grows with the machine's width, against a fixed break window. Read it as a
+* pointer to the macrostep worth inspecting, not a verdict.
+* Advisory (never a {@link FailCause}, never flips `ok`).
+*/
+| 'rtc-unobserved'
+/**
+* An OBSERVATION BUFFER hit its cap and stopped retaining records, so a
+* lifecycle-keyed oracle saw only a PREFIX of the run
+* ({@link SimWarning} `lifecycle-truncated`).
+*
+* Carried through under its OWN kind rather than the `residual-rejection`
+* catch-all: a truncated observation plane is a statement about how much of the
+* run was CHECKED, and naming it "residual rejection" would report a completely
+* different and much more alarming condition than the one observed — the exact
+* laundering already fixed for the two budget kinds.
+* Advisory (never a {@link FailCause}, never flips `ok`).
+*/
+| 'lifecycle-truncated';
 
 // @public
 export function wire<T extends object>(env: SimEnv, config: StateMachineConfig<T>, owner: T | Adapter<T>): StateMachine<T, StateMachineConfig<T>>;

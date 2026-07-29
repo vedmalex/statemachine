@@ -309,7 +309,11 @@ describe('invoke action failure is observable', () => {
     expect(probe.owner.n).toBe(0)
   })
 
-  it('reports an expiry through the SAME channels as a throwing action', async () => {
+  // The title said "reports an EXPIRY"; the body passes no `transitionTimeout`
+  // at all, so nothing can expire — it exercises the THROWING action, which is
+  // the other half of the same claim (both failure modes reach the same two
+  // channels). Titled for what it runs.
+  it('reports a THROWING action through the same channels as an expiry', async () => {
     const thrower = invokeProbe(async () => {
       throw new Error('boom')
     })
@@ -349,7 +353,12 @@ describe('invoke action failure is observable', () => {
   it('leaves a SUCCEEDING invoke action untouched (no new noise)', async () => {
     const probe = invokeProbe(async () => {}, { transitionTimeout: 500 })
 
-    await sleep(120)
+    // Wait for the ARRIVAL, not for a fixed duration. A `sleep(120)` followed by
+    // an assertion on `state === 'done'` is a race that a loaded CI box loses:
+    // the fixed delay is the deadline AND the only synchronisation, so the test
+    // fails for being slow rather than for being wrong. The siblings above
+    // already use `waitFor`; this one had been left behind.
+    await waitFor(() => probe.owner.state === 'done', 2000, 'the invoke to advance the machine')
 
     expect(probe.recorded).toEqual([])
     expect(probe.onErrorMessages).toEqual([])

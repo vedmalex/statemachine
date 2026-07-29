@@ -393,6 +393,12 @@ const I2: Invariant = {
  * is not still processing. A quiescent frame whose record says processing was
  * still in flight is a violation. We read the captured `quiescent` boolean (true
  * settle boundary ⇒ isProcessingEvents() was false at :509).
+ *
+ * OPT-IN, and currently WITHOUT a machine-reachable witness — see the exclusion
+ * ledger in `checkStep` and `DEFAULT_BUILTIN_INVARIANT_IDS` in public.ts. It is
+ * retained (rather than deleted) because it is the placeholder for the RTC
+ * question, and because a hand-built trace can still exercise it; what it needs to
+ * become decidable is stated in `docs/dynamic-check.md`.
  */
 const I3: Invariant = {
   id: 'I-3',
@@ -405,7 +411,8 @@ const I3: Invariant = {
     // a wedged in-flight transition is the I-3 witness only when the run claimed
     // settlement. Step-level I-3 here checks monotonic frame steps + that a
     // resolve-true settle boundary is quiescent.
-    // Two DOCUMENTED, legitimate non-quiescence waits are EXCLUDED (not RTC breaks):
+    // EVERY documented non-quiescence reason is now EXCLUDED (none is an RTC break
+    // the harness can establish), which is why I-3 is OPT-IN again:
     //  - WAITING_ON_TIMER (C1): the fired region observably completed
     //    (`hasPendingWork()===false`); only a sibling's future timer remains.
     //  - WAITING_ON_TRANSITION_TIMEOUT (U1 precision): settle.ts now assigns this
@@ -426,37 +433,60 @@ const I3: Invariant = {
     //    every time yet failed I-3 at N>=1000 and passed at N<=100. The deciding
     //    variable was `DEFAULT_MAX_TURNS`, an internal harness constant — never the
     //    machine. Both reasons are now surfaced as WARNINGS (public.ts) instead.
-    // STILL flagged as I-3 witnesses:
-    //  - WAITING_ON_INTERNAL (U1): pending queue/processing with NO tracked in-flight
-    //    async + a timer — a wedged processing-flag / undrained internal queue. This
-    //    is where I-3's teeth now rest, and it is a POSITIVE observation rather than
-    //    a truncation: the pump reached it at its EARLY break (exit (b): a stable
-    //    fingerprint for QUIET_FLUSH turns WHILE a future timer is armed), inside
-    //    budget, so the "nothing is moving" reading is something the harness
-    //    observed rather than something it ran out of time to disprove.
-    //  - a resolve-true boundary with NO settleReason at all (should have settled).
-    // ISS-030 — CLOSED in W8/V8, which is what promoted I-3 into the DEFAULT builtin
-    // set (public.ts). The residual was: `bracketAsync` wraps only FUNCTION-VALUED
-    // invoke actions at the CONFIG layer, so a STRING-METHOD invoke action — resolved
-    // by name INSIDE `callAction`, past that boundary — was untracked, and a machine
-    // legitimately awaiting one could surface as WAITING_ON_INTERNAL (an I-3
-    // false-positive on a CORRECT machine). The W8/V1b lifecycle channel wraps the
-    // CALL rather than the action VALUE, so `invoke.action` begin/end pairs cover the
-    // string-method form; driver.ts composes that count into `Env.inFlightAsyncCount`,
-    // and such a boundary now classifies as WAITING_ON_TRANSITION_TIMEOUT (excluded)
-    // or reaches true quiescence. NOTE the scope: this covers awaited INVOKE actions.
-    // Enter/exit hooks are awaited where `isProcessingEvents()` is already true, so
-    // the structural conjunct covers them; `invoke.operation` is deliberately NOT
-    // counted (its begin/end pair spans a whole long-running `src`).
-    // The §4а.2 zero-false-positive corpus carries string-method-invoke and
-    // composite-join machines as the standing guard on this promotion.
+    //  - WAITING_ON_INTERNAL — DEMOTED, and this is the change that left I-3 with no
+    //    reachable witness (see `DEFAULT_BUILTIN_INVARIANT_IDS` in public.ts, which
+    //    no longer lists it). It was justified as a POSITIVE observation on the
+    //    grounds that the pump reaches it at its EARLY break — exit (b) in settle.ts,
+    //    `pending && stuck >= QUIET_FLUSH && earliestExecuteAt() !== null` — "inside
+    //    budget, so it is something the harness observed rather than something it ran
+    //    out of time to disprove". That justification was FALSE. Exit (b)'s
+    //    observational content is *the fingerprint has not moved for 16 turns and
+    //    some timer somewhere is armed*: the same frozen-prefix object as a budget
+    //    exhaustion, over a window 64x smaller, and the armed timer may belong to an
+    //    unrelated parallel region.
+    //
+    //    MEASURED, through the public surface (`runSimulation`, seed '1', steps 2,
+    //    mode 'safety'). A parallel composite whose region `rt` merely holds
+    //    `invoke: [{event:'never', delay:100000}]` — an armed timer that never fires
+    //    under 'safety' — while region `r1` steps `h1 -(invoke delay:0)-> slow`:
+    //
+    //      slow with a SYNCHRONOUS onEnter  -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      slow.onEnter async, 1 microtask  -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      slow.onEnter async, 3 / 5 / 20   -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      the SAME machine without `rt`    -> ok:true        (no violation)
+    //
+    //    Every one of those machines reaches `slow` in the same trace. The deciding
+    //    variable is an UNRELATED sibling region's deadline plus the internal
+    //    constant `QUIET_FLUSH = 16` — never the machine. Note the first row: the
+    //    hook is SYNCHRONOUS, so there is no async span to observe and no in-flight
+    //    count of any kind could have rescued it.
+    //
+    //    WHY NO PROXY FIXES THIS. `stuck` counts turns with a frozen
+    //    `queueDepth|isProcessingEvents|inFlightAsyncCount` fingerprint, but that
+    //    fingerprint is frozen across an ENTIRE ordinary microstep: the engine awaits
+    //    once per hook slot per state even when no hook is defined (the `if (!action)
+    //    return` sits INSIDE the awaited function, state_machine.ts:~4853-4855, enter
+    //    side ~:4971-4986). One LEGITIMATE microstep's frozen-turn count is therefore
+    //    O(#states + #hooks) — a function of the machine's own width, unbounded and
+    //    config-dependent. Any fixed k-turn window is refuted by a correct machine
+    //    whose legitimate frozen chain is k+1 turns long. `stuck` is a proxy for "the
+    //    engine has no scheduled continuation", and that is not observable from here.
+    //    It is surfaced as an advisory WARNING instead (`rtc-unobserved`, public.ts).
+    //  - a resolve-true boundary with NO settleReason at all. This branch is DEAD
+    //    from any real run: every `quiescent:false` return in `settleMacrostep` sets a
+    //    reason, and the driver stamps `result.reason ?? preFire.reason`, so a
+    //    non-quiescent boundary frame always carries one. It is kept only because a
+    //    HAND-BUILT trace (the oracle self-tests construct frames directly) can still
+    //    reach it — it is not a witness a machine can produce.
     const legitimateWait =
       frame.settleReason === 'WAITING_ON_TIMER' ||
       frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT' ||
       // Both budget exhaustions: the HARNESS stopped watching. Neither says
       // anything about the machine — see the truncation note above.
       frame.settleReason === 'budget-progressing' ||
-      frame.settleReason === 'microtask-budget'
+      frame.settleReason === 'microtask-budget' ||
+      // The 16-turn window is the same truncation over a smaller window.
+      frame.settleReason === 'WAITING_ON_INTERNAL'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&

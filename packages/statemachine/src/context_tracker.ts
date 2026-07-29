@@ -27,13 +27,22 @@ import type { IContextTracker } from './types'
  *    detected. See {@link IContextTracker} for the degradation contract.
  *
  * ## Everything is PROBED, not assumed
- * A candidate is accepted only after a live round-trip probe proves all three
- * operations behave (`run` binds, nested `exit`/`run(undefined)` clears, the
- * store is empty outside). A runtime that exposes a name but a different shape
- * is therefore REJECTED into the no-op branch rather than silently mis-detecting
- * reentrancy. This matters most for branch 2, which could not be verified
- * against a shipping implementation (neither Node 24 nor Deno 2.2 exposes
- * `AsyncContext`) — the probe is what makes it safe to offer anyway.
+ * A candidate is accepted only after a live round-trip probe proves the
+ * operations behave: `run` binds, a nested `exit`/`run(undefined)` clears, the
+ * store is empty outside — AND `run` restores on its own SYNCHRONOUS RETURN even
+ * when the body returned a still-pending promise. A runtime that exposes a name
+ * but a different shape is therefore REJECTED into the no-op branch rather than
+ * silently mis-detecting reentrancy. This matters most for branch 2, which could
+ * not be verified against a shipping implementation (neither Node 24 nor Deno 2.2
+ * exposes `AsyncContext`) — the probe is what makes it safe to offer anyway.
+ *
+ * The probe's guarantee is deliberately ASYMMETRIC and {@link probe} states it in
+ * full: it establishes that no legitimate call can be falsely rejected, not that
+ * every true reentrant call is detected. Propagation across an `await` is the one
+ * property it cannot reach — {@link detect} runs synchronously inside the engine
+ * constructor — and a tracker that fails to propagate degrades to the SAME
+ * behaviour as the no-op branch, which is a documented contract rather than a
+ * correctness hazard.
  */
 
 /** Which primitive backs the tracker a machine is using. */
@@ -51,9 +60,39 @@ export type ContextTrackerKind =
 const PROBE = 0xc0ffee
 
 /**
- * Prove a candidate tracker honours the three operations. Returns `false` on any
- * deviation OR any throw, so a partially-implemented look-alike cannot be
- * selected.
+ * Prove a candidate tracker honours the operations this engine depends on.
+ * Returns `false` on any deviation OR any throw, so a partially-implemented
+ * look-alike cannot be selected.
+ *
+ * ## What is verified, and why the last check is not redundant
+ * The first four checks are synchronous round-trips: the store starts empty,
+ * `run` binds, a nested `exit` clears, and nothing survives the call.
+ *
+ * The fifth is the one that matters for the ENGINE's actual usage. The drain does
+ * `await this.drainContext.run(epoch, () => this.executeQueuedTransition(evt))`
+ * (state_machine.ts:~1181/:1216) — `run` is handed a function returning a PROMISE,
+ * and the reentrancy test compares `getStore()` against the active epoch several
+ * awaits deep. A look-alike whose `run` restores the previous value when the
+ * returned value SETTLES (rather than on synchronous return) passes all four
+ * synchronous checks and then keeps the epoch bound for the WHOLE async drain, so
+ * a `fireEvent` issued from an INDEPENDENT timer/IO continuation during that drain
+ * observes the active epoch and is FALSELY REJECTED as reentrant. That is exactly
+ * the coarse `isProcessing` defect the epoch design exists to eliminate,
+ * reintroduced through the one branch that could never be checked against a
+ * shipping implementation. Verified reachable: a `Variable` look-alike restoring
+ * in `.finally` was accepted by the four-check probe and left `getStore() === 42`
+ * immediately after `run` returned.
+ *
+ * ## What is NOT verified — a deliberate, bounded gap
+ * That the bound value PROPAGATES INTO async continuations started inside `run`
+ * cannot be checked here: {@link detect} is called synchronously from the engine
+ * constructor and has nowhere to await. The asymmetry is what makes that
+ * acceptable — a tracker that fails to propagate reports `getStore() === undefined`
+ * deep in the drain, so a TRUE reentrant call goes UNDETECTED (the documented
+ * no-op degradation, which parks the drain instead of rejecting) and NO legitimate
+ * call is ever rejected. Failure to propagate costs detection; failure to restore
+ * synchronously costs correctness, and only the latter is checkable from here, so
+ * only the latter is what this probe promises.
  */
 function probe(t: IContextTracker): boolean {
   try {
@@ -61,6 +100,15 @@ function probe(t: IContextTracker): boolean {
     if (t.run(PROBE, () => t.getStore()) !== PROBE) return false
     if (t.run(PROBE, () => t.exit(() => t.getStore())) !== undefined) return false
     if (t.getStore() !== undefined) return false
+    // The async-shape check. `run` MUST restore on its own synchronous return even
+    // when the body returned a still-pending promise; anything else leaves the
+    // binding visible to unrelated continuations. The promise is already resolved
+    // and is never rejected, so this leaves nothing pending and no unhandled
+    // rejection behind.
+    const pending: unknown = t.run(PROBE, () => Promise.resolve())
+    const leaked = t.getStore() !== undefined
+    void pending
+    if (leaked) return false
     return true
   } catch {
     return false
@@ -153,6 +201,34 @@ export function createNoopContextTracker(): IContextTracker {
 let cachedCtor: (() => IContextTracker) | undefined
 let cachedKind: ContextTrackerKind | undefined
 
+/**
+ * Has the `kind:'none'` degradation already been disclosed in this PROCESS?
+ * See {@link claimContextTrackerDisclosure}.
+ */
+let degradationDisclosed = false
+
+/**
+ * Claim the right to emit the ONE degradation disclosure for this process.
+ * Returns `true` exactly once (until {@link resetContextTrackerDetectionForTests}),
+ * and `false` on every later call.
+ *
+ * The disclosure describes a PROCESS-level environment capability — "this runtime
+ * has no async-context primitive" — and the detection behind it is already
+ * memoised per process, so it is the same fact every time. It was nevertheless
+ * emitted per MACHINE CONSTRUCTION, which made an application that builds one
+ * machine per request repeat an unchanging environment warning on every request
+ * while the comment and the docs both described it as happening once. Latching it
+ * here rather than in the engine keeps it tied to the memoised detection it
+ * describes, so the test seam that clears the detection clears this too.
+ */
+export function claimContextTrackerDisclosure(): boolean {
+  if (degradationDisclosed) {
+    return false
+  }
+  degradationDisclosed = true
+  return true
+}
+
 function detect(): { kind: ContextTrackerKind; make: () => IContextTracker } {
   if (cachedCtor !== undefined && cachedKind !== undefined) {
     return { kind: cachedKind, make: cachedCtor }
@@ -207,4 +283,5 @@ export function createDefaultContextTracker(): {
 export function resetContextTrackerDetectionForTests(): void {
   cachedCtor = undefined
   cachedKind = undefined
+  degradationDisclosed = false
 }

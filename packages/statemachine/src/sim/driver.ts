@@ -441,10 +441,17 @@ export class SimDriver<T extends object> {
   }
 
   /**
-   * The invariant part of every {@link settleMacrostep} this driver makes. Built
-   * in ONE place so a new settle site cannot silently drop the configured
-   * `maxTurns` (the budget knob must reach every drain, or raising it would fix
-   * only some of them).
+   * The invariant part of every {@link settleMacrostep} THIS DRIVER makes. Built
+   * in ONE place so a new DRIVER settle site cannot silently drop the configured
+   * `maxTurns` (the budget knob must reach every drain the driver runs, or raising
+   * it would fix only some of them).
+   *
+   * The scope is the driver, not the harness. `Simulator.runSentinelProbe`
+   * (public.ts) constructs its settle args INLINE with a hardcoded `maxTurns: 64`
+   * and a throwaway env, deliberately: it is a one-shot behavioural assertion that
+   * a harness-owned sentinel timer fires through the injected scheduler, not a
+   * drain of consumer work, and it must stay a fixed cost that a consumer's
+   * `maxTurns` cannot inflate. It is outside this helper and outside the claim.
    */
   private settleArgs(policy: SettlePolicy): {
     sm: StateMachine<T, StateMachineConfig<T>>
@@ -519,6 +526,19 @@ export class SimDriver<T extends object> {
       // CONSTRUCTION completely silent: frame 0 stamped `quiescent:false` and no
       // `settleReason`, so nothing downstream could say WHY. Populating a hashed
       // field on the init path is corpus-breaking — see `header.version` '6'.
+      //
+      // SCOPE, precisely (do not read this as "a construction wedge is now
+      // reported"): frame 0 has no `fireOutcome` and never can — nothing was fired.
+      // Every INVARIANT that reads a settle boundary keys on `fireOutcome`
+      // (I-3: `fireOutcome === 'resolve-true' && quiescent === false`), so NO
+      // invariant can see this field on the init frame. Its only consumers are the
+      // advisory warning counters in public.ts, which scan frames by
+      // `settleReason` irrespective of cause. A construction-time non-quiescence is
+      // therefore reported iff its reason has a warning attached — the two budget
+      // reasons and, since the wave-B demotion, `WAITING_ON_INTERNAL` via
+      // `rtc-unobserved` — and is silent for `WAITING_ON_TIMER` /
+      // `WAITING_ON_TRANSITION_TIMEOUT`, which at construction are the NORMAL
+      // outcome (an initial state that arms a timer is not a defect).
       ...(result.reason ? { settleReason: result.reason } : {}),
       ...(initDone !== undefined ? { doneDelta: initDone } : {}),
     })
@@ -658,6 +678,25 @@ export class SimDriver<T extends object> {
      * The reason recorded for THIS step: the post-fire drain's when it has one,
      * otherwise the pre-fire drain's (whose result was previously dropped on the
      * floor). See the boundary frame below and TraceFrame.settleReason.
+     *
+     * TWO IMPRECISIONS, both known, both currently harmless, and neither fixable
+     * without moving a hashed field:
+     *
+     *  1. A step runs TWO settles (pre-fire and post-fire) but records at most ONE
+     *     reason, so when the post-fire drain converged and the fallback supplies
+     *     the PRE-fire drain's reason, the boundary frame — which describes the
+     *     post-fire settle, and may well be `quiescent:true` — carries a reason
+     *     produced by a DIFFERENT settle. Nothing reads the pair as a unit today
+     *     (the invariants gate on `quiescent === false`, and a frame that is
+     *     quiescent with a stale reason attached is excluded by that conjunct), so
+     *     this is latent rather than live. Separating them needs a second hashed
+     *     field on TraceFrame, which is corpus-breaking.
+     *
+     *  2. The one reason is then stamped on EVERY frame this step emits — the
+     *     boundary frame plus one per state-write captured during the drain — so a
+     *     frame COUNT of a given reason over-reports a single non-quiescent
+     *     macrostep by however many transitions landed in it. The advisory warning
+     *     counters in public.ts therefore count DISTINCT STEPS, not frames.
      */
     const settleReasonForStep: SettleReason | undefined = result.reason ?? preFire.reason
 

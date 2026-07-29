@@ -302,6 +302,21 @@ describe('settle.ts: policy-parameterized clock jump (DoD 6)', () => {
         // is the documented ISS-030 boundary: an un-tracked in-flight action is
         // indistinguishable from a wedged queue, which is exactly why I-3 stays
         // opt-in (not in the DEFAULT builtin set).
+        //
+        // That last clause was briefly UNTRUE. W8/V8 promoted I-3 into the default
+        // set on the theory that ISS-030's last false-positive path had closed, and
+        // this fixture then sat ONE hook-body edit away from being the
+        // counterexample: replace the never-resolving promise with `async () => {}`
+        // — a hook that RETURNS — and the classification is unchanged, because the
+        // pump's exit (b) fires on `stuck >= QUIET_FLUSH` over a fingerprint that is
+        // frozen for a whole ordinary microstep regardless of what the hook does.
+        // Measured through `runSimulation`: a parallel composite whose sibling
+        // region merely holds `invoke:[{event:'never', delay:100000}]` was `ok:false`
+        // with an I-3 violation for a SYNCHRONOUS `onEnter`, and for an async one
+        // awaiting 1, 3, 5 or 20 microtasks; without that sibling timer the same
+        // machine was clean. The promotion has been REVERTED and
+        // `WAITING_ON_INTERNAL` is now surfaced as the advisory `rtc-unobserved`
+        // warning, so the comment above is accurate again.
         busy: { onEnter: () => new Promise<void>(() => {}) },
       },
       events: { go: { transitions: [{ from: 'idle', to: 'busy' }] } },

@@ -1,6 +1,6 @@
 # Extension Points
 
-The package exposes 7 extension points for host integration. Each EP is a
+The package exposes 8 extension points for host integration. Each EP is a
 TypeScript interface from `@vedmalex/statemachine` that hosts may implement
 to customize behavior.
 
@@ -139,3 +139,38 @@ export function isValidConfig<T extends object>(config: StateMachineConfig<T>): 
 
 **Note**: this EP exposes function-level validation entry points only. The internal
 `ConfigValidator` class is NOT exported; the public surface is the three functions above.
+
+## EP-8 — IContextTracker (async-context host)
+
+**Contract** (from `src/types.ts`):
+
+```ts
+export interface IContextTracker {
+  run<R>(store: number, fn: () => R): R
+  exit<R>(fn: () => R): R
+  getStore(): number | undefined
+}
+```
+
+**Propagation contract**: `run` binds `store` for the duration of `fn` **including
+across every `await` inside it** — that is the whole point, and a synchronous-only
+implementation silently breaks the property it exists to provide. `exit` must
+observe `undefined` for its duration and must NOT catch: a throw from `fn`
+propagates unchanged.
+
+**What depends on it**: the precise reentrancy detector. The engine stamps each
+drain pass with an epoch and rejects a `fireEvent` only when the caller's async
+context carries the ACTIVE epoch — which is what separates a genuinely reentrant
+call (issued from inside an action, and therefore undrainable) from a legitimate
+concurrent one issued by an independent timer or IO callback.
+
+**When to implement**: to restore precise detection on a runtime that offers no
+async-context primitive of its own. `AsyncContext.Variable` maps directly onto
+this contract once browsers ship it (`exit` is `run(undefined, fn)`).
+
+**Default factory**: resolved per machine, without any import statement, from
+`process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global
+`AsyncContext.Variable`, then a no-op. `machine.contextTrackerKind` reports which
+was taken. On the no-op the machine logs one `WARN` at construction and true
+reentrancy goes UNDETECTED — the call parks the drain instead of being rejected.
+A legitimate concurrent `fireEvent` is never falsely rejected in any mode.

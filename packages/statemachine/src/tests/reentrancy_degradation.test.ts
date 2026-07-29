@@ -382,3 +382,158 @@ describe('context-tracker capability reporting', () => {
     expect(a).not.toBe(b)
   })
 })
+
+// ── the probe's ASYNC-SHAPE check, and the process-scoped disclosure ─────────
+
+/**
+ * A look-alike `AsyncContext.Variable` whose `run(value, fn)` restores the
+ * previous binding when the RETURNED VALUE SETTLES rather than on its own
+ * synchronous return.
+ *
+ * It honours every SYNCHRONOUS reading of the contract, which is why it used to
+ * be ACCEPTED: `getStore()` starts empty, `run` binds, a nested `run(undefined,…)`
+ * clears, and nothing survives a call whose body returned a plain value. The
+ * deviation shows up only on the shape the ENGINE actually uses —
+ * `await drainContext.run(epoch, () => executeQueuedTransition(evt))`, whose body
+ * returns a PROMISE. There the binding stays live for the whole async drain, so a
+ * `fireEvent` from an INDEPENDENT timer/IO continuation observes the active epoch
+ * and is FALSELY REJECTED as reentrant — the coarse `isProcessing` defect the
+ * epoch design exists to eliminate, reintroduced through the one branch that
+ * could never be checked against a shipping implementation.
+ */
+class SettleRestoringVariableLookAlike {
+  private value: number | undefined
+  run<R>(value: number | undefined, fn: () => R): R {
+    const prev = this.value
+    this.value = value
+    let r: R
+    try {
+      r = fn()
+    } catch (e) {
+      this.value = prev
+      throw e
+    }
+    if (r instanceof Promise) {
+      return r.finally(() => {
+        this.value = prev
+      }) as unknown as R
+    }
+    this.value = prev
+    return r
+  }
+  get(): number | undefined {
+    return this.value
+  }
+}
+
+/** A CONFORMING `AsyncContext.Variable`: restores on synchronous return. */
+class ConformingVariable {
+  private value: number | undefined
+  run<R>(value: number | undefined, fn: () => R): R {
+    const prev = this.value
+    this.value = value
+    try {
+      return fn()
+    } finally {
+      this.value = prev
+    }
+  }
+  get(): number | undefined {
+    return this.value
+  }
+}
+
+/** Run `body` with `process.getBuiltinModule` hidden and `AsyncContext` stubbed. */
+function withStubbedRuntime(Variable: unknown | undefined, body: () => void): void {
+  const proc = globalThis.process as unknown as {
+    getBuiltinModule?: (id: string) => unknown
+  }
+  const saved = proc.getBuiltinModule
+  try {
+    proc.getBuiltinModule = undefined
+    if (Variable !== undefined) {
+      ;(globalThis as { AsyncContext?: unknown }).AsyncContext = { Variable }
+    }
+    resetContextTrackerDetectionForTests()
+    body()
+  } finally {
+    proc.getBuiltinModule = saved
+    ;(globalThis as { AsyncContext?: unknown }).AsyncContext = undefined
+    resetContextTrackerDetectionForTests()
+  }
+}
+
+describe('the tracker probe rejects a look-alike that restores on SETTLE, not on return', () => {
+  it('the look-alike is demoted to the no-op branch instead of being accepted', () => {
+    withStubbedRuntime(SettleRestoringVariableLookAlike, () => {
+      const { kind, tracker } = createDefaultContextTracker()
+      // 'none', not 'async-context': the async-shape check caught it.
+      expect(kind).toBe('none')
+      // …and the no-op it fell back to cannot false-reject anything: getStore()
+      // is permanently undefined, so it never equals a numeric drain epoch.
+      expect(tracker.getStore()).toBeUndefined()
+    })
+  })
+
+  it('TEETH: the look-alike really does leak past a synchronous return', async () => {
+    // Without this the test above would also pass if the look-alike were simply
+    // broken in some unrelated way, or if the stub never got installed.
+    const v = new SettleRestoringVariableLookAlike()
+    const p = v.run(42, () => Promise.resolve())
+    expect(v.get()).toBe(42) // ← the leak: still bound after run() returned
+    await p
+    expect(v.get()).toBeUndefined() // restored only once it settled
+  })
+
+  it('a CONFORMING Variable is still accepted (the check is not a blanket rejection)', () => {
+    withStubbedRuntime(ConformingVariable, () => {
+      expect(createDefaultContextTracker().kind).toBe('async-context')
+    })
+  })
+})
+
+describe('the degradation WARN is disclosed once per PROCESS, not once per machine', () => {
+  const trivial: StateMachineConfig<{ state: string }> = {
+    name: 'DisclosureProbe',
+    stateAttribute: 'state',
+    initialState: 'idle',
+    states: { idle: {} },
+    events: {},
+  }
+
+  function makeSpyLogger(): { logger: ILogger; warns: string[] } {
+    const warns: string[] = []
+    return {
+      warns,
+      logger: {
+        debug() {},
+        info() {},
+        warn(message) {
+          warns.push(message)
+        },
+        error() {},
+      },
+    }
+  }
+
+  it('a second machine on the same degraded runtime does not repeat it', () => {
+    withStubbedRuntime(undefined, () => {
+      const first = makeSpyLogger()
+      const a = new StateMachine(trivial, new MemoryAdapter({ state: 'idle' }), {
+        logger: first.logger,
+      })
+      expect(a.contextTrackerKind).toBe('none')
+      expect(first.warns).toHaveLength(1)
+
+      // Same process, same memoised detection, same unchanging environment fact.
+      // An app that builds one machine per request used to repeat this warning on
+      // every request while the comment and the docs both said "exactly once".
+      const second = makeSpyLogger()
+      const b = new StateMachine(trivial, new MemoryAdapter({ state: 'idle' }), {
+        logger: second.logger,
+      })
+      expect(b.contextTrackerKind).toBe('none')
+      expect(second.warns).toEqual([])
+    })
+  })
+})

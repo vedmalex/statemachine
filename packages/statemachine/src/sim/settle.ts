@@ -56,11 +56,13 @@ export type SettlePolicy = 'safety' | 'liveness'
 /**
  * Why a settle did NOT reach quiescence (only populated when `quiescent:false`).
  *
- * The two BUDGET reasons are ADVISORY readings of a truncated window and neither
- * can convict a machine; the three `WAITING_ON_*` reasons are positive
- * observations made at an EARLY break (the pump reached a stable point on its
- * own, inside budget) and `WAITING_ON_INTERNAL` is where the RTC oracle's teeth
- * now live.
+ * NONE of these five reasons can convict a machine. The two BUDGET reasons are
+ * advisory readings of a truncated 1024-turn window; `WAITING_ON_TIMER` and
+ * `WAITING_ON_TRANSITION_TIMEOUT` name legitimate waits on time; and
+ * `WAITING_ON_INTERNAL` — which DID carry the RTC oracle's teeth — is the same
+ * truncation over the 16-turn `QUIET_FLUSH` window. Its early break (exit (b))
+ * looked like a stronger observation than a budget exhaustion but is not: see the
+ * note at exit (b) for the measurement that refuted it.
  */
 export type SettleReason =
   | 'microtask-budget' // pump exhausted maxTurns with no RECENT observable progress — advisory: a wedge OR a hook doing long internal work
@@ -300,7 +302,24 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
         break // (a) idle
       }
       if (pending && stuck >= QUIET_FLUSH && env.earliestExecuteAt() !== null) {
-        break // (b) timer-gated: stable pending work + a future deadline
+        // (b) timer-gated: stable pending work + a future deadline.
+        //
+        // WHAT THIS BREAK DOES AND DOES NOT OBSERVE. Its entire content is "the
+        // fingerprint has not moved for QUIET_FLUSH turns and SOME timer is armed".
+        // That is the same frozen-prefix object a budget exhaustion produces, over a
+        // window 64x smaller — and the armed timer may belong to a completely
+        // unrelated parallel region. It was long described as an observation made
+        // "inside budget" and therefore stronger than a truncation; it is not.
+        // `stuck` counts turns over `queueDepth|isProcessingEvents|inFlightAsyncCount`,
+        // and that fingerprint stays frozen across an ENTIRE ordinary microstep
+        // because the engine awaits once per hook slot per state even where no hook
+        // is defined (the `if (!action) return` sits INSIDE the awaited function,
+        // state_machine.ts:~4853-4855; enter side ~:4971-4986). One LEGITIMATE
+        // microstep's frozen length is thus O(#states + #hooks) — a property of the
+        // machine's own width — so a fixed 16-turn window is refuted by any correct
+        // machine whose legitimate frozen chain runs 17 turns. Consequently the
+        // `WAITING_ON_INTERNAL` this break leads to is ADVISORY (see SettleReason).
+        break
       }
       await Promise.resolve()
       turns += 1
@@ -401,14 +420,16 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
       //    break; I-3 now excludes it SOUNDLY because inFlight>0 proves real
       //    in-flight work, not a wedged flag).
       //  - pendingNow && inFlight === 0   -> queued/processing work with NO tracked
-      //    in-flight async, accompanied by a future timer: WAITING_ON_INTERNAL — a
-      //    wedged processing flag / undrained internal queue is a real RTC concern
-      //    (I-3 witness). ISS-030 CLOSED (W8/V8): `inFlightAsyncCount` now ALSO
-      //    counts un-settled `invoke.action` callbacks observed on the
-      //    `recordLifecycle` channel, so a STRING-METHOD invoke action — which
-      //    `bracketAsync` never wrapped — is tracked too and no longer masquerades
-      //    as a wedged queue. I-3 is consequently in the DEFAULT builtin set, gated
-      //    on a zero-false-positive corpus that includes string-method configs.
+      //    in-flight async, accompanied by a future timer: WAITING_ON_INTERNAL.
+      //    ADVISORY — it is a pointer to a macrostep, never a verdict. This was
+      //    briefly the I-3 witness (W8/V8 promoted I-3 into the DEFAULT builtin set
+      //    on the strength of it); the promotion has been REVERTED because the break
+      //    it rests on cannot distinguish a wedge from a correct machine — see the
+      //    note at exit (b), `SettleReason`, and the `rtc-unobserved` warning in
+      //    public.ts. `inFlightAsyncCount` does also count un-settled `invoke.action`
+      //    callbacks from the `recordLifecycle` channel (ISS-030 / W8/V8), so a
+      //    STRING-METHOD invoke action no longer lands here — but closing that one
+      //    path never made the remaining reading sound.
       let reason: SettleReason
       if (!pendingNow) {
         reason = 'WAITING_ON_TIMER'

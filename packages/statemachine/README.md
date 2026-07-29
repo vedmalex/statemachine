@@ -11,11 +11,14 @@ Hierarchical state machine for TypeScript with orthogonal (parallel) regions, SC
 - Orthogonal **parallel regions** with W3C SCXML §3.13 callback ordering — entry in document order, exit in reverse document order
 - **UML all-regions-final join** via `final` states, the engine-raised `done.state.<id>` event, and the `isDone()` guard
 - Parallel-exit (LCCA) — a transition from a composite parent preempts and exits all active regions
-- Guards, before/enter/after + exit/transition actions, and timed `invoke` transitions
-- Pluggable monitoring, validation, persistence, and timer scheduling (7 extension points)
+- Guards, before/enter/after + exit/transition actions, and `invoke` in both forms — a delayed timer that raises an event (`InvokeTimer`), and a long-running operation with an `AbortSignal` and `onDone` / `onError` events (`InvokeOperation`)
+- A lifecycle observability channel (`IMonitor.recordLifecycle`) and `createLifecycleTracer()` over it, which names hung and failed callbacks
+- Pluggable monitoring, validation, persistence, timer scheduling and async-context tracking
 - ESM + CJS dual bundle; DI-free lite surface
 
 The package ships only the DI-free lite surface. The legacy DI-aware factory from `@grainjs/statemachine` is intentionally not carried over.
+
+Upgrading from an earlier beta: [Breaking changes in 1.0.0-beta.5](#breaking-changes-in-100-beta5).
 
 ## Install
 
@@ -112,9 +115,11 @@ One machine can drive many owner objects, but `fireEvent` cannot express that
 unambiguously: a non-`Adapter` second positional is an event **argument** — that is
 what makes `fireEvent('submit', payload)` work — so a raw object passed as an owner
 is read as a payload and the event resolves against the machine's primary owner
-instead. (When that object carries the machine's `stateAttribute`, the engine emits
-an advisory warning through the injected `logger`; the argument is still forwarded
-verbatim, so a payload that happens to have the field keeps working.)
+instead. (When it is a *different* object carrying the machine's `stateAttribute` —
+the tell-tale shape of the mistake — the engine warns through its `logger`; passing
+the machine's own owner back in is the correct common pattern and stays quiet. The
+argument is forwarded verbatim either way, so a payload that happens to have the
+field keeps working.)
 
 The `*For` family resolves the ambiguity structurally rather than by sniffing:
 **slot 1 is always the owner**, everything after the event name is always an
@@ -137,7 +142,18 @@ internally, once per object. Because every per-owner structure keys on the adapt
 the object keeps its own state, timers, `invoke`s and history whether you hand over
 the object or an `Adapter` for it.
 
-`fireEvent` itself is unchanged.
+One caveat worth knowing before you rely on that. Which *position* holds the owner
+is structural, but whether the value in it is already an `Adapter` is a duck test:
+`isAdapter` asks only for `get` and `set`. A domain object that happens to expose
+methods by those names is therefore taken *as* an adapter and driven through its own
+`get('state')` / `set('state', …)` rather than through a `MemoryAdapter` over its
+properties — the state lands somewhere you did not intend and nothing is thrown. If
+your owner type has its own `get`/`set`, wrap it explicitly:
+`sm.fireEventFor(new MemoryAdapter(owner), 'go')`.
+
+`fireEvent` itself is unchanged. `canFireEvent(event, obj)` now normalizes a raw
+object like the `*For` family does, instead of reading it as an adapter and
+returning an answer about a state it was never in.
 
 ## Action timeouts (`transitionTimeout`)
 
@@ -152,10 +168,10 @@ On expiry the call rejects with `StateMachineError('Transition timeout')` (`cont
 | `guard` | transition disabled; `fireEvent` resolves `false`, nothing thrown |
 | `onEnter`, with `errorState` set | machine commits `errorState`; `fireEvent` resolves `false` |
 | `onExit`, with `abortOnExitError` set | microstep aborts back to the source state; `fireEvent` resolves `false` |
-| `invoke` action | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
+| `invoke` action (the timer form's `action`) | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
 | anything else (`onBefore`, `onTransition`, `onEnter` / `onExit` without the options above) | the error propagates out of `fireEvent`; the machine stays in the source state |
 
-An `invoke` action that **throws** is reported through those same two channels, so an expiry and a throw of the same action are indistinguishable to an error sink — an expiry is just one more way the action failed. (Long-running `invoke` operations — the `src` / `onError` form — keep their own routing: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
+An `invoke` action that **throws** takes exactly that same route, on a freshly armed timer and on one resumed from a snapshot alike: an expiry is simply one more way the action failed, and the two are distinguishable only by the error you receive, never by where it arrives or by what the machine does next. (The `recordError` channel is gated by `IErrorHandler.isEnabled()`, which defaults to enabled. Long-running `invoke` **operations** — the `src` / `onDone` / `onError` form — keep their own routing instead: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
 
 The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
 
@@ -165,7 +181,9 @@ Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedma
 
 ## Extension Points
 
-This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+This package exposes 7 catalogued extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+
+`IContextTracker` (`StateMachineOptions.contextTracker`) is an eighth injection contract, added in `1.0.0-beta.5` and not yet folded into that catalog. It backs reentrancy detection and is documented under [Runtime support](#runtime-support).
 
 ## Lifecycle tracing (debugging)
 
@@ -255,7 +273,7 @@ const result = await runSimulation(
     seed: '0x1234',            // bigint | string — canonicalized to a bigint PRNG seed
     steps: 64,                 // number of macrosteps to drive
     invariants: myInvariants,  // readonly Invariant[] (Safety oracle registry)
-    mode: 'safety',            // 'safety' | 'liveness'
+    mode: 'safety',            // 'safety' | 'liveness' | 'both'
   },
 )
 
@@ -276,7 +294,7 @@ if (!result.ok) {
 
 - `await sim.init()` — mandatory post-construction settle plus a behavioral sentinel-scheduler probe (fails loudly if timers do not route through the injected virtual scheduler). Idempotent.
 - `await sim.step()` — drive exactly one macrostep; returns a `StepOutcome` (`step`, `t`, `frames`, `traceHash`, `quiescent`, `done`, optional `violation`).
-- `await sim.run()` — drive `opts.steps` macrosteps; returns the aggregate `SimResult` (`ok`, `seed`, `steps`, `traceHash`, `trace`, optional `violation`, `metrics`).
+- `await sim.run()` — drive `opts.steps` macrosteps; returns the aggregate `SimResult` (`ok`, `seed`, `steps`, `traceHash`, `trace`, `oraclesRun`, `metrics`, and optionally `violation`, `liveness` and `warnings`).
 - `sim.snapshot()` — a serializable mid-run checkpoint (`SimSnapshot`: `seed`, `machine`, `prngState`, `t`, `step`); never hashed.
 
 `wire(env, config, owner)` constructs `new StateMachine(config, owner, { clock, scheduler, monitor, errorHandler, logger })` with all five deterministic seams pre-forwarded from `env`, so the scheduler-omission footgun is structurally impossible.
@@ -287,10 +305,14 @@ if (!result.ok) {
 | --- | --- | --- |
 | `seed` | `bigint \| string` | Required. Drives the PRNG; the only source of nondeterminism. |
 | `steps?` | `number` | Macrostep budget (default 16). |
+| `maxTurns?` | `number` | Microtask-pump budget per macrostep settle (default 1024). Running out is never a failure — see [budget truncation](#breaking-changes-in-100-beta5). |
 | `faults?` | `FaultPlan` | Seed-keyed fault injection plan (see the 7 kinds below). |
 | `invariants?` | `readonly Invariant[]` | Safety-oracle registry evaluated at each step boundary. |
-| `mode?` | `'safety' \| 'liveness'` | Oracle policy (default `'safety'`). |
+| `mode?` | `'safety' \| 'liveness' \| 'both'` | Oracle policy. Omitted means safety only. |
+| `script?` | `readonly DriverOp[]` | Drive from a fixed op stream instead of the fuzzer. |
 | `onTrace?` | `(frame: TraceFrame) => void` | Per-frame streaming callback. |
+
+The remaining fields (`eventPayload`, `maxQueueDepth`) are in [`etc/statemachine-sim.api.md`](./etc/statemachine-sim.api.md), which is the generated public surface.
 
 ### Fault injection (7 kinds)
 
@@ -302,7 +324,7 @@ A `FaultPlan` may inject any of the seven fault kinds (`FaultKind`), keyed deter
 4. **overflow** — flood the queue past its bound
 5. **clock-skew** — perturb the logical clock
 6. **timer-jitter** — perturb armed-timer deadlines
-7. **callback-throw** — make an action/guard/invoke callback throw
+7. **throw** — make an action/guard/invoke callback throw
 
 Fault-free runs behave exactly as a simulation with no plan.
 
@@ -312,7 +334,9 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 
 ### Back-compatibility
 
-> Omitting **both** `clock` and `scheduler` keeps runtime behavior byte-identical to prior releases: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before. The DST machinery only engages when you opt in by injecting a scheduler.
+> The DST machinery engages only when you opt in. Omitting **both** `clock` and `scheduler` leaves the real-time path as it was: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before.
+>
+> One deliberate exception in `1.0.0-beta.5`: under a `transitionTimeout`, the deadline timer is now cleared on the default scheduler too, where the cleanup used to be attached only when a scheduler was injected. A process that had finished its work could previously stay alive for up to one `transitionTimeout` per outstanding handle; it now exits promptly.
 
 ### API reference
 
@@ -328,8 +352,7 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 `checkMachine(config, ownerFactory, options?)` (from `@vedmalex/statemachine/sim`)
 is the **dynamic** complement to the static `validateConfig`: it fuzzes your
 machine over N deterministic runs through the simulator's oracle suite and returns
-a structured `CheckReport` of unreachable states, deadlocks, livelocks, invariant
-violations, and coverage gaps. The report's `ok` cannot lie — `ok === true` implies
+a structured `CheckReport`. The report's `ok` cannot lie — `ok === true` implies
 `oraclesRun > 0 ∧ transitionsFired > 0`. **It is fuzzing, not model-checking:** the
 absence of a finding is not a proof of correctness. Full guide, contract, and the
 list of what it does NOT check: [`docs/dynamic-check.md`](./docs/dynamic-check.md).
@@ -340,22 +363,68 @@ const report = await checkMachine(myConfig, () => ({ state: 'idle' }), { seed: '
 if (!report.ok) throw new Error(`checkMachine failed: ${report.failedOn.join(', ')}`)
 ```
 
+Beside `ok` and `failedOn`, the report carries `violations`, `unreachableStates`,
+`reachableStates`, `deadEvents`, `deadlocks`, `livelocks`, `uncoveredTransitions`,
+`nonConvergingRegions` (a parallel region that can never complete its join),
+`guardOutcomes` (per transition, whether the guard was ever seen returning true and
+ever seen returning false — one that never returned true is the classic dead
+branch), `saturation`, and `warnings`. **A warning is never a verdict** and never
+flips `ok`; `failOn` and `degradationExcept` decide which causes do.
+
+Three options are worth knowing about:
+
+- `shrink` (**default `true`**) delta-debugs the first violation down to a minimal
+  reproduction. Reduction runs against your live config, so closures, guards and
+  object payloads survive, and every candidate is decided by an actual re-run — a
+  stream that does not reproduce the finding is reported as a `shrink-skipped`
+  warning and the original run is kept. A minimal repro is never printed without
+  having been verified. A green sweep spends nothing extra.
+- `script` replays a fixed op stream instead of fuzzing — the executable twin of a
+  printed repro, so a minimal repro is something you can paste back in. With a
+  script the per-event `payload` generators are not consulted; the ops carry their
+  args.
+- `maxTurns` (**default 1024**) is the microtask-pump budget each macrostep settle
+  uses. Raise it when a report carries a `budget-progressing` or `budget-frozen`
+  warning and you need to know which reading is real.
+
 ## Stability policy
 
 5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. The all-regions-final join API lives on these stable symbols — `State.final?: boolean`, `StateMachine.isDone(compositeId)`, and the engine-raised `done.state.<id>` event (all reflected in `etc/statemachine.api.md`). Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
 
+## Breaking changes in 1.0.0-beta.5
+
+Five changes in this release are observable from outside a machine you already have working.
+
+**Enter/exit callback order now follows W3C SCXML §3.13.** Entry is document order — a DFS pre-order walk of the config — and exit is its exact reverse, so `exited.reverse()` is now precisely `entered`. Two sequences move. `onExit` of sibling states in parallel regions fires in the **reverse** of declaration order (regions `r1, r2, r3` exit `r3 → r2 → r1`, where they previously exited `r1 → r2 → r3`), which restores the LIFO property: the region that acquired a paired resource first releases it last. And nested regions are no longer interleaved — the previous walk ordered the whole set by depth, so a shallow region's leaf could be visited *between* two states of another region's chain; each region is now walked to completion, on both entry and exit. The **set** of callbacks invoked and the **reached configuration** are unchanged, as are the layering guarantees (a parent enters before its region children and exits after them) and the entry sibling order. Order-independent `onExit` handlers — the common case — need no migration; if some code depended on the old sibling-exit order, invert that expectation. Detail and migration guidance: [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
+
+**An unrecognized serialized action shape is no longer accepted in silence.** `deserializeAction` used to install any object it did not recognize verbatim, so a hand-written `{ source, name }` guard *became* the guard and then failed only at fire time — where the guard-error path absorbs the failure into "transition disabled". The event no-opped forever with nothing thrown anywhere. That branch now warns unconditionally, and under `strictActions` throws a `StateMachineError` naming the keys it found — matching what the adjacent unresolvable-identity branches already did. It is reachable only from a payload this library did not write: `serializeActionRef` emits `{ type: 'string', name }`, `{ type: 'function', name, slot? }` or nothing at all, and none of those reach it, so a normal `toJSON` / `fromJSON` round-trip is unaffected. If you hand-assemble machine JSON, re-serialize it with `toJSON()` or drop the offending slot.
+
+**A failing `invoke` action now reports.** The timer form of `invoke` swallowed both of its failure modes — an action that threw, and an action whose `transitionTimeout` expired. Neither reached `monitor.recordError`, neither reached the config-level `onError`, and nothing was thrown; the machine simply stopped advancing. Both now route through those same two channels, on the fresh-entry path and on the `resumeTimers` path alike. The invoke's `event` still is **not** raised — raising it would fabricate a completion the action never reached — so the machine's *behaviour* is what it was. **If you have a config-level `onError`, expect it to be called for failures it has never seen.** They were always happening; they were invisible.
+
+**Exhausting the harness turn budget no longer fails a `checkMachine` / `./sim` run.** A correct machine whose `onEnter` awaited a long but finite chain of microtasks was convicted of a run-to-completion violation and a livelock: an awaited enter/exit hook is deliberately not counted as in-flight async, so while one runs the settle fingerprint is frozen — indistinguishable from a wedged drain. The verdict turned on exceeding an internal constant that no option could raise. Budget exhaustion is now an advisory warning and never a verdict: `budget-progressing` when the machine was still moving as the pump stopped watching, `budget-frozen` when it had already stopped. **A run that reported `ok: false` for this reason now reports `ok: true` with a warning.** The honest cost is that a genuinely wedged drain observed only through budget exhaustion is no longer convicted either — see [Known gaps](#known-gaps-in-100-beta). Alongside it: `maxTurns` is now a public option on both `SimOptions` and `CheckOptions` (default 1024), so the advice those warnings give is actionable; `LivenessParams.microtaskBudgetExhausted` is removed, because it turned the same truncated observation into a hard verdict; `SettleReason` and the check report's `WarningKind` both gained members, which breaks an exhaustive `switch` at compile time; and the DST trace header version moved to `'6'`, so any pinned `traceHash` changes.
+
+**`I-3` (run-to-completion) left the default oracle set.** The teeth were left on the
+one non-budget witness, `WAITING_ON_INTERNAL` — and that turned out to be the same
+truncated observation over a 16-turn window. It is now the advisory `rtc-unobserved`
+warning, which leaves `I-3` with no witness a real run can reach, so shipping it in the
+default set would ship an inert oracle wearing a default badge. **A run that reported
+`ok: false` for `WAITING_ON_INTERNAL` now reports `ok: true` with a warning.** Trace
+hashes are unaffected — the header stays `'6'`. `SimWarning['kind']` gained
+`rtc-unobserved`; the check report's `WarningKind` gained `rtc-unobserved` and
+`lifecycle-truncated`, which previously reached consumers mislabelled as
+`residual-rejection`. The measured cost of the removal is zero: the zero-false-positive
+corpus never produced a single frame in the guarded branch (438 frames, 6 non-quiescent,
+all `WAITING_ON_TIMER`), so the oracle was catching nothing there before. A genuinely
+hung machine is still surfaced by `transitionTimeout` and by the liveness plane's
+virtual-time budget.
+
+**A `done.state.<C>` join is now raised after an `errorState` recovery.** When a transition failed and the machine recovered into the configured `errorState`, the recovery configuration was committed without a completion check. If that configuration happened to be all-final, `isDone(C)` reported `true` while `done.state.<C>` was never raised — a handler waiting on the join silently never ran. Completion is a property of the committed configuration, not of the path taken into it, so the check now runs on the recovery path too. A machine that has both an `errorState` and a `done.state.<C>` transition may therefore take a transition it did not take before. Recovery is still recovery — the attempted transition is not recorded as successful, and `fired: false` is unchanged — and the join stays edge-triggered, so a recovery into a partially-final configuration raises nothing.
+
+Not a break, but new output you will see: on a runtime with no async-context primitive — a browser, today — the machine logs one `WARN` per process, at the first such construction, disclosing that precise reentrancy detection is unavailable. [Runtime support](#runtime-support) explains what that costs and how to silence it.
+
 ## Status & module format
 
 `1.0.0-beta.x` (current published version: see the npm badge above; both the `latest` and `beta` dist-tags track the newest release). Stability: experimental. SCXML/UML parallel regions, ancestor-first / descendant-first ordering, and the all-regions-final join landed in **`1.0.0-beta.2`**. The full API surface is `@unstable` per the package's STABILITY policy except the 5 firm `@stable` symbols; per-symbol stability tagging completes before `1.0.0` stable.
-
-### BREAKING (callback ordering) — `1.0.0-beta.x`
-
-Enter/exit callback order was brought to the W3C SCXML §3.13 norm: **entry = document order (DFS pre-order), exit = reverse document order**. Two observable changes:
-
-1. `onExit` of **sibling states in parallel regions** now fires in the **reverse** of the declaration order (regions `r1, r2, r3` exit `r3 → r2 → r1`; previously `r1 → r2 → r3`).
-2. **Nested regions are no longer interleaved.** The previous walk ordered the whole set by depth, so a shallow region's leaf could be visited *between* two states of another region's chain. Each region is now walked to completion, on both entry and exit.
-
-The **set** of callbacks invoked and the **reached configuration** are unchanged — only the sequence. The layering guarantees (parent enters before its region children, exits after them) and the entry sibling order are unchanged. Order-independent `onExit` handlers — the common case — need no migration. Full detail and migration guidance: [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 
@@ -372,7 +441,11 @@ That capability is **precise reentrancy detection**. Each drain tags the actions
 | Browser | `'none'` | **Degraded** — see below | Chromium 147 (headless) |
 | Any other tracker-less runtime | `'none'` | **Degraded** — see below | — |
 
-Detection is by feature probe, not a runtime name: the engine tries `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global `AsyncContext.Variable`, and verifies each with a live round-trip before accepting it. Deno lands in the precise tier because its Node-compat layer provides the first. A browser that ships `AsyncContext.Variable` will report `'async-context'` and get the precise tier automatically.
+Detection is by feature probe, not a runtime name: the engine tries `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global `AsyncContext.Variable`, and verifies each with a live round-trip — including that `run` restores on its own
+synchronous return when the body returned a pending promise, which is the shape the
+engine actually uses. Propagation across an `await` is *not* checked, because detection
+runs synchronously in the constructor; a tracker that fails that degrades to no
+detection rather than to false rejection, which is the safe direction. Deno lands in the precise tier because its Node-compat layer provides the first. A browser that ships `AsyncContext.Variable` will report `'async-context'` and get the precise tier automatically.
 
 ### What "degraded" means, exactly
 
@@ -409,7 +482,26 @@ evicted.
 
 ## Known gaps in 1.0.0-beta
 
-- **Multi-runtime CI (Tier B)**: Deno + Browser smokes run with `continue-on-error: true` and are tracked for full enablement at stable 1.0.0.
+- **Multi-runtime CI (Tier B)**: the `tier-b-deno` and `tier-b-browser` jobs still
+  carry `continue-on-error: true` — they report, they do not gate, and a regression
+  in either runtime will not fail CI. The defect that was failing both lanes (a bare
+  `async_hooks` specifier in the bundle) is fixed, and the browser smoke now drives a
+  real transition instead of merely constructing a machine, so the jobs are no longer
+  expected to be red — but flipping them to blocking is still tracked for stable
+  1.0.0 and has not happened.
+- **A wedged drain seen only through budget exhaustion is not convicted.** Since
+  `1.0.0-beta.5`, running out of the harness turn budget produces a warning rather
+  than a verdict, because an `onEnter`/`onExit` hook doing a large but finite amount
+  of internal work leaves a frozen prefix byte-identical to a hook that never
+  returns — an awaited hook is not tracked as in-flight async, so no fixed window can
+  tell the two apart. Raising `maxTurns` can: a finite hook eventually completes.
+  The pump's EARLY break turned out to be the same truncation over a 16-turn window
+  instead of a 1024-turn one: the settle fingerprint is frozen across an entire
+  ordinary microstep, whose length grows with the machine's own width. A parallel
+  composite whose sibling region merely holds an armed timer was convicted for a
+  *synchronous* `onEnter`. So that boundary does not convict either, and `I-3`
+  (run-to-completion) is no longer in the default oracle set — request it explicitly
+  if you want those frames flagged.
 - **`checkMachine` (dynamic check)**: fuzzing, not model-checking (see
   [`docs/dynamic-check.md`](./docs/dynamic-check.md)) — the absence of a finding is
   never a proof of correctness. Two builtin oracles are additionally limited by what
@@ -435,7 +527,7 @@ The Phase 1 bootstrap copied several modules as-is from the legacy `@grainjs/sta
 - **`tsconfig.moduleResolution = "bundler"`** — TASK-003 TD-T3-5 / F-CR-4 conditional closure. Downstream tasks (TASK-005 CI/CD + CJS) MUST keep an import-rewriting bundler (`tsup`, `esbuild`, `rollup` with `node-resolve`, `vite build` library mode). Flipping to a non-rewriting toolchain (raw `tsc --module commonjs`) requires upgrading `moduleResolution` to `"node16"`/`"nodenext"` first and migrating all internal imports to use `.js` extensions explicitly.
 - **`tsup` is the runtime bundler** — TASK-005 selection. Future tasks must keep an import-rewriting bundler (`tsup`/`esbuild`/`rollup`-with-node-resolve) per TD-T3-5 conditional bundler constraint.
 - **`etc/statemachine.api.md`** is the canonical `@stable` surface snapshot — generated by `api-extractor`; CI fails on uncommitted drift. Promoting a symbol from `@unstable` to `@stable` requires updating this file deliberately.
-- **knip ignore-list cap = 5 entries** — TASK-003 PLAN F-PL-5 governance. Adding a 6th ignore requires either removing an existing one OR opening a new DA review against the Sustainability lens. Currently 2/5 used (`ValidationConfig`, `MonitoringConfig`).
+- **knip ignore-list cap = 5 entries** — TASK-003 PLAN F-PL-5 governance. Adding a 6th ignore requires either removing an existing one OR opening a new DA review against the Sustainability lens. Currently 2/5 used (`src/tests/**`, `src/presets.ts` — see `knip.json`).
 - **`@stable` public surface** — 5 firm symbols (`createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`). Changing their signatures is a 1.0.0-stable breaking change. The `src/tests/public_surface.test.ts` ratchet test enforces non-regression at CI time.
 
 A full review trail for Phase 1 lives in the MB3 work tree (see root README): `memory-bank/tasks/2026-05-03_TASK-002_.../code-review.md` (bootstrap) and `memory-bank/tasks/2026-05-03_TASK-003_.../code-review.md` (quality baseline).

@@ -235,19 +235,36 @@ describe('each I-2..I-12 catch/pass with normalized witness (DoD 3)', () => {
     expect(runSafety(INVARIANTS, clean, baseCtx())).toBeNull()
   })
 
-  it('I-3 (U1 precision): EXCLUDES the two legitimate waits (WAITING_ON_TIMER / WAITING_ON_TRANSITION_TIMEOUT) and FLAGS WAITING_ON_INTERNAL + no-reason', () => {
+  it('I-3 EXCLUDES every documented settle reason, including WAITING_ON_INTERNAL; only a no-reason boundary is left, and that is hand-built only', () => {
     const nonQuiescentBoundary = (settleReason?: string): CanonicalTrace => ({
       header: HEADER,
       frames: [frame({ step: 1, fireOutcome: 'resolve-true', quiescent: false, ...(settleReason ? { settleReason: settleReason as never } : {}) })],
     })
-    // legitimate waits — I-3 stays clean (the anti-FP contract; the WAITING_ON_TIMER
-    // half is C1, the WAITING_ON_TRANSITION_TIMEOUT half is the new U1 exclusion,
-    // sound because settle assigns it only when inFlightAsyncCount()>0).
-    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_TIMER'), baseCtx())).toBeNull()
-    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_TRANSITION_TIMEOUT'), baseCtx())).toBeNull()
-    // genuine RTC concerns — I-3 fires: a wedged internal queue / a settle-boundary
-    // with no documented reason at all.
-    expect(runSafety(INVARIANTS, nonQuiescentBoundary('WAITING_ON_INTERNAL'), baseCtx())?.invariantId).toBe('I-3')
+    // EVERY documented reason is a legitimate wait — I-3 stays clean (anti-FP).
+    // WAITING_ON_TIMER is C1; WAITING_ON_TRANSITION_TIMEOUT is U1 (settle assigns it
+    // only when inFlightAsyncCount()>0); the two budget reasons are wave-A
+    // truncations; and WAITING_ON_INTERNAL is the SAME truncation over the 16-turn
+    // QUIET_FLUSH window rather than the 1024-turn budget — the pump's early break
+    // (exit (b)) observes only "the fingerprint has not moved for 16 turns and some
+    // timer is armed", and that fingerprint is frozen across an entire ordinary
+    // microstep whose length grows with the machine's own width. Measured through
+    // `runSimulation`: a parallel composite with an unrelated sibling region holding
+    // `invoke:[{event:'never', delay:100000}]` used to be convicted here for a
+    // SYNCHRONOUS `onEnter`.
+    for (const reason of [
+      'WAITING_ON_TIMER',
+      'WAITING_ON_TRANSITION_TIMEOUT',
+      'WAITING_ON_INTERNAL',
+      'budget-progressing',
+      'microtask-budget',
+    ]) {
+      expect(runSafety(INVARIANTS, nonQuiescentBoundary(reason), baseCtx()), reason).toBeNull()
+    }
+    // The ONLY surviving branch: a non-quiescent boundary carrying no reason at all.
+    // It is unreachable from a real run — every `quiescent:false` return in
+    // `settleMacrostep` sets a reason and the driver stamps it — which is why I-3 is
+    // no longer in DEFAULT_BUILTIN_INVARIANT_IDS. This hand-built frame is the only
+    // way to reach it, and the assertion documents that fact rather than a capability.
     expect(runSafety(INVARIANTS, nonQuiescentBoundary(undefined), baseCtx())?.invariantId).toBe('I-3')
   })
 

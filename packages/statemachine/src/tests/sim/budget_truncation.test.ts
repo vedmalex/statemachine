@@ -261,3 +261,166 @@ describe('the canonical trace-header version', () => {
     expect(inDriver[0]).toBe('6')
   })
 })
+
+// ── (6) the SIBLING-TIMER variant: the same demotion, one window smaller ──────
+
+/**
+ * The 16-turn twin of the defect this file was created for.
+ *
+ * `WAITING_ON_INTERNAL` survived wave A's demotion on the argument that the pump
+ * reaches it at its own EARLY break (settle.ts exit (b): `pending && stuck >=
+ * QUIET_FLUSH && earliestExecuteAt() !== null`) rather than by running out of
+ * budget — "inside budget, so it is something the harness observed rather than
+ * something it ran out of time to disprove". That argument is false. Exit (b)'s
+ * observational content is *the fingerprint has not moved for 16 turns and some
+ * timer is armed*: the same frozen-prefix object as a budget exhaustion, over a
+ * window 64x smaller, and the armed timer can belong to an unrelated parallel
+ * region.
+ *
+ * MEASURED AT HEAD BEFORE THE CHANGE, through this exact fixture
+ * (`runSimulation`, seed '1', steps 2, mode 'safety'):
+ *
+ * ```
+ * sibling timer + SYNCHRONOUS onEnter   ok=false reasons=["WAITING_ON_INTERNAL"] violation=I-3
+ * sibling timer + async onEnter, N=1    ok=false reasons=["WAITING_ON_INTERNAL"] violation=I-3
+ * sibling timer + async onEnter, N=3    ok=false reasons=["WAITING_ON_INTERNAL"] violation=I-3
+ * sibling timer + async onEnter, N=5    ok=false reasons=["WAITING_ON_INTERNAL"] violation=I-3
+ * sibling timer + async onEnter, N=20   ok=false reasons=["WAITING_ON_INTERNAL"] violation=I-3
+ * NO sibling timer, same hooks          ok=true  reasons=[]
+ * ```
+ *
+ * Every one of those machines reaches `slow` in the same trace. Note the first
+ * row especially: the hook is SYNCHRONOUS, so there is no async span of any kind
+ * to observe — no in-flight count could have rescued it. The deciding variable
+ * was an unrelated sibling region's deadline plus `QUIET_FLUSH = 16`.
+ *
+ * The reason `stuck` cannot carry a verdict: it counts turns over the frozen
+ * `queueDepth|isProcessingEvents|inFlightAsyncCount` fingerprint, and that
+ * fingerprint is frozen across an ENTIRE ordinary microstep, because the engine
+ * awaits once per hook slot per state even where no hook is defined. A LEGITIMATE
+ * microstep's frozen length is therefore a function of the machine's own width,
+ * not a constant — so any fixed k-turn window is refuted by a correct machine
+ * whose legitimate frozen chain is k+1 turns long.
+ */
+function slowHookWithSiblingTimer(hook: 'sync' | number): unknown {
+  const slow: Record<string, unknown> =
+    hook === 'sync'
+      ? { onEnter: (): void => {} }
+      : {
+          onEnter: async (): Promise<void> => {
+            for (let i = 0; i < hook; i++) {
+              await Promise.resolve()
+            }
+          },
+        }
+  return {
+    name: 'slowHookSibling',
+    stateAttribute: 'state',
+    initialState: 's0',
+    states: {
+      s0: {},
+      P: {
+        initial: 'r1.h1|rt.w2',
+        regions: {
+          // the SAME zero-delay hop into a hooked state as `slowHook` above…
+          r1: { h1: { invoke: [{ event: 'n1', delay: 0 }] }, slow },
+          // …plus ONE unrelated sibling region holding an armed timer that never
+          // fires under mode:'safety'. This is the entire difference.
+          rt: { w2: { invoke: [{ event: 'never', delay: 100000 }] }, done2: {} },
+        },
+      },
+    },
+    events: {
+      E: { transitions: [{ from: 's0', to: 'P' }] },
+      n1: { transitions: [{ from: 'P.r1.h1', to: 'P.r1.slow' }] },
+      never: { transitions: [{ from: 'P.rt.w2', to: 'P.rt.done2' }] },
+    },
+  }
+}
+
+const runSibling = (hook: 'sync' | number) =>
+  runSimulation(
+    () => ({ config: slowHookWithSiblingTimer(hook) as never, owner: { state: 's0' } as never }),
+    { seed: '1', steps: 2, mode: 'safety' },
+  )
+
+describe('an unrelated sibling region holding an armed timer never convicts a correct machine', () => {
+  it.each(['sync', 1, 3, 5, 20, 1000] as const)(
+    'hook=%s stays ok:true and still reaches `slow`',
+    async (hook) => {
+      const r = await runSibling(hook)
+      expect(r.trace.at(-1)?.to).toContain('P.r1.slow') // it really did complete
+      expect((r as { violation?: { invariantId?: string } }).violation).toBeUndefined()
+      expect(r.livelocks).toBeUndefined()
+      expect(r.ok).toBe(true)
+    },
+  )
+
+  it('the fixture has TEETH: it really does reach the exit-(b) break', async () => {
+    // Without this, `ok:true` above would also pass if the settle simply converged
+    // — i.e. for the wrong reason. The reason must still be RECORDED (demoting it
+    // to advisory must not silence it) even though it no longer convicts.
+    const r = await runSibling(20)
+    const reasons = new Set(
+      r.trace
+        .filter((f) => f.quiescent === false)
+        .map((f) => (f as { settleReason?: string }).settleReason),
+    )
+    expect(reasons.has('WAITING_ON_INTERNAL')).toBe(true)
+  })
+
+  it('the SAME machine without the sibling timer never reaches that break at all', async () => {
+    // The control. It isolates the deciding variable to the sibling region's
+    // deadline, which is what makes the conviction a property of the HARNESS.
+    const r = await runSlow(20)
+    const reasons = new Set(
+      r.trace
+        .filter((f) => f.quiescent === false)
+        .map((f) => (f as { settleReason?: string }).settleReason),
+    )
+    expect(reasons.has('WAITING_ON_INTERNAL')).toBe(false)
+    expect(r.ok).toBe(true)
+  })
+
+  it('it is REPORTED as an advisory warning — demoted, not silenced', async () => {
+    const w = ((await runSibling(20)).warnings ?? []).filter((x) => x.kind === 'rtc-unobserved')
+    expect(w.length).toBe(1) // deduped once per run
+    expect(w[0]?.count).toBeGreaterThan(0) // …with the multiplicity kept
+    expect(w[0]?.message).toMatch(/CANNOT convict/)
+  })
+
+  it('checkMachine surfaces it under its OWN kind, not the residual-rejection catch-all', async () => {
+    const report = await checkMachine(
+      slowHookWithSiblingTimer(20) as never,
+      () => ({ state: 's0' }) as never,
+      { seed: '1', steps: 2, runs: 1, mode: 'safety', events: [{ event: 'E' }] },
+    )
+    expect(report.warnings.some((x) => x.kind === 'rtc-unobserved')).toBe(true)
+    expect(report.warnings.some((x) => x.kind === 'residual-rejection')).toBe(false)
+  })
+})
+
+// ── (7) the advisory `count` is per SETTLE, not per FRAME ────────────────────
+
+describe('a budget/settle warning `count` reports settles, not frames', () => {
+  /**
+   * A step stamps its ONE recorded `settleReason` onto EVERY frame it emitted —
+   * the boundary frame plus one per state-write captured during the drain — so a
+   * frame-based count reported a single non-quiescent macrostep as 2, 3 or more
+   * occurrences purely as a function of how many transitions happened to land in
+   * it. At most one reason is recorded per step, so the count must never exceed
+   * the number of distinct steps carrying it.
+   */
+  it('never exceeds the number of distinct steps carrying that reason', async () => {
+    const r = await runSibling(20)
+    const stampedFrames = r.trace.filter(
+      (f) => (f as { settleReason?: string }).settleReason === 'WAITING_ON_INTERNAL',
+    )
+    const distinctSteps = new Set(stampedFrames.map((f) => f.step)).size
+    const w = (r.warnings ?? []).find((x) => x.kind === 'rtc-unobserved')
+    expect(w?.count).toBe(distinctSteps)
+    // teeth: the fixture really does stamp MORE frames than settles, so the two
+    // numbers are genuinely different and the assertion above is not vacuous.
+    expect(stampedFrames.length).toBeGreaterThan(distinctSteps)
+  })
+})
