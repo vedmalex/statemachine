@@ -212,7 +212,11 @@ describe('W8 §2: payload generation is DETERMINISTIC per seed', () => {
         () => ({ config: GATE, owner: { state: 'gate', seen: [] } }),
         { seed, steps: 24, eventPayload: makeVerdictPayload(sink) },
       )
-      return { sink, hash: hashTrace({ header: r.header, frames: r.trace }) }
+      // `SimResult` exposes no header, so `hashTrace({ header: r.header, … })`
+      // hashed with `header: undefined` — self-consistent between two such runs,
+      // but blind to the very header field a version bump moves. `traceHash` IS
+      // the canonical hash the run already computed, header included.
+      return { sink, hash: r.traceHash }
     }
     const a = await run('7')
     const b = await run('7')
@@ -231,6 +235,20 @@ describe('W8 §2: payload generation is DETERMINISTIC per seed', () => {
       return sink
     }
     expect(await run('7')).not.toEqual(await run('99'))
+  })
+
+  it('the traceHash is SEED-SENSITIVE (so the equality assertion above is not vacuous)', async () => {
+    // Without this, `expect(b.hash).toBe(a.hash)` in the determinism test would
+    // still pass if `traceHash` were constant for every run — the assertion would
+    // prove nothing. This pins that the hash actually moves when the run does.
+    const run = async (seed: string) =>
+      (
+        await runSimulation<Box>(
+          () => ({ config: GATE, owner: { state: 'gate', seen: [] } }),
+          { seed, steps: 24, eventPayload: makeVerdictPayload([]) },
+        )
+      ).traceHash
+    expect(await run('7')).not.toBe(await run('99'))
   })
 
   it('the payload generator SEES the pre-fire snapshot (state/config/data), not a blank one', async () => {
@@ -468,7 +486,8 @@ describe('W8 §4: the generated corpus replays to its PINNED traceHash', () => {
         () => ({ config: LANE, owner: { state: 'a', seen: [] } }),
         { seed: '21', steps: 16, ...(eventPayload !== undefined ? { eventPayload } : {}) },
       )
-      return hashTrace({ header: r.header, frames: r.trace })
+      // The canonical hash (header included) rather than a re-hash that dropped it.
+      return r.traceHash
     }
     const withoutPayload = await run()
     let draws = 0
