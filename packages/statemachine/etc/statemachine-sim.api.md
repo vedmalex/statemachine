@@ -702,6 +702,13 @@ export const I10_PROBE: CorruptStateProbe;
 export const I6_PROBE: CorruptStateProbe;
 
 // @public
+export interface IContextTracker {
+    exit<R>(fn: () => R): R;
+    getStore(): number | undefined;
+    run<R>(store: number, fn: () => R): R;
+}
+
+// @public
 export interface IErrorHandler {
     // Warning: (ae-forgotten-export) The symbol "ErrorRecoveryStrategy" needs to be exported by the entry point index.d.ts
     //
@@ -1489,6 +1496,7 @@ export class SimDriver<T extends object> {
 // @public (undocumented)
 export interface SimEnv {
     readonly clock: Clock;
+    readonly contextTracker?: IContextTracker;
     readonly errorHandler: IErrorHandler;
     readonly logger: ILogger;
     readonly monitor: IMonitor;
@@ -1721,6 +1729,8 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    // Warning: (ae-forgotten-export) The symbol "OwnerDetachResult" needs to be exported by the entry point index.d.ts
+    detachOwner(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): OwnerDetachResult;
     // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
     fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult_2>;
@@ -1817,7 +1827,6 @@ export interface StateMachineOptions {
     // Warning: (ae-forgotten-export) The symbol "FunctionRegistry" needs to be exported by the entry point index.d.ts
     actions?: FunctionRegistry;
     clock?: () => number;
-    // Warning: (ae-forgotten-export) The symbol "IContextTracker" needs to be exported by the entry point index.d.ts
     contextTracker?: IContextTracker;
     // (undocumented)
     errorHandler?: IErrorHandler;

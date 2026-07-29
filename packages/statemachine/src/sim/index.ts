@@ -45,6 +45,7 @@ export { StateMachine, createVirtualScheduler, isAdapter } from '../index'
 export type {
   Adapter,
   Clock,
+  IContextTracker,
   IErrorHandler,
   ILogger,
   IMonitor,

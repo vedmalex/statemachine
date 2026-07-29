@@ -19,12 +19,17 @@
  * wire() — THE SANCTIONED DI-FIRST PATH (ADR-7 D2/D3, R17):
  *
  * `wire(env, config, owner)` ITSELF calls
- *   `new StateMachine(config, wrappedOwner, {clock,scheduler,monitor,errorHandler,logger})`
- * with ALL FIVE seams pre-forwarded, so the scheduler-omission footgun
- * (`schedulerProvided = options?.scheduler !== undefined` state_machine.ts:154 →
- * real `createDefaultScheduler()` :155, and real-time timer routing keyed off
- * `schedulerProvided` at :2199) is STRUCTURALLY impossible: there is no way to
- * call `wire()` without supplying `env.scheduler`. `owner` is wrapped by the
+ *   `new StateMachine(config, wrappedOwner, forwardSeams(env))`
+ * with EVERY DI seam pre-forwarded, so the scheduler-omission footgun
+ * (`schedulerProvided = options?.scheduler !== undefined` state_machine.ts:601 →
+ * real `createDefaultScheduler()` :602, and real-time timer routing keyed off
+ * `schedulerProvided`) is STRUCTURALLY impossible: there is no way to
+ * call `wire()` without supplying `env.scheduler`.
+ *
+ * The seam SET is derived from `SimEnv` and spread, not transcribed into a field
+ * list — the earlier hand-written list quietly stopped covering the engine's DI
+ * slots when `contextTracker` was added, and nothing failed. Two type-level
+ * guards now make that failure mode a `tsc` error; see `forwardSeams`. `owner` is wrapped by the
  * Step-2 `Adapter.set` capture seam before construction; the wrapped Adapter is
  * always passed as the EXPLICIT 2nd positional arg (ADR-7 c13), never the
  * `:469-471` unshift path.
@@ -35,12 +40,14 @@ import { MemoryAdapter, StateMachine, isAdapter } from '../index'
 import type {
   Adapter,
   Clock,
+  IContextTracker,
   IErrorHandler,
   ILogger,
   IMonitor,
   ITimerScheduler,
   PropertiesOf,
   StateMachineConfig,
+  StateMachineOptions,
 } from '../index'
 import { wrapAdapterForCapture } from './capture'
 import { type SimClock, makeSimClock } from './clock'
@@ -70,26 +77,131 @@ import { SimMonitor } from './sim-monitor'
 import { type CanonicalHeader, type CanonicalTrace, type TraceFrame, hashTrace, normalizeParts } from './trace'
 
 // ============================================================================
-// SimEnv — the FIVE deterministic seams + random/now. logger is FIRST-CLASS and
-// NON-OPTIONAL (R18 / ADR-7 c8). All five map 1:1 to StateMachineOptions DI
-// slots the harness forwards.
+// SimEnv — the engine DI seams + random/now. logger is FIRST-CLASS and
+// NON-OPTIONAL (R18 / ADR-7 c8). Every member EXCEPT the {@link SimEnvExtras}
+// pair maps 1:1 (BY NAME) to a StateMachineOptions DI slot, and {@link wire}
+// forwards that set by SPREAD — see {@link SimEnvSeams} for the compile-time
+// machinery that keeps the mapping honest.
 // ============================================================================
 /** @unstable */
 export interface SimEnv {
-  /** -> StateMachineOptions.clock (types.ts:128). */
+  /** -> StateMachineOptions.clock (types.ts:414). */
   readonly clock: Clock
-  /** -> StateMachineOptions.scheduler (types.ts:120) — REQUIRED (omission unrepresentable). */
+  /** -> StateMachineOptions.scheduler (types.ts:388) — REQUIRED (omission unrepresentable). */
   readonly scheduler: ITimerScheduler
-  /** -> StateMachineOptions.monitor (types.ts:119) — SimMonitor (reads no wall-clock). */
+  /** -> StateMachineOptions.monitor (types.ts:387) — SimMonitor (reads no wall-clock). */
   readonly monitor: IMonitor
-  /** -> StateMachineOptions.errorHandler (types.ts:121) — SimErrorHandler, isEnabled()===true. */
+  /** -> StateMachineOptions.errorHandler (types.ts:389) — SimErrorHandler, isEnabled()===true. */
   readonly errorHandler: IErrorHandler
-  /** -> StateMachineOptions.logger (types.ts:118) — NoopLogger; NON-OPTIONAL (R18). */
+  /** -> StateMachineOptions.logger (types.ts:386) — NoopLogger; NON-OPTIONAL (R18). */
   readonly logger: ILogger
+  /**
+   * -> StateMachineOptions.contextTracker (types.ts:407) — DELIBERATELY OPTIONAL,
+   * and the ONE seam here that is.
+   *
+   * The other five are DETERMINISM seams: a machine that keeps the real
+   * scheduler/clock is not simulatable at all, so omission must be
+   * unrepresentable. `contextTracker` is a BEHAVIOUR seam — injecting one flips
+   * {@link StateMachine#contextTrackerKind} to `'injected'`, which changes WHICH
+   * reentrant `fireEvent` calls are rejected. Absent, the engine resolves its own
+   * (`AsyncLocalStorage` under Node — precise), which is the harness default and
+   * why {@link makeSimEnv} does NOT set this field.
+   *
+   * Supply one only to pin reentrancy semantics across hosts; it is then
+   * forwarded by {@link wire} STRUCTURALLY (it is in the spread, not in a
+   * hand-written field list). Each machine needs its OWN instance.
+   */
+  readonly contextTracker?: IContextTracker
   /** PRNG-backed [0,1); never Math.random. */
   random(): number
   /** === clock(); never Date.now(). */
   now(): number
+}
+
+// ============================================================================
+// The compile-time seam-forwarding guarantee (see wire()).
+//
+// The ORIGINAL guarantee here was prose: "all five seams are forwarded, so
+// omission is unrepresentable". That was true only of the seams somebody had put
+// in SimEnv BY HAND, and nothing failed when the engine grew a sixth DI slot
+// (`contextTracker`) that wire() did not forward — the option is optional, so the
+// compiler stayed silent. Three type-level guards now hold the claim up. Each is
+// USED by forwardSeams() below, so none can rot into a dead assertion.
+// ============================================================================
+
+/**
+ * The {@link SimEnv} members that are NOT engine DI slots.
+ *
+ * This list is the ONLY hand-maintained half of the mapping, and it is
+ * self-policing: {@link SimEnvSeams} is everything else, so a member added to
+ * `SimEnv` is treated as a seam BY DEFAULT and must either name a real
+ * `StateMachineOptions` slot or be classified here — otherwise `ForwardedSeams`
+ * below fails to compile.
+ *
+ * They are excluded because they have no engine counterpart: `random()` is the
+ * harness PRNG facade and `now()` is a convenience reader over `clock`.
+ */
+type SimEnvExtras = 'random' | 'now'
+
+/**
+ * EXACTLY the DI slots of {@link SimEnv} — DERIVED, never hand-listed, so that
+ * adding a seam to `SimEnv` (the natural place to add one) forwards it with no
+ * second edit. This is the mechanism; the tests are a belt.
+ */
+type SimEnvSeams = Omit<SimEnv, SimEnvExtras>
+
+/**
+ * GUARD 1 — every seam name is a REAL `StateMachineOptions` slot.
+ *
+ * `Pick`'s second parameter is constrained to `keyof StateMachineOptions`, so a
+ * seam that names no engine option (a typo, a slot the engine renamed) is a `tsc`
+ * error HERE rather than a property the engine silently ignores at runtime.
+ */
+type ForwardedSeams = Pick<StateMachineOptions, keyof SimEnvSeams>
+
+/**
+ * Engine options that are deliberately NOT seams: behavioural scalars and the
+ * action registry, all of which belong to the machine under test rather than to
+ * the harness environment. `SimDriver` forwards several of these from its own
+ * config; {@link wire} intentionally forwards none of them.
+ */
+type NonSeamOptionKeys =
+  | 'transitionTimeout'
+  | 'errorState'
+  | 'abortOnExitError'
+  | 'maxQueueDepth'
+  | 'maxTransitionDepth'
+  | 'actions'
+  | 'strictActions'
+
+/** Engine options that are neither forwarded as a seam nor classified above. */
+type UnclassifiedEngineOptions = Exclude<keyof StateMachineOptions, keyof SimEnvSeams | NonSeamOptionKeys>
+
+/**
+ * GUARD 2 — the engine cannot grow a DI slot unnoticed.
+ *
+ * Resolves to `unknown` (an identity for `&`) while every `StateMachineOptions`
+ * key is classified, and otherwise to a shape carrying an impossible field, so
+ * the {@link forwardSeams} call inside {@link wire} stops compiling with the
+ * offending key NAMED in the error. This is the guard that would have caught the
+ * `contextTracker` omission on the day the engine added it.
+ */
+type SeamTotality = [UnclassifiedEngineOptions] extends [never]
+  ? unknown
+  : { readonly __UNCLASSIFIED_ENGINE_OPTION__: UnclassifiedEngineOptions }
+
+/**
+ * GUARD 3 (the forwarding itself) — a SPREAD, never a hand-written field list.
+ *
+ * A seam added to {@link SimEnv} is forwarded structurally: there is no list to
+ * forget to update. The runtime spread also copies the {@link SimEnvExtras}
+ * (`random`/`now`), which is inert — the engine reads named options only and
+ * `persistedOptions` is assembled field-by-field, so nothing iterates or
+ * serializes the object — and a future engine option that COLLIDED with one of
+ * those names could not land silently either, because GUARD 2 fails first.
+ */
+function forwardSeams(env: SimEnvSeams & SeamTotality): ForwardedSeams {
+  return { ...env }
 }
 
 // ============================================================================
@@ -481,9 +593,13 @@ export interface SimSnapshot {
 
 /**
  * THE SANCTIONED DI-FIRST PATH (ADR-7 D2/D3, R17). Constructs
- * `new StateMachine(config, wrappedOwner, {all five seams})` — every DI slot
- * pre-forwarded from `env`, so the scheduler-omission footgun is structurally
- * impossible. `owner` is wrapped by the Step-2 capture seam before construction.
+ * `new StateMachine(config, wrappedOwner, {...seams})` — every DI slot on `env`
+ * pre-forwarded, so the scheduler-omission footgun is structurally impossible.
+ * `owner` is wrapped by the Step-2 capture seam before construction.
+ *
+ * The forwarded set is DERIVED from `SimEnv` and spread, not hand-listed: see
+ * {@link forwardSeams} and its guards for why "every seam is forwarded" is a
+ * compile-time fact here rather than a promise in a comment.
  *
  * @returns the constructed engine machine (post-construction enter actions are
  *   floating microtasks; the caller settles via {@link settleMacrostep}).
@@ -495,23 +611,24 @@ export function wire<T extends object>(
 ): StateMachine<T, StateMachineConfig<T>> {
   // Normalize the owner to an Adapter, then wrap it with the capture seam so
   // every engine state-write is observable. wire() itself is sink-less (it proves
-  // the FIVE-seam construction path); the Simulator supplies its own live sink.
+  // the DI-first construction path); the Simulator supplies its own live sink.
   const adapter: Adapter<T> = isAdapter<T>(owner)
     ? (owner as Adapter<T>)
     : (new MemoryAdapter<T>(owner as T) as unknown as Adapter<T>)
   const wrapped = wrapAdapterForCapture(adapter, config.stateAttribute, { onStateWrite() {} })
-  // ALL FIVE seams forwarded together (ADR-3 c1). Omission is unrepresentable:
-  // every field of SimEnv is non-optional, so a missing scheduler cannot reach
-  // this call. The wrapped adapter is structurally a valid Adapter; the cast
-  // bridges Adapter<T> -> Adapter<PropertiesOf<T>> (the seam never touches the
+  // EVERY seam forwarded together (ADR-3 c1), by spread rather than by a field
+  // list that a future seam could be left out of. Omission of a DETERMINISM seam
+  // stays unrepresentable — clock/scheduler/monitor/errorHandler/logger are
+  // non-optional on SimEnv, so a missing scheduler cannot reach this call — and a
+  // seam ADDED to SimEnv now arrives here with no edit to this function. The
+  // wrapped adapter is structurally a valid Adapter; the cast bridges
+  // Adapter<T> -> Adapter<PropertiesOf<T>> (the seam never touches the
   // properties/methods split).
-  return new StateMachine<T, StateMachineConfig<T>>(config, wrapped as unknown as Adapter<PropertiesOf<T>>, {
-    clock: env.clock,
-    scheduler: env.scheduler,
-    monitor: env.monitor,
-    errorHandler: env.errorHandler,
-    logger: env.logger,
-  })
+  return new StateMachine<T, StateMachineConfig<T>>(
+    config,
+    wrapped as unknown as Adapter<PropertiesOf<T>>,
+    forwardSeams(env),
+  )
 }
 
 /**
@@ -528,9 +645,16 @@ type HarnessScheduler = {
 
 /**
  * Assemble a default {@link SimEnv} from a seeded {@link Prng} and a fresh
- * {@link SimClock}/virtual scheduler. The five seams are the Step-2/3
+ * {@link SimClock}/virtual scheduler. The five DETERMINISM seams are the Step-2/3
  * deterministic components. `random()` draws from the PRNG; `now()` reads the
  * logical clock.
+ *
+ * `contextTracker` is deliberately NOT set: it is a behaviour seam, and leaving
+ * it absent keeps the engine's own resolution (precise under Node) rather than
+ * flipping every harness-built machine to `contextTrackerKind:'injected'` — which
+ * would change which reentrant `fireEvent` calls are rejected, hence `fireOutcome`
+ * in trace frames, hence corpus hashes. A consumer who wants one sets it on the
+ * env it hands to {@link wire}.
  */
 function makeSimEnv(
   prng: Prng,
@@ -751,7 +875,7 @@ export class Simulator<T extends object = object> {
     }
   }
 
-  /** The harness environment (the five seams + random/now). */
+  /** The harness environment (the five determinism seams + random/now). */
   get env(): SimEnv {
     return this._env
   }
@@ -770,8 +894,16 @@ export class Simulator<T extends object = object> {
     this.ownerAdapter = resolved.owner
 
     // Build the Step-3 driver over the resolved {config, owner}. The driver
-    // forwards all five seams (it never omits scheduler) — the DI-first
-    // construction path wire() exercises is mirrored structurally here.
+    // forwards all five DETERMINISM seams (it never omits scheduler) — the
+    // DI-first construction path wire() exercises is mirrored here.
+    //
+    // The mirror is DELIBERATELY not exact: `contextTracker` is forwarded by
+    // wire() and NOT here. wire() is off the corpus path, but this driver IS the
+    // corpus path, and injecting a tracker flips contextTrackerKind → changes
+    // which reentrant fireEvent calls are rejected → changes `fireOutcome` in
+    // trace frames → moves every corpus hash. The driver's forwarded set is
+    // pinned as unchanged by `src/tests/sim/wire_seam_forwarding.test.ts` so this
+    // stays a decision rather than a memory.
     const driver = new SimDriver<T>({
       config: resolved.config,
       owner: resolved.owner,
