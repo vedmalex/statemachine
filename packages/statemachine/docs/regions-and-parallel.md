@@ -45,29 +45,73 @@ sm.isInState('parent')                   // true
 sm.getCurrentState()                     // 'parent.r1.c1|parent.r2.c1' (order not guaranteed)
 ```
 
-> The order of the `|`-joined parts is insertion-dependent. Compare with `isInState(...)` or by
-> sorting the parts — never assert against a hard-coded composite string.
+> The `|`-joined parts are serialized in **document order** (the position of each active leaf in
+> the config), so the same set of active leaves always serializes identically regardless of how it
+> was reached. That order is nonetheless an implementation detail of the string form: prefer
+> `isInState(...)` over asserting against a hard-coded composite string.
 
 `isInState(id)` is ancestor-aware: `isInState('parent')` and `isInState('parent.r1')` are both
 true while the expanded configuration is active.
 
-## 3. Entry/exit ordering (SCXML)
+## 3. Entry/exit ordering (SCXML §3.13)
 
-- **Entry is ancestor-first** (outer → inner): the composite parent's `onEnter` fires *before* its
-  region children's `onEnter`. For nested composites every ancestor fires top-down.
-- **Exit is descendant-first** (inner → outer): region children's `onExit` fire *before* the
-  parent's `onExit`.
-- A state that remains in the active configuration is **not** re-entered or exited: re-entering an
-  overlapping composite does not re-fire a still-active ancestor's `onEnter` nor re-arm its
-  `invoke` timers, and a surviving sibling region keeps its timers.
+The rule is the W3C SCXML §3.13 rule, stated once:
+
+- **Entry runs in document order** — a depth-first **pre-order** walk of the config tree.
+- **Exit runs in the exact reverse of document order.**
+
+"Document order" is the order states and regions are declared in the `states` / `regions` objects,
+read outside-in and top-to-bottom. Two consequences follow, and they are not separate rules:
+
+- **Layering.** A composite parent's `onEnter` fires *before* its region children's; on exit the
+  children's `onExit` fire *before* the parent's. For nested composites every ancestor enters
+  top-down and exits bottom-up.
+- **Sibling regions.** Regions declared `r1, r2, r3` are **entered** `r1 → r2 → r3` and **exited**
+  `r3 → r2 → r1`. Each region is walked to completion before the next one is touched: a region
+  containing a nested composite enters that whole subtree before its sibling region is entered at
+  all (and unwinds the same way in reverse).
+
+A state that remains in the active configuration is **not** re-entered or exited: re-entering an
+overlapping composite does not re-fire a still-active ancestor's `onEnter` nor re-arm its
+`invoke` timers, and a surviving sibling region keeps its timers.
 
 ```ts
-// ancestor-first entry
-expect(log.indexOf('parent')).toBeLessThan(log.indexOf('parent.r1.c1'))
-// descendant-first exit (mirror): 'parent.r1.c1' and 'parent.r2.c1' exit before 'parent'
+// regions: { r1: { a: … }, r2: { x: … } }, with r1.a a nested composite r1.a ▸ s ▸ deep
+// entry  = document order (r1's subtree finishes before r2 begins):
+//   'parent', 'parent.r1.a', 'parent.r1.a.s.deep', 'parent.r2.x'
+// exit   = the exact mirror:
+//   'parent.r2.x', 'parent.r1.a.s.deep', 'parent.r1.a', 'parent'
+expect([...exitLog].reverse()).toEqual(entryLog)
 ```
 
-This ordering is uniform across `setInitialState`, `reset`, and every transition.
+This ordering is uniform across `setInitialState`, `reset`, and every transition, and it is
+deterministic: it is derived from the compiled config model's document index, a pure function of
+the config's shape — not of the activation path or of `Map` insertion order.
+
+> **Caveat — integer-like region keys.** Document order is the JS own-property order of the
+> `regions` object, and ECMAScript sorts integer-like keys numerically *ahead* of string keys.
+> A config written `{ '2': …, '1': … }` therefore has document order `(1, 2)`. Still fully
+> deterministic, but source order is not readable as document order when region keys are numeric.
+
+### BREAKING change in `1.0.0-beta.x` (W8/V11)
+
+Before this change the engine ordered the enter/exit sets by **depth** (tie-broken by declaration
+order) rather than by document index. Two observable differences:
+
+1. **Sibling `onExit` order reversed.** Regions declared `r1, r2, r3` used to exit `r1 → r2 → r3`;
+   they now exit `r3 → r2 → r1`, as §3.13 requires.
+2. **Nested regions are no longer interleaved.** The old depth-major walk emitted callbacks
+   level-by-level across regions, so a shallow sibling's leaf could land *between* two states of
+   another region's chain. Regions are now traversed one subtree at a time on both edges.
+
+The difference is invisible for flat regions whose leaves all sit at the same depth, and only
+point 1 applies there.
+
+**What did *not* change:** the SET of callbacks invoked, the reached configuration, the layering
+guarantees above, and entry sibling order (already document order). If your `onExit` handlers are
+order-independent — the common case — no migration is needed. If one region's `onExit` relied on a
+sibling region having already torn down, invert that expectation or move the dependency into the
+composite parent's `onExit`, which still runs last.
 
 ## 4. Leaving a composite: parallel-exit vs. all-final join
 

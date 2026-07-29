@@ -8,7 +8,7 @@ Hierarchical state machine for TypeScript with orthogonal (parallel) regions, SC
 **Features:**
 
 - Hierarchical (nested) states addressed by dotted paths
-- Orthogonal **parallel regions** with SCXML ancestor-first entry / descendant-first exit
+- Orthogonal **parallel regions** with W3C SCXML §3.13 callback ordering — entry in document order, exit in reverse document order
 - **UML all-regions-final join** via `final` states, the engine-raised `done.state.<id>` event, and the `isDone()` guard
 - Parallel-exit (LCCA) — a transition from a composite parent preempts and exits all active regions
 - Guards, before/enter/after + exit/transition actions, and timed `invoke` transitions
@@ -67,7 +67,7 @@ const sm = createMachine(
     states: {
       proc: {
         initial: 'a.run|b.run',          // both regions active in parallel
-        onEnter: () => {/* parent runs BEFORE region children (ancestor-first) */},
+        onEnter: () => {/* parent runs BEFORE region children (document order) */},
         regions: {
           a: { run: {}, done: { final: true } },
           b: { run: {}, done: { final: true } },
@@ -87,7 +87,7 @@ const sm = createMachine(
 ```
 
 - **Expansion** — entering `proc` (as initial state *or* via a transition) expands to the parallel configuration `proc.a.run|proc.b.run`.
-- **Ordering** — entry is ancestor-first (`proc` then region children); exit is descendant-first (region children then `proc`).
+- **Ordering** — **entry follows document order** (a DFS pre-order walk of the config: `proc`, then region `a` and everything under it, then region `b`); **exit follows the exact reverse of document order** (region `b`'s states, then region `a`'s, then `proc`). This is W3C SCXML §3.13 verbatim, and it implies both the ancestor-first/descendant-first layering and the sibling-region sequence. See [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
 - **Parallel-exit** — a plain transition `from: 'proc'` on a user event preempts and exits all active regions immediately (LCCA).
 - **Join** — when all regions are `final`, the engine raises `done.state.proc`; `sm.isDone('proc')` reflects the all-final configuration. (`done.state.*` is never matched by a `from: '*'` wildcard.)
 
@@ -113,6 +113,10 @@ Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedma
 ## Extension Points
 
 This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+
+## Lifecycle tracing (debugging)
+
+`createLifecycleTracer()` plugs into `StateMachineOptions.monitor` and renders the machine's callback timeline — hook order, nesting, per-microstep grouping, hung callbacks, failures and guard coverage — answering "why was my `onExit` never called?" and "which callback is hung?". See [`docs/lifecycle-tracing.md`](./docs/lifecycle-tracing.md).
 
 ## Deterministic testing (DST)
 
@@ -290,6 +294,15 @@ if (!report.ok) throw new Error(`checkMachine failed: ${report.failedOn.join(', 
 ## Status & module format
 
 `1.0.0-beta.x` (current published version: see the npm badge above; both the `latest` and `beta` dist-tags track the newest release). Stability: experimental. SCXML/UML parallel regions, ancestor-first / descendant-first ordering, and the all-regions-final join landed in **`1.0.0-beta.2`**. The full API surface is `@unstable` per the package's STABILITY policy except the 5 firm `@stable` symbols; per-symbol stability tagging completes before `1.0.0` stable.
+
+### BREAKING (callback ordering) — `1.0.0-beta.x`
+
+Enter/exit callback order was brought to the W3C SCXML §3.13 norm: **entry = document order (DFS pre-order), exit = reverse document order**. Two observable changes:
+
+1. `onExit` of **sibling states in parallel regions** now fires in the **reverse** of the declaration order (regions `r1, r2, r3` exit `r3 → r2 → r1`; previously `r1 → r2 → r3`).
+2. **Nested regions are no longer interleaved.** The previous walk ordered the whole set by depth, so a shallow region's leaf could be visited *between* two states of another region's chain. Each region is now walked to completion, on both entry and exit.
+
+The **set** of callbacks invoked and the **reached configuration** are unchanged — only the sequence. The layering guarantees (parent enters before its region children, exits after them) and the entry sibling order are unchanged. Order-independent `onExit` handlers — the common case — need no migration. Full detail and migration guidance: [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 

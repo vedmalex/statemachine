@@ -1,0 +1,44 @@
+{
+  "schema": "llm-wiki-change-report/v1",
+  "run_id": "2026-07-29T02-07-25Z",
+  "ts": "2026-07-29T02:07:25.468Z",
+  "node_path": "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki",
+  "changed": [
+    {
+      "source_id": "README",
+      "orig": "/Users/vedmalex/work/statemachine/packages/statemachine/README.md",
+      "reason": "head_sha-drift; file-in-diff",
+      "dependent_pages": [],
+      "new_hash": "c6c5258aad4a",
+      "new_head_sha": "25963eb467cbcca46451bb7c792a21c1e9e14e6e"
+    },
+    {
+      "source_id": "hierarchical.test",
+      "orig": "/Users/vedmalex/work/statemachine/packages/statemachine/src/tests/hierarchical.test.ts",
+      "reason": "head_sha-drift; file-in-diff",
+      "dependent_pages": [],
+      "new_hash": "984798c45929",
+      "new_head_sha": "25963eb467cbcca46451bb7c792a21c1e9e14e6e"
+    }
+  ],
+  "missing": [],
+  "unchanged": [
+    {
+      "source_id": "regions-and-parallel",
+      "orig": "/Users/vedmalex/work/statemachine/packages/statemachine/docs/regions-and-parallel.md"
+    }
+  ],
+  "unknown": [],
+  "notes": [],
+  "metrics": {
+    "sources_checked": 3,
+    "duration_ms": 85,
+    "sources_by_kind": {
+      "git": 3,
+      "file": 0,
+      "url": 0,
+      "pdf": 0,
+      "image": 0
+    }
+  }
+}

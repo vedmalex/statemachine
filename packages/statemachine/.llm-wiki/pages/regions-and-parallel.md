@@ -29,8 +29,9 @@ composite is reached as the machine's `initialState`, via a dotted-path transiti
 **bare-root** transition (`to: 'parent'`). All three produce the same active state, e.g.
 `parent.r1.c1|parent.r2.c1`.
 
-- The order of the `|`-joined parts is insertion-dependent — assert via [[entry-exit-ordering]]-aware
-  `isInState(...)` or by sorting parts, never against a hard-coded composite string.
+- The `|`-joined parts are rendered in **document order** (the normalized model's `documentIndex`),
+  not insertion order — but prefer asserting via `isInState(...)` or by sorting parts rather than
+  against a hard-coded composite string, so a config edit does not break the assertion.
 - `isInState(id)` is ancestor-aware: `isInState('parent')` and `isInState('parent.r1')` are both
   true while expanded.
 - When a region omits `initial`, its first declared sub-state (document order) is the initial state;
@@ -38,7 +39,8 @@ composite is reached as the machine's `initialState`, via a dotted-path transiti
 
 ## Related
 
-- [[entry-exit-ordering]] — SCXML ancestor-first entry / descendant-first exit
+- [[entry-exit-ordering]] — SCXML §3.13: entry = document order, exit = reverse document order
+  (layering and reverse sibling order on exit are consequences of that single rule)
 - [[all-final-join]] — leaving a composite: parallel-exit vs `done.state` join
 
 Source: `raw/regions-and-parallel.md`, `raw/README.md`, `raw/hierarchical.test.ts`.

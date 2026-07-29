@@ -138,6 +138,7 @@ export interface CheckerContext {
     readonly graph: ConfigGraph;
     // (undocumented)
     readonly header: CanonicalHeader;
+    readonly lifecycle?: readonly LifecycleObservation[];
     readonly maxQueueDepth?: number;
 }
 
@@ -149,7 +150,7 @@ export interface CheckEventSpec<T extends object> {
     readonly weight?: number;
 }
 
-// @public
+// @public (undocumented)
 export function checkMachine<T extends object>(config: StateMachineConfig<T>, owner: OwnerSource<T>, options?: CheckOptions<T>): Promise<CheckReport>;
 
 // @public (undocumented)
@@ -181,9 +182,18 @@ export interface CheckReport {
         state: string;
     }>;
     readonly failedOn: readonly FailCause[];
+    readonly guardOutcomes: ReadonlyArray<{
+        transition: string;
+        sawTrue: boolean;
+        sawFalse: boolean;
+    }>;
     // (undocumented)
     readonly livelocks: ReadonlyArray<{
         reason: string;
+    }>;
+    readonly nonConvergingRegions: ReadonlyArray<{
+        composite: string;
+        region: string;
     }>;
     // (undocumented)
     readonly ok: boolean;
@@ -576,7 +586,7 @@ export function fingerprintOf(sample: LivenessSample): ProgressFingerprint;
 export function fingerprintsEqual(a: ProgressFingerprint, b: ProgressFingerprint): boolean;
 
 // @public
-export function fireBuffered<T extends object>(fireEvent: (event: never, adapter: never, ...args: number[]) => Promise<boolean>, wrapped: Adapter<T>, entry: SubmissionEntry): Promise<FireResult>;
+export function fireBuffered<T extends object>(fireEvent: (event: never, adapter: never, ...args: unknown[]) => Promise<boolean>, wrapped: Adapter<T>, entry: SubmissionEntry): Promise<FireResult>;
 
 // @public
 export type FireOutcome = 'resolve-true' | 'resolve-false' | 'reject';
@@ -694,6 +704,8 @@ export interface IMonitor {
     recordError(error: Error, context?: ErrorContext): void;
     // (undocumented)
     recordEvent?(eventName: string, duration: number): void;
+    // Warning: (ae-forgotten-export) The symbol "LifecycleEvent" needs to be exported by the entry point index.d.ts
+    recordLifecycle?(event: LifecycleEvent): void;
     // Warning: (ae-forgotten-export) The symbol "TransitionContext" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
@@ -794,6 +806,30 @@ export interface LatencyStats {
 
 // @public
 export function latencyStatsOf(durations: readonly number[]): LatencyStats;
+
+// @public
+export interface LifecycleObservation {
+    // (undocumented)
+    readonly edge: 'begin' | 'end';
+    // (undocumented)
+    readonly event?: string;
+    // (undocumented)
+    readonly failed?: boolean;
+    // (undocumented)
+    readonly hook: string;
+    // (undocumented)
+    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard';
+    // (undocumented)
+    readonly microstep: number;
+    // (undocumented)
+    readonly owner: object;
+    // (undocumented)
+    readonly seq: number;
+    // (undocumented)
+    readonly state: string;
+    // (undocumented)
+    readonly transition?: string;
+}
 
 // @public
 export interface LiteralCallback {
@@ -1359,7 +1395,7 @@ export class SimDriver<T extends object> {
     faultRecordsList(): readonly FaultRecord[];
     fireMany(ops: ReadonlyArray<{
         event: string;
-        args?: readonly number[];
+        args?: readonly unknown[];
         opId: string;
     }>): Promise<readonly FireResult[]>;
     init(): Promise<void>;
@@ -1403,19 +1439,28 @@ export class SimErrorHandler implements IErrorHandler {
 }
 
 // @public
+export type SimEventPayload = (event: string, rng: SimPayloadRng, snapshot: SimPayloadSnapshot) => readonly unknown[];
+
+// @public
 export class SimMonitor implements IMonitor {
     getDurations(): readonly number[];
     getErrorCount(): number;
     getFailureCount(): number;
+    getLifecycle(): readonly LifecycleObservation[];
+    getTransitionContexts(): readonly TransitionContext[];
     getTransitionCount(): number;
+    invokeActionInFlightCount(): number;
+    isLifecycleTruncated(): boolean;
     // (undocumented)
     recordError(_error: Error, _context?: ErrorContext): void;
+    recordLifecycle(event: LifecycleEvent): void;
     // (undocumented)
-    recordTransition(duration: number, success: boolean, _context?: TransitionContext): void;
+    recordTransition(duration: number, success: boolean, context?: TransitionContext): void;
 }
 
 // @public (undocumented)
 export interface SimOptions {
+    readonly eventPayload?: SimEventPayload;
     // (undocumented)
     readonly faults?: FaultPlan;
     // (undocumented)
@@ -1428,6 +1473,22 @@ export interface SimOptions {
     readonly seed: bigint | string;
     // (undocumented)
     readonly steps?: number;
+}
+
+// @public
+export interface SimPayloadRng {
+    float(): number;
+    int(max: number): number;
+    pick<A>(xs: readonly A[]): A;
+}
+
+// @public
+export interface SimPayloadSnapshot {
+    readonly config: string;
+    readonly data: Readonly<object>;
+    // (undocumented)
+    readonly queueDepth: number;
+    readonly state: string;
 }
 
 // @public (undocumented)
@@ -1500,7 +1561,7 @@ export interface SimWarning {
     // (undocumented)
     readonly count?: number;
     // (undocumented)
-    readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles';
+    readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles' | 'lifecycle-truncated';
     // (undocumented)
     readonly message: string;
 }
@@ -1527,6 +1588,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
     // Warning: (ae-forgotten-export) The symbol "FireResult_2" needs to be exported by the entry point index.d.ts
     fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult_2>;
@@ -1678,8 +1740,7 @@ export interface StepOutcome {
 
 // @public
 export interface SubmissionEntry {
-    // (undocumented)
-    readonly args: readonly number[];
+    readonly args: readonly unknown[];
     // (undocumented)
     readonly event: string;
     readonly opId: string;
@@ -1806,7 +1867,13 @@ export interface Violation {
 export type ViolationFingerprint = Violation['fingerprint'];
 
 // @public (undocumented)
-export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-plateau' | 'uncovered-at-plateau' | 'residual-rejection';
+export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-plateau' | 'uncovered-at-plateau' | 'residual-rejection'
+/** A guard that never returned `true` across a SATURATED sweep (advisory). */
+| 'dead-guard-at-plateau'
+/** Detail carrier for {@link CheckReport.nonConvergingRegions}. */
+| 'non-converging-region'
+/** The initial-configuration invariant pass could not run — see the detail. */
+| 'init-check-skipped';
 
 // @public
 export function wire<T extends object>(env: SimEnv, config: StateMachineConfig<T>, owner: T | Adapter<T>): StateMachine<T, StateMachineConfig<T>>;
