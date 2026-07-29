@@ -175,6 +175,34 @@ An `invoke` action that **throws** takes exactly that same route, on a freshly a
 
 The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
 
+## Serialization (`toJSON` / `fromJSON`)
+
+`toJSON()` writes a machine to a string; `fromJSON(json, owner, options?)` reads one back. `toSecureJSON()` / `fromSecureJSON()` are the async forms and carry exactly the same thing.
+
+`StateMachineOptions` splits in two, and the split decides what the payload holds.
+
+**Behavioural scalars are persisted and restored.** `transitionTimeout`, `errorState`, `abortOnExitError`, `maxQueueDepth` and `maxTransitionDepth` are pure data that changes how the machine behaves, so they travel in the payload: `fromJSON(json, owner)` — no third argument — gives you a machine that behaves like the machine that was saved. Pass one of them to `fromJSON` anyway and **your value wins**; the persisted one is used only where you supplied nothing (`undefined` counts as "supplied nothing"). Only values you passed explicitly are written, so a machine built with no options serializes exactly as it did before this existed.
+
+**Injection contracts are not persisted and must be re-supplied on every restore.** `logger`, `monitor`, `scheduler`, `errorHandler`, `contextTracker`, `clock` and the `actions` registry hold functions and host objects; no document can carry them. If you restore without them the machine falls back to the defaults — the console logger, a fresh monitor, real `setTimeout`, `Date.now` — silently, because that is a legitimate configuration. Pass them every time:
+
+```ts
+const sm = StateMachine.fromJSON(json, owner, {
+  // Re-supplied on every restore — never in the payload:
+  actions: { 'busy.onEnter': enterBusy },  // resolves the config's function NAMES
+  monitor, logger, scheduler, clock,
+  // Optional: overrides whatever the payload persisted.
+  transitionTimeout: 2_000,
+})
+```
+
+`actions` is the one you cannot skip if your config has function-valued hooks: functions serialize as a **name** (never a body — see [Breaking changes](#breaking-changes-in-100-beta5)), and restoration resolves that name against this registry. `strictActions` is not persisted either — it governs how strictly *this* read resolves those names, and a document does not get to relax the rules it is read under.
+
+### Known issue: no countdown survives a restore
+
+**A deadline that was counting down when you called `toJSON` is not persisted, so after a restore every action budget starts fresh.** A `transitionTimeout` of 5 s that had already burned 4 s at save time restores as a full 5 s. This is deliberate: the deadline races a pending promise, and a pending promise cannot be resumed — there is nothing to continue counting against. Budget for it: a machine that is saved and restored repeatedly can let a single action run for longer than `transitionTimeout` in total wall-clock. The bound is per action *per run*, not across a restore.
+
+Invoke **delays** are different and do resume correctly: they are recomputed from the persisted `stateEntryTimes`, so a 1000 ms timer snapshotted 400 ms in fires 600 ms after the restore. See [Replaying serialized state](#replaying-serialized-state).
+
 ## Documentation
 
 Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)

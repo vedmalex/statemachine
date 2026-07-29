@@ -685,7 +685,6 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     fireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<boolean>;
     // (undocumented)
     static fromData<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(config: SMConfig, initialState?: string, context?: TOwner, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
-    // (undocumented)
     static fromJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     // (undocumented)
     static fromJSONWithContext<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, context?: MethodsOf<TOwner>, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
@@ -733,7 +732,6 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     setContext(context: MethodsOf<TOwner>): void;
     // (undocumented)
     get targetState(): string | undefined;
-    // (undocumented)
     toJSON(): string;
     toSecureJSON(): Promise<string>;
 }

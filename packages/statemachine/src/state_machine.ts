@@ -101,6 +101,44 @@ interface RaiseOrigin {
 }
 
 /**
+ * The BEHAVIOURAL SCALARS of {@link StateMachineOptions} — pure data that
+ * changes how the machine behaves — mapped to the `typeof` their persisted form
+ * must have.
+ *
+ * These are the ONLY options carried in the serialized payload. Everything else
+ * on `StateMachineOptions` is an INJECTION CONTRACT (`logger`, `monitor`,
+ * `scheduler`, `errorHandler`, `contextTracker`, `clock`, `actions`) — a
+ * function or host object that cannot be serialized and MUST be re-supplied by
+ * the caller on every restore.
+ *
+ * `strictActions` is deliberately NOT here. It is not machine behaviour: it is
+ * the policy governing how `fromJSON` / `fromSecureJSON` resolve THIS payload's
+ * function references, read straight from the caller's options and never stored
+ * on the instance. Persisting it would let a payload lower the strictness with
+ * which it is itself restored — the bare-name fallback that strict mode exists
+ * to refuse (W0.2 C1) would be re-enabled by the untrusted document.
+ *
+ * The `typeof` table is enforced on read: a payload key whose value has the
+ * wrong type is ignored rather than installed. A forged payload can still forge
+ * a well-typed value, which is the library's standing threat model for
+ * configuration (see {@link StateMachine.fromSecureJSON}) — this only keeps a
+ * malformed one from reaching the engine.
+ */
+const PERSISTED_BEHAVIOUR_OPTIONS = {
+  transitionTimeout: 'number',
+  errorState: 'string',
+  abortOnExitError: 'boolean',
+  maxQueueDepth: 'number',
+  maxTransitionDepth: 'number',
+} as const
+
+/** The behavioural-scalar subset of {@link StateMachineOptions}. */
+type PersistedBehaviourOptions = Pick<
+  StateMachineOptions,
+  keyof typeof PERSISTED_BEHAVIOUR_OPTIONS
+>
+
+/**
  * Prototype-chain builtin names that must NEVER be call-time-resolved as an
  * action / guard / error-handler by bare-name lookup (W0 B1).
  *
@@ -445,6 +483,20 @@ export class StateMachine<
   private abortOnExitError?: boolean
   private maxQueueDepth = 1000
 
+  /**
+   * The behavioural scalars this machine was EXPLICITLY constructed with — the
+   * subset {@link toJSON} carries in the payload so a restored machine behaves
+   * like the machine that was saved.
+   *
+   * Only EXPLICITLY-supplied values are recorded. `maxQueueDepth` /
+   * `maxTransitionDepth` have engine defaults applied above, so the private
+   * fields alone cannot tell "the caller asked for 1000" from "nobody asked";
+   * this record can. The consequences are both intended: a machine constructed
+   * with no behavioural options serializes to a byte-identical payload, and a
+   * value the caller DID pin survives a later change to the engine default.
+   */
+  private readonly persistedOptions: PersistedBehaviourOptions = {}
+
   // Transition state visibility
   private _isTransitioning = false
   private _targetState: string | undefined
@@ -558,21 +610,28 @@ export class StateMachine<
       }
     }
 
-    // Apply options
+    // Apply options. Each behavioural scalar is ALSO recorded in
+    // `persistedOptions` so `toJSON` can carry it — see that field's doc for
+    // why the private fields alone are not enough.
     if (options?.transitionTimeout !== undefined) {
       this.transitionTimeout = options.transitionTimeout
+      this.persistedOptions.transitionTimeout = options.transitionTimeout
     }
     if (options?.errorState !== undefined) {
       this.errorState = options.errorState
+      this.persistedOptions.errorState = options.errorState
     }
     if (options?.abortOnExitError !== undefined) {
       this.abortOnExitError = options.abortOnExitError
+      this.persistedOptions.abortOnExitError = options.abortOnExitError
     }
     if (options?.maxQueueDepth !== undefined) {
       this.maxQueueDepth = options.maxQueueDepth
+      this.persistedOptions.maxQueueDepth = options.maxQueueDepth
     }
     if (options?.maxTransitionDepth !== undefined) {
       this.maxTransitionDepth = options.maxTransitionDepth
+      this.persistedOptions.maxTransitionDepth = options.maxTransitionDepth
     }
     if (config.onError !== undefined) {
       this.onError = config.onError
@@ -2309,6 +2368,70 @@ export class StateMachine<
     return sm
   }
 
+  /**
+   * Fold the behavioural scalars carried in a payload (see
+   * {@link PERSISTED_BEHAVIOUR_OPTIONS}) into the options a caller passed to
+   * `fromJSON` / `fromSecureJSON`.
+   *
+   * PRECEDENCE: an EXPLICIT restore-time option ALWAYS wins over the persisted
+   * value. "Explicit" means `!== undefined`, matching how the constructor reads
+   * the same options — so `{ transitionTimeout: undefined }` is "I did not
+   * supply one" and the persisted value is used, exactly as if the key were
+   * absent.
+   *
+   * Only the whitelisted keys are read, and only when the persisted value has
+   * the declared type. Injection contracts (`actions`, `logger`, `scheduler`,
+   * …) and `strictActions` are never sourced from the payload — a document can
+   * never name what will execute for it, nor relax how strictly it is read.
+   *
+   * @param persisted - the payload's `options` member, of unknown shape.
+   * @param explicit - the options the caller passed to the restore call.
+   * @returns the options to construct with; `explicit` untouched when the
+   * payload contributes nothing.
+   */
+  private static mergeBehaviourOptions(
+    persisted: unknown,
+    explicit?: StateMachineOptions,
+  ): StateMachineOptions | undefined {
+    if (typeof persisted !== 'object' || persisted === null) return explicit
+
+    const source = persisted as Record<string, unknown>
+    const merged: StateMachineOptions = { ...explicit }
+    let adopted = false
+
+    for (const [key, expectedType] of Object.entries(
+      PERSISTED_BEHAVIOUR_OPTIONS,
+    )) {
+      // Explicit restore-time options always win.
+      if (explicit?.[key as keyof StateMachineOptions] !== undefined) continue
+      const value = source[key]
+      if (typeof value !== expectedType) continue
+      ;(merged as Record<string, unknown>)[key] = value
+      adopted = true
+    }
+
+    return adopted ? merged : explicit
+  }
+
+  /**
+   * Deserializes a StateMachine from a {@link toJSON} string.
+   *
+   * The behavioural scalars the payload carries (`transitionTimeout`,
+   * `errorState`, `abortOnExitError`, `maxQueueDepth`, `maxTransitionDepth`)
+   * are restored, so a machine restored WITHOUT options behaves like the
+   * machine that was saved. An `options` value you pass here ALWAYS wins over
+   * the persisted one. A payload written before those fields existed loads
+   * unchanged, simply without them.
+   *
+   * The INJECTION CONTRACTS are never in a payload and must be supplied here on
+   * every restore: `logger`, `monitor`, `scheduler`, `errorHandler`,
+   * `contextTracker`, `clock`, and the `actions` registry that resolves the
+   * config's serialized function NAMES (a body is never compiled — see
+   * {@link StateMachineOptions.actions}).
+   *
+   * Known issue: no countdown is restored. Every action budget starts fresh
+   * from the restore — see {@link toJSON}.
+   */
   public static fromJSON<
     TOwner extends object,
     SMConfig extends StateMachineConfig<TOwner>,
@@ -2318,10 +2441,21 @@ export class StateMachine<
     options?: StateMachineOptions,
   ): StateMachine<TOwner, SMConfig> {
     const parsedData = JSON.parse(jsonData)
-    const { config, currentState, historyMap, stateEntryTimes } = parsedData
+    const {
+      config,
+      options: persistedOptions,
+      currentState,
+      historyMap,
+      stateEntryTimes,
+    } = parsedData
 
+    // The registry and its strictness come from the CALLER, never the payload.
     const registry = options?.actions
     const strict = options?.strictActions ?? false
+    const effectiveOptions = StateMachine.mergeBehaviourOptions(
+      persistedOptions,
+      options,
+    )
     const deserializedStates = StateMachine.deserializeStates<TOwner>(
       config.states,
       registry,
@@ -2349,7 +2483,7 @@ export class StateMachine<
     const sm = new StateMachine<TOwner, StateMachineConfig<TOwner>>(
       smConfig as SMConfig,
       obj as any,
-      options,
+      effectiveOptions,
     )
 
     sm.seedHistory(new Map(historyMap))
@@ -2389,10 +2523,21 @@ export class StateMachine<
     options?: StateMachineOptions,
   ): Promise<StateMachine<TOwner, SMConfig>> {
     const parsedData = JSON.parse(jsonData)
-    const { config, currentState, historyMap, stateEntryTimes } = parsedData
+    const {
+      config,
+      options: persistedOptions,
+      currentState,
+      historyMap,
+      stateEntryTimes,
+    } = parsedData
 
+    // The registry and its strictness come from the CALLER, never the payload.
     const registry = options?.actions
     const strict = options?.strictActions ?? false
+    const effectiveOptions = StateMachine.mergeBehaviourOptions(
+      persistedOptions,
+      options,
+    )
     // Async deserialization of states and events
     const deserializedStates =
       await StateMachine.deserializeStatesAsync<TOwner>(
@@ -2423,7 +2568,7 @@ export class StateMachine<
     const sm = new StateMachine<TOwner, StateMachineConfig<TOwner>>(
       smConfig as SMConfig,
       obj as any,
-      options,
+      effectiveOptions,
     )
 
     sm.seedHistory(new Map(historyMap))
@@ -5816,6 +5961,42 @@ export class StateMachine<
   }
 
   // Методы сериализации
+
+  /**
+   * The `options` member of the payload: the behavioural scalars this machine
+   * was explicitly constructed with, or `undefined` when it was constructed
+   * with none — in which case the key is omitted entirely and the payload stays
+   * byte-identical to what this machine serialized before the field existed.
+   */
+  private behaviourOptionsForPayload(): PersistedBehaviourOptions | undefined {
+    const options = { ...this.persistedOptions }
+    return Object.keys(options).length > 0 ? options : undefined
+  }
+
+  /**
+   * Serializes the StateMachine to a JSON string.
+   *
+   * WHAT IS CARRIED. The config (functions as NAME references only — never a
+   * body), the current state, the history map, the state entry times, and the
+   * BEHAVIOURAL SCALARS this machine was explicitly constructed with
+   * (`transitionTimeout`, `errorState`, `abortOnExitError`, `maxQueueDepth`,
+   * `maxTransitionDepth`) — so a machine restored with no options behaves like
+   * the machine that was saved.
+   *
+   * WHAT IS NOT. The INJECTION CONTRACTS on {@link StateMachineOptions} —
+   * `logger`, `monitor`, `scheduler`, `errorHandler`, `contextTracker`, `clock`
+   * and the `actions` registry. They hold functions and host objects, and MUST
+   * be re-supplied on every {@link fromJSON}. Nor is `strictActions`, which is a
+   * property of the READ rather than of the machine.
+   *
+   * KNOWN ISSUE — no countdown survives. An in-flight deadline is not persisted
+   * state: a `transitionTimeout` that had already consumed part of its budget
+   * when `toJSON` ran restores as a FULL fresh budget, because the pending
+   * promise it was racing cannot be resumed at all. Action budgets after a
+   * restore start from the restore, not from the save. (Invoke DELAYS are
+   * different — those are recomputed from `stateEntryTimes` and do resume with
+   * the correct remaining time.)
+   */
   public toJSON(): string {
     // Pre-allocate objects for better performance
     const serializedStates: Record<string, any> = {}
@@ -5840,8 +6021,11 @@ export class StateMachine<
       onError: this.serializeAction(this.onError),
     }
 
+    const options = this.behaviourOptionsForPayload()
+
     return JSON.stringify({
       config,
+      ...(options !== undefined ? { options } : {}),
       currentState: this.getCurrentState(),
       historyMap: Array.from(this.historyFor(this.adaptee).entries()),
       stateEntryTimes: Array.from(this.entryTimesFor(this.adaptee).entries()),
@@ -5856,6 +6040,9 @@ export class StateMachine<
    * compatibility. Payload integrity/authenticity is the transport's
    * responsibility (TLS / a signed envelope); a forged payload cannot inject
    * code but can still forge configuration.
+   *
+   * It carries exactly what {@link toJSON} carries, including the behavioural
+   * scalars and the same known issue about in-flight deadlines.
    */
   public async toSecureJSON(): Promise<string> {
     const serializedStates: Record<string, any> = {}
@@ -5878,8 +6065,11 @@ export class StateMachine<
       onError: await this.serializeActionAsync(this.onError),
     }
 
+    const options = this.behaviourOptionsForPayload()
+
     return JSON.stringify({
       config,
+      ...(options !== undefined ? { options } : {}),
       currentState: this.getCurrentState(),
       historyMap: Array.from(this.historyFor(this.adaptee).entries()),
       stateEntryTimes: Array.from(this.entryTimesFor(this.adaptee).entries()),

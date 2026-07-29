@@ -4,7 +4,7 @@
 
 ### Minor Changes
 
-- The library now loads outside Node; failing `invoke` actions stop being silent; and the dynamic check no longer fails a run over its own turn budget.
+- 849c2b6: The library now loads outside Node; failing `invoke` actions stop being silent; and the dynamic check no longer fails a run over its own turn budget.
 
   **The bundle loads in a browser (and in Deno).** `dist/index.js` opened with a static
   `import { AsyncLocalStorage } from "async_hooks"` — a bare Node builtin. A browser
@@ -82,6 +82,27 @@
   is still surfaced by `transitionTimeout` and by the liveness plane's virtual-time budget.
   `WarningKind` also gained `lifecycle-truncated`, which previously reached consumers
   mislabelled as `residual-rejection`.
+
+  **A restored machine keeps its behavioural options.** `transitionTimeout`, `errorState`,
+  `abortOnExitError`, `maxQueueDepth` and `maxTransitionDepth` live on
+  `StateMachineOptions`, not in the config, and were never serialized — so
+  `fromJSON(json, owner)` returned a machine with no action deadline, no error state and
+  no run-away bounds, silently. That bit hardest right after a restore, because
+  `resumeTimers` re-arms persisted invoke timers whose actions then run unattended. Those
+  five scalars are now carried in the payload under an `options` key and restored;
+  explicit options passed at restore still win. Only values you supplied explicitly are
+  recorded, so a machine constructed without them serializes byte-identically to before.
+
+  The injection contracts — `logger`, `monitor`, `scheduler`, `errorHandler`,
+  `contextTracker`, `clock` and the action registry — are still NOT serialized and must be
+  re-supplied on every restore; they hold functions and host objects. `strictActions` is
+  deliberately not persisted either: it governs how the payload's own function names are
+  resolved, so honouring it from the document would let a document relax the rules it is
+  read under.
+
+  **Known issue:** a deadline that was counting down when the machine was serialized does
+  not survive. After a restore every action budget starts fresh. A pending promise cannot
+  be resumed, so the alternative would be to fabricate one.
 
   Alongside it: `maxTurns` is now a public option on both `SimOptions` and
   `CheckOptions` (default 1024), so the advice those warnings give is actionable;
