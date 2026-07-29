@@ -310,15 +310,51 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
         // window 64x smaller — and the armed timer may belong to a completely
         // unrelated parallel region. It was long described as an observation made
         // "inside budget" and therefore stronger than a truncation; it is not.
+        //
         // `stuck` counts turns over `queueDepth|isProcessingEvents|inFlightAsyncCount`,
-        // and that fingerprint stays frozen across an ENTIRE ordinary microstep
-        // because the engine awaits once per hook slot per state even where no hook
-        // is defined (the `if (!action) return` sits INSIDE the awaited function,
-        // state_machine.ts:~4853-4855; enter side ~:4971-4986). One LEGITIMATE
-        // microstep's frozen length is thus O(#states + #hooks) — a property of the
-        // machine's own width — so a fixed 16-turn window is refuted by any correct
-        // machine whose legitimate frozen chain runs 17 turns. Consequently the
-        // `WAITING_ON_INTERNAL` this break leads to is ADVISORY (see SettleReason).
+        // and that fingerprint stays frozen across an ENTIRE ordinary microstep. The
+        // reason is width, and it has THREE distinct sources — NOT the single one
+        // this note used to give. (Method names, not line numbers: the previous
+        // citations here had rotted to unrelated code, which is exactly how a wrong
+        // derivation survived.)
+        //
+        //  1. SELECTION — the dominant term, and the one that has nothing to do with
+        //     hooks. `computeEnabledSet` awaits `selectTransition` ONCE PER ACTIVE
+        //     LEAF, so an N-region machine pays at least N awaits per selection even
+        //     with no hook and no guard anywhere in the config.
+        //  2. THE EXIT SIDE — `executeExitActions` awaits `runExitAction` three times
+        //     per exited state UNCONDITIONALLY; its `if (!action) return` sits INSIDE
+        //     the awaited callee. Three hops per exited state, hooks or no hooks.
+        //  3. THE ENTER SIDE IS NOT LIKE THAT — and the old wording, which claimed
+        //     the engine "awaits once per hook slot per state even when no hook is
+        //     defined" as a symmetric fact, was simply FALSE for it.
+        //     `executeEnterActions` tests `if (action)` OUTSIDE the await, so a
+        //     hookless enter slot costs NO hop at all.
+        //
+        // The O(width) conclusion therefore still holds — via (1) alone, and more
+        // strongly via (1)+(2) — but not for the stated reason.
+        //
+        // MEASURED at HEAD on a flat N-region parallel machine, one event exiting
+        // every region, counting the longest frozen-fingerprint run inside the
+        // pending-work window (`probe_gap`, A1/A2 wave):
+        //
+        //     N regions:        1    2    4    8   16   32
+        //     no hooks:        11   17   29   53  101  197      (= 6N + 5)
+        //     onEnter+onExit:  16   27   49   93  181  357      (= 11N + 5)
+        //
+        // A fixed 16-turn window is thus refuted by a CORRECT machine at N=2 with no
+        // hooks at all. Consequently the `WAITING_ON_INTERNAL` this break leads to is
+        // ADVISORY (see SettleReason).
+        //
+        // The direct observation this proxy was standing in for now exists:
+        // `StateMachine#getProgress()` (A2) exposes a monotonic engine phase-advance
+        // `tick`, and over the SAME runs the longest frozen-TICK run is 1 (no hooks)
+        // and 3 (with hooks) — CONSTANT in N, because every tick site sits adjacent
+        // to an existing drain-path await. Its companion `openDispatches` (A1) names
+        // which consumer callable is holding the drain when the tick does not move.
+        // This note stays here rather than being replaced by that reading: nothing in
+        // this file consumes `getProgress()`, and wiring a live engine read into the
+        // settle predicate would breach the zero-core-ABI rule the harness is built on.
         break
       }
       await Promise.resolve()

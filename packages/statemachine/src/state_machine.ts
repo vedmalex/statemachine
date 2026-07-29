@@ -20,6 +20,7 @@ import {
   type ErrorContext,
   type ErrorHandler,
   type ErrorHandlerOrString,
+  type EngineProgress,
   type Event,
   type EventAction,
   type EventName,
@@ -41,6 +42,7 @@ import {
   type LifecycleEvent,
   MemoryAdapter,
   type MethodsOf,
+  type OpenDispatch,
   type OwnerDetachResult,
   type PropertiesOf,
   type RegionsConfig,
@@ -100,6 +102,175 @@ interface RaiseOrigin {
   readonly state: string
   readonly microstep: number
 }
+
+/**
+ * A1 — the CLOSED set of USER-CALLABLE dispatch origins, one per shape in which
+ * the engine hands control to code the CONSUMER wrote.
+ *
+ * ## Why a closed union and not a list in a comment
+ * Before A1 the engine invoked consumer code through FIVE unrelated syntactic
+ * shapes (a resolved action inside `callAction`, a `processError` handler called
+ * directly, `invoke[].cond` called and truthiness-coerced, `invoke[].src` called
+ * directly, and the persistence adapter's `save`/`restore`), so every "list of
+ * instrumented slots" drifted the moment a sixth shape appeared. `dispatchHook`
+ * is a REQUIRED parameter of {@link StateMachine.dispatchUser} — the SINGLE
+ * function in this file that syntactically invokes a consumer callable — so a
+ * new slot cannot be added without naming itself here. Omitting it is a COMPILE
+ * ERROR, exactly as {@link RaiseOrigin} makes it for `raiseEvent`.
+ *
+ * The DoD is enforced mechanically, not by review: `src/tests/dispatch_funnel_source_scan.test.ts`
+ * asserts that `Reflect.apply` appears EXACTLY ONCE in this file and that no
+ * consumer-callable identifier is call-applied anywhere else.
+ */
+type DispatchHook =
+  /** `callAction` arm 1 — an action resolved from the DI `context`. */
+  | 'action.context'
+  /** `callAction` arm 2 — an inline function action/guard/hook. */
+  | 'action.inline'
+  /** `callAction` arm 3 — a string action resolved as an adaptee method. */
+  | 'action.method'
+  /** A consumer-supplied `onError` handler resolved by `processError`. */
+  | 'error.handler'
+  /** The ENGINE's own rethrow fallback in `processError` — see {@link ENGINE_OWNED_DISPATCH}. */
+  | 'error.default'
+  /** An `invoke[].cond` predicate (arm / re-arm / resume). */
+  | 'invoke.cond'
+  /** An `invoke[].src` long-running operation body. */
+  | 'invoke.src'
+  /** `StatePersistenceAdapter.save`. */
+  | 'persist.save'
+  /** `StatePersistenceAdapter.restore`. */
+  | 'persist.restore'
+
+/**
+ * The one {@link DispatchHook} whose callable is ENGINE code, not consumer code:
+ * `processError`'s default rethrow handler, which runs whenever no `onError` was
+ * configured. It goes through the funnel so the funnel stays the SOLE invocation
+ * site (the source scan can then be an absolute "exactly once"), but it is
+ * neither counted in {@link StateMachine.userDispatchInFlight} nor spanned —
+ * counting the engine's own synchronous rethrow as an in-flight consumer callback
+ * would make the debugging surface lie.
+ */
+const ENGINE_OWNED_DISPATCH: DispatchHook = 'error.default'
+
+/**
+ * A1 — ONE open dispatch: a consumer callable that has been entered and whose own
+ * promise has not settled. Held in {@link StateMachine.openDispatches} for the
+ * lifetime of the call and dropped on settle, so the set size is bounded by REAL
+ * CONCURRENCY (never by run length) and is safe to keep maintained even when
+ * nothing is subscribed to the lifecycle channel.
+ *
+ * `openedAtTick` is the A2 heartbeat reading at entry, which is what turns
+ * "something is stuck" into "`onEnter@work.r1` has been open for M engine ticks".
+ */
+interface OpenDispatchRecord {
+  readonly hook: string
+  readonly state: string
+  readonly owner: object
+  readonly openedAtTick: number
+}
+
+/**
+ * A1 — an OPEN lifecycle span the dispatch funnel is responsible for CLOSING at
+ * the settle of the consumer callable's OWN promise.
+ *
+ * ## The timeout-zombie rule (the reason this object exists)
+ * With `transitionTimeout` set, `callAction` returns
+ * `Promise.race([executeAction(), timeoutPromise])`. Before A1 the `end` edge was
+ * attached to the RACE result, so a timeout win closed the span WHILE THE
+ * CONSUMER BODY WAS STILL RUNNING — an invisible continuation, and (for
+ * `invoke.action`, which feeds `SimMonitor.invokeActionInFlight`) a settledness
+ * signal that read "settled" over a live callback.
+ *
+ * The rule adopted here is the one `src/sim/env.ts` (`bracketAsync`, ~:83-116)
+ * already froze for the harness side: bracket the BODY, never the race. The
+ * CALLER emits `begin` (so a failure to even RESOLVE the action still produces a
+ * pair, exactly as before A1) and hands the span down; the funnel sets
+ * {@link taken} synchronously the moment the body starts, and from that point the
+ * caller's own settle handlers MUST NOT close it — the funnel will, when the body
+ * really finishes. A timeout is reported as a SEPARATE adjacent begin+end point
+ * pair on a `<hook>.timeout` slot (the `invoke.abort` precedent), never by
+ * widening `LifecycleEvent.edge`, whose narrowness is the load-bearing half of
+ * the "a `begin` with no `end` means HUNG" contract.
+ */
+interface DispatchSpan {
+  readonly kind: LifecycleEvent['kind']
+  readonly hook: string
+  readonly state: string
+  readonly owner: object
+  readonly microstep: number
+  readonly event: string | undefined
+  /** `"<from> -> <to>"` label, carried on `kind:'guard'` records only. */
+  readonly transition: string | undefined
+  /** Extra `end` fields the CALLER wants carried (guard `outcome`). */
+  readonly carryOutcome: boolean
+  /** Set synchronously by the funnel once the consumer body has STARTED. */
+  taken: boolean
+  /** Set by whoever emits the `end` edge, so it can never be emitted twice. */
+  closed: boolean
+}
+
+/**
+ * A2 — the CLOSED set of engine PHASE-ADVANCE sites. Each member names one
+ * `await` on the drain path after which the engine has provably made one hop of
+ * progress, so the gap between two consecutive ticks is a CODE CONSTANT rather
+ * than a function of the machine's width.
+ *
+ * ## Why the sites are CALLER-side
+ * The naive placement — tick inside the per-slot helper — is wrong, and measurably
+ * so: {@link StateMachine.runExitAction} returns early when no hook is defined
+ * (`if (!action) return`), yet `executeExitActions` still `await`s it three times
+ * per exited state and therefore still pays three microtask hops. A tick that only
+ * fires when a hook exists emits NOTHING on the hookless path, leaving O(depth)
+ * un-ticked hops per microstep — the exact O(machine width) blind window this
+ * heartbeat exists to remove. Ticking CALLER-side, immediately after each await,
+ * fires on every path of the callee including its early return, and has the
+ * additional property of being GREPPABLE: `rg 'this\.tick\(' src/state_machine.ts`
+ * lists the complete set.
+ *
+ * ## Dependency on A1 (stated here, not merely in the commit order)
+ * The CONSTANCY of the inter-tick gap is conditional on A1. A tick means "the
+ * engine advanced one hop"; the time between two ticks is engine time PLUS the
+ * time consumer code holds the drain. Only because every awaited consumer slot is
+ * now inside a {@link DispatchSpan} can a long gap be ATTRIBUTED to the open span
+ * rather than misread as engine stall. Without A1 an arbitrarily long consumer
+ * hook is silently classified as engine time and the constant is a fiction.
+ */
+type EngineTickSite =
+  /** `processQueues` drained one INTERNAL queued event. */
+  | 'drain.internal'
+  /** `processQueues` drained one EXTERNAL queued event. */
+  | 'drain.external'
+  /** `executeQueuedTransition` finished building the whole enabled set. */
+  | 'select.set'
+  /** `computeEnabledSet` finished selection for one active leaf. */
+  | 'select.leaf'
+  /** `selectTransition` finished evaluating one candidate's guard. */
+  | 'select.guard'
+  /** An awaited `onError` routing call returned. */
+  | 'error.route'
+  /** `executeQueuedTransition` finished applying the microstep. */
+  | 'micro.apply'
+  /** `applyMicrostep` phase 2 — the event-level `onBefore` returned. */
+  | 'micro.onBefore'
+  /** `applyMicrostep` phase 3 — one exiting state's hook set returned. */
+  | 'micro.exit'
+  /** `executeExitActions` — one exit hook SLOT returned (defined or not). */
+  | 'exit.slot'
+  /** `applyMicrostep` phase 5 — one transition action returned. */
+  | 'micro.onTransition'
+  /** `applyMicrostep` phase 6 — one entering state's hook set returned. */
+  | 'micro.enter'
+  /** `executeEnterActions` — one enter hook SLOT returned. */
+  | 'enter.slot'
+  /** `runLifecycleAction` — one instrumented hook callback returned. */
+  | 'hook.callback'
+  /** `applyMicrostep` phase 7 — the event-level `onAfter` returned. */
+  | 'micro.onAfter'
+  /** `applyMicrostep` — the whole risky() phase block returned. */
+  | 'micro.body'
+  /** An invoke TIMER's traced action returned (fresh-entry or resumed lane). */
+  | 'invoke.action'
 
 /**
  * W3b.2 — ONE invoke OPERATION whose launch is committed and whose `src` has not
@@ -450,9 +621,20 @@ export class StateMachine<
   /**
    * W8/V1 — near-zero gate. Resolved ONCE in the constructor (the monitor is
    * injected there and never reassigned), so an unsubscribed machine pays a
-   * single boolean test per instrumented callback and builds NO event object,
-   * takes NO extra promise hop, and allocates nothing. Every emission site is
-   * wrapped in `if (this.lifecycleEnabled)`.
+   * single boolean test per instrumented callback, builds NO `LifecycleEvent`
+   * object, calls NO sink, and takes NO extra promise hop.
+   *
+   * A1 AMENDMENT — "allocates nothing" is no longer literally true and the
+   * difference is deliberate. An unsubscribed machine now allocates ONE
+   * {@link DispatchSpan} descriptor per instrumented callback, because that
+   * descriptor carries the SLOT IDENTITY that {@link getProgress} reports for an
+   * in-flight consumer callable. Building it only for subscribed machines would
+   * degrade the debugging surface to a bare dispatch origin (`action.inline`)
+   * exactly when no observability was configured in advance — the case you are
+   * debugging in. What the gate still guarantees, and what actually matters, is
+   * HOP-NEUTRALITY: the unsubscribed promise chain is byte-identical to the pre-A1
+   * one (MEASURED: identical microtask-turn counts on 1..32-region machines with
+   * sync and async hooks).
    */
   private lifecycleEnabled = false
   /** W8/V1 — per-machine monotonic record counter (`LifecycleEvent.seq`). */
@@ -476,6 +658,43 @@ export class StateMachine<
    * cannot retag an in-flight record.
    */
   private currentMicrostep = 0
+
+  // ── A2: engine progress heartbeat ───────────────────────────────────────────
+  /**
+   * A2 — monotonic count of engine PHASE ADVANCES. See {@link EngineTickSite} for
+   * the closed set of sites and for why they are caller-side.
+   *
+   * ROLLING SCALAR, never a buffered record. At ten-plus ticks per microstep,
+   * emitting the heartbeat onto the lifecycle channel would flood the subscriber's
+   * non-rotating 200k observation buffer and make every OTHER oracle reading that
+   * buffer go vacuous sooner — the heartbeat would destroy the very observability
+   * it exists to add.
+   */
+  private engineTick = 0
+  /** A2 — label of the site that produced the most recent {@link engineTick}. */
+  private lastTickSite = ''
+  /** A2 — {@link lifecycleSeq} sampled at the most recent tick. */
+  private lastTickSeq = 0
+
+  // ── A1: the consumer-callable dispatch funnel ───────────────────────────────
+  /**
+   * A1 — live count of consumer callables entered and not yet settled.
+   *
+   * MAINTAINED ON ENTRY/SETTLE, never derived by scanning the lifecycle buffer.
+   * That buffer STOPS GROWING at its cap rather than rotating, so a retained
+   * `begin` whose `end` was dropped would jam a derived counter non-zero forever
+   * and silently void anything reading it. `SimMonitor.invokeActionInFlight` is
+   * the precedent — note it is maintained BEFORE the cap test, for exactly this
+   * reason.
+   */
+  private userDispatchInFlight = 0
+  /**
+   * A1 — the consumer callables currently in flight. Only ASYNC dispatches are
+   * recorded: a synchronous callable has already settled by the time anyone could
+   * observe the set, so tracking it would be pure allocation on the hot path. The
+   * set size is therefore bounded by real concurrency, never by run length.
+   */
+  private readonly openDispatches = new Set<OpenDispatchRecord>()
 
   // Event Queue Infrastructure (SCXML Run-to-Completion)
   private externalQueue: QueuedEvent<TOwner>[] = []
@@ -859,6 +1078,240 @@ export class StateMachine<
     }
   }
 
+  // ── A2: the engine progress heartbeat ───────────────────────────────────────
+  /**
+   * A2 — record ONE engine phase advance.
+   *
+   * Three synchronous scalar writes and nothing else: no allocation, no promise
+   * link, no record. Every call site is a statement placed IMMEDIATELY AFTER an
+   * existing `await` on the drain path, so the tick adds ZERO microtask hops —
+   * which is what makes A2 (unlike A1) genuinely hop-neutral and provable as such.
+   *
+   * @param site the phase that just advanced; a REQUIRED closed-union member, so
+   *   a new drain-path await cannot be added without naming its tick.
+   */
+  private tick(site: EngineTickSite): void {
+    this.engineTick++
+    this.lastTickSite = site
+    this.lastTickSeq = this.lifecycleSeq
+  }
+
+  /**
+   * @unstable — A1/A2 progress snapshot: the engine's phase-advance heartbeat
+   * plus the consumer callables it is currently inside.
+   *
+   * The whole point of the pair is ATTRIBUTION. `tick` alone says whether the
+   * engine advanced; `openDispatches` says what it is waiting on when it did not.
+   * Together they turn "something is stuck" into "the engine has not ticked since
+   * turn N, and span `onEnter@work.r1` has been open for M ticks".
+   *
+   * READ-ONLY and side-effect-free. Nothing in the engine consumes it, and it is
+   * NOT a liveness verdict — a consumer callable is entitled to take as long as it
+   * likes, so a long-open span is a description, never a conviction.
+   */
+  public getProgress(): EngineProgress {
+    const tick = this.engineTick
+    const open: OpenDispatch[] = []
+    for (const d of this.openDispatches) {
+      open.push({
+        hook: d.hook,
+        state: d.state,
+        owner: d.owner,
+        openedAtTick: d.openedAtTick,
+        openTicks: tick - d.openedAtTick,
+      })
+    }
+    return {
+      tick,
+      lastTickSite: this.lastTickSite,
+      lastTickSeq: this.lastTickSeq,
+      inFlightUserCallables: this.userDispatchInFlight,
+      openDispatches: open,
+    }
+  }
+
+  // ── A1: the consumer-callable dispatch funnel ───────────────────────────────
+  /**
+   * A1 — build ONE {@link DispatchSpan} and, IF the lifecycle channel is
+   * subscribed, emit its `begin` edge.
+   *
+   * ## Why the descriptor is allocated even when nothing is subscribed
+   * The span carries the SLOT IDENTITY (`onEnter` @ `work.r1`), and that identity
+   * is what {@link getProgress} reports for an in-flight callable. Building it only
+   * for subscribed machines would mean the debugging surface degrades to the raw
+   * dispatch origin (`action.inline`) precisely when nobody configured
+   * observability in advance — which is the case you are debugging in.
+   *
+   * The cost is ONE small object per instrumented callback, and it is paid where
+   * three promises are already being allocated for the same call. What is NOT paid
+   * is anything the {@link lifecycleEnabled} gate protects: no `LifecycleEvent` is
+   * constructed, no sink is called, and — crucially — the caller's promise chain is
+   * unchanged, so an unsubscribed machine still takes the pre-A1 number of
+   * microtask hops. That hop-neutrality, not the allocation, is the invariant.
+   */
+  private openSpan(
+    kind: LifecycleEvent['kind'],
+    hook: string,
+    state: string,
+    owner: object,
+    microstep: number,
+    event: string | undefined,
+    carryOutcome = false,
+    transition?: string,
+  ): DispatchSpan {
+    const span: DispatchSpan = {
+      kind,
+      hook,
+      state,
+      owner,
+      microstep,
+      event,
+      transition,
+      carryOutcome,
+      taken: false,
+      closed: false,
+    }
+    if (this.lifecycleEnabled) {
+      this.emitLifecycle(kind, hook, state, owner, microstep, 'begin', {
+        ...(event !== undefined ? { event } : {}),
+        ...(transition !== undefined ? { transition } : {}),
+      })
+    }
+    return span
+  }
+
+  /**
+   * A1 — emit the `end` edge of a span exactly once.
+   *
+   * `outcome` is carried only for spans that asked for it (guards), so the
+   * `LifecycleEvent.outcome` field keeps meaning "the predicate's boolean result"
+   * and does not silently appear on hook records.
+   */
+  private closeSpan(span: DispatchSpan, failed: boolean, outcome?: boolean): void {
+    if (span.closed) return
+    span.closed = true
+    if (!this.lifecycleEnabled) return
+    this.emitLifecycle(span.kind, span.hook, span.state, span.owner, span.microstep, 'end', {
+      ...(span.event !== undefined ? { event: span.event } : {}),
+      ...(span.transition !== undefined ? { transition: span.transition } : {}),
+      failed,
+      ...(span.carryOutcome ? { outcome: outcome ?? false } : {}),
+    })
+  }
+
+  /**
+   * A1 — THE DISPATCH FUNNEL. The one and only place in this file where a callable
+   * the CONSUMER supplied is syntactically invoked.
+   *
+   * ## The contract
+   * `hook` is REQUIRED and closed ({@link DispatchHook}), so a sixth dispatch shape
+   * cannot be added without naming itself — omitting it is a compile error, not a
+   * silent observability hole. This is the `raiseEvent` / {@link RaiseOrigin}
+   * shape, applied to the other direction of control transfer, and it is enforced
+   * MECHANICALLY: `Reflect.apply` occurs exactly once in this file, and the source
+   * scan in `src/tests/dispatch_funnel_source_scan.test.ts` fails if a consumer
+   * callable is call-applied anywhere else.
+   *
+   * ## Why the parameters are positional and not one origin OBJECT
+   * `raiseEvent` can afford an origin object: raises are point events on a cold
+   * path. This funnel is the hot path — three of its nine origins are `callAction`
+   * arms, i.e. EVERY action, guard and hook the machine ever runs. A per-dispatch
+   * origin allocation would be paid by machines that subscribe to nothing at all.
+   * The closed-union first parameter buys the same compile-time completeness with
+   * no allocation.
+   *
+   * ## Bracketing: the BODY, never a race
+   * The counters and the span are closed on the settle of the callable's OWN
+   * promise, attached as a SIBLING reaction (`raw.then(...)`) rather than by
+   * returning a derived promise. Two consequences, both deliberate:
+   *
+   *  - the caller `await`s the SAME promise it would have awaited before A1, so
+   *    the funnel adds NO microtask hop to any existing chain;
+   *  - a `transitionTimeout` that wins the race in {@link callAction} cannot close
+   *    the span, because the race is OUTSIDE this bracket. That is the frozen rule
+   *    `src/sim/env.ts` `bracketAsync` already applies on the harness side, and it
+   *    is the whole reason a timed-out consumer body is no longer an invisible
+   *    continuation.
+   *
+   * The sibling reaction deliberately does NOT rethrow: rethrowing would
+   * manufacture a brand-new unhandled rejection for every failing callable whose
+   * real chain IS handled by the caller. It does mark `raw` as handled, which is
+   * why the two FIRE-AND-FORGET error-handler sites attach their own logging
+   * `.catch` — see `reportRuntimeError` and the `onAfter` recovery in
+   * `applyMicrostep`.
+   *
+   * @param hook the REQUIRED dispatch origin
+   * @param state state the dispatch belongs to (`''` where the slot has none)
+   * @param owner owner object for the record (`ownerKey`-resolved by the caller)
+   * @param span an already-OPEN span the funnel must close at the body's settle,
+   *   or `undefined` (unsubscribed, or a slot the caller did not span)
+   * @param self `this` binding for `fn` (a method taken off an adapter needs one)
+   * @param fn the consumer callable
+   * @param args its arguments
+   */
+  private dispatchUser(
+    hook: DispatchHook,
+    state: string,
+    owner: object,
+    span: DispatchSpan | undefined,
+    self: unknown,
+    fn: (...a: any[]) => unknown,
+    args: any[],
+  ): unknown {
+    // The engine's own rethrow fallback is dispatched here purely so this stays the
+    // SOLE invocation site; it is not consumer code and must not be counted or
+    // spanned. It shares the ONE `Reflect.apply` below rather than early-returning
+    // through a second one — "exactly one apply in this file" is what the source
+    // scan asserts, and two would already have made that assertion approximate.
+    const engineOwned = hook === ENGINE_OWNED_DISPATCH
+    if (!engineOwned) {
+      if (span) span.taken = true
+      this.userDispatchInFlight++
+    }
+    let raw: unknown
+    try {
+      // ─────────────────────────────────────────────────────────────────────────
+      // THE CHOKEPOINT. The only place in this file where consumer code is called.
+      // ─────────────────────────────────────────────────────────────────────────
+      raw = Reflect.apply(fn, self, args)
+    } catch (error) {
+      if (!engineOwned) {
+        this.userDispatchInFlight--
+        if (span) this.closeSpan(span, true)
+      }
+      throw error
+    }
+    if (engineOwned) return raw
+    if (raw instanceof Promise) {
+      // The SPAN's identity wins when there is one: `callAction` only knows the
+      // configuration it was called from, while the span knows the SLOT — and
+      // "`onEnter@work.r1` has been open for M ticks" is the whole deliverable.
+      const record: OpenDispatchRecord = {
+        hook: span?.hook ?? hook,
+        state: span?.state ?? state,
+        owner: span?.owner ?? owner,
+        openedAtTick: this.engineTick,
+      }
+      this.openDispatches.add(record)
+      raw.then(
+        (value) => {
+          this.userDispatchInFlight--
+          this.openDispatches.delete(record)
+          if (span) this.closeSpan(span, false, Boolean(value))
+        },
+        () => {
+          this.userDispatchInFlight--
+          this.openDispatches.delete(record)
+          if (span) this.closeSpan(span, true, false)
+        },
+      )
+      return raw
+    }
+    this.userDispatchInFlight--
+    if (span) this.closeSpan(span, false, Boolean(raw))
+    return raw
+  }
+
   /**
    * W8/V1 — run ONE engine-invoked callback through {@link callAction} with a
    * `begin` / `end` lifecycle pair around it, preserving the caller's error
@@ -887,28 +1340,30 @@ export class StateMachine<
     microstep: number,
     eventName?: string,
   ): Promise<void> {
+    const span = this.openSpan(kind, hook, state, this.ownerKey(obj), microstep, eventName)
     if (!this.lifecycleEnabled) {
-      await this.callAction(obj, action, ...callArgs).catch(route)
+      // BYTE-IDENTICAL to the pre-A1 chain: one `.catch(route)` and nothing else.
+      // The span is still handed down — the funnel needs it for the in-flight
+      // attribution `getProgress()` reports — but it emits nothing.
+      await this.callAction(obj, action, span, ...callArgs).catch(route)
+      this.tick('hook.callback')
       return
     }
-    const owner = this.ownerKey(obj)
-    const ctx = eventName !== undefined ? { event: eventName } : undefined
-    this.emitLifecycle(kind, hook, state, owner, microstep, 'begin', ctx)
-    await this.callAction(obj, action, ...callArgs)
+    // A1 — the `end` edge is owned by {@link dispatchUser} once the consumer BODY
+    // has started (`span.taken`). These handlers are the FALLBACK for the window
+    // in which the funnel was never reached — action RESOLUTION failed ("No action
+    // found") — and they must stay silent otherwise, or a `transitionTimeout` win
+    // would close the span over a body that is still running.
+    await this.callAction(obj, action, span, ...callArgs)
       .then(() => {
-        this.emitLifecycle(kind, hook, state, owner, microstep, 'end', {
-          ...ctx,
-          failed: false,
-        })
+        if (!span.taken) this.closeSpan(span, false)
       })
       .catch((error) => {
-        this.emitLifecycle(kind, hook, state, owner, microstep, 'end', {
-          ...ctx,
-          failed: true,
-        })
+        if (!span.taken) this.closeSpan(span, true)
         throw error
       })
       .catch(route)
+    this.tick('hook.callback')
   }
 
   /**
@@ -931,26 +1386,61 @@ export class StateMachine<
     microstep: number,
     eventName?: string,
   ): Promise<void> {
+    const span = this.openSpan('invoke', 'invoke.action', state, this.ownerKey(obj), microstep, eventName)
     if (!this.lifecycleEnabled) {
-      await this.callAction(obj, action)
+      await this.callAction(obj, action, span)
+      this.tick('invoke.action')
       return
     }
-    const owner = this.ownerKey(obj)
-    const ctx = eventName !== undefined ? { event: eventName } : undefined
-    this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'begin', ctx)
+    // A1 — same ownership rule as {@link runLifecycleAction}: the funnel closes the
+    // span at the BODY's settle; these branches only cover a resolution failure.
+    // This slot is the one that feeds `SimMonitor.invokeActionInFlight`, so closing
+    // it on a `transitionTimeout` win (the pre-A1 behaviour) reported SETTLED over a
+    // still-running callback — the settledness signal itself was unsound.
     try {
-      await this.callAction(obj, action)
-      this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'end', {
-        ...ctx,
-        failed: false,
-      })
+      await this.callAction(obj, action, span)
+      if (!span.taken) this.closeSpan(span, false)
+      this.tick('invoke.action')
     } catch (error) {
-      this.emitLifecycle('invoke', 'invoke.action', state, owner, microstep, 'end', {
-        ...ctx,
-        failed: true,
-      })
+      if (!span.taken) this.closeSpan(span, true)
+      this.tick('invoke.action')
       throw error
     }
+  }
+
+  /**
+   * A1 — evaluate ONE `invoke[].cond` predicate through the dispatch funnel.
+   *
+   * There are THREE call sites, not two: fresh entry ({@link armStateInvoke}), the
+   * abort-rollback relaunch ({@link rearmInvokeOperationsAfterAbort}) and the
+   * snapshot resume ({@link resumeTimers}). Routing them through one helper is why
+   * a fourth cannot be added without an origin.
+   *
+   * The result is TRUTHINESS-COERCED by every caller (`if (!shouldInvoke) continue`),
+   * which means an `async cond` is ALWAYS truthy and its continuation used to be
+   * completely invisible — the predicate resolved long after the engine had already
+   * acted on its pending promise. The coercion is FROZEN behaviour and is NOT
+   * changed here; what changes is that the pending promise is now counted in
+   * {@link userDispatchInFlight} and carries an open `invoke.cond` span, so the
+   * mismatch is at least OBSERVABLE instead of silent.
+   */
+  private evaluateInvokeCond(
+    cond: (owner: any) => unknown,
+    ownerArg: unknown,
+    state: string,
+    owner: object,
+    microstep: number,
+  ): unknown {
+    const span = this.openSpan('invoke', 'invoke.cond', state, owner, microstep, undefined)
+    return this.dispatchUser(
+      'invoke.cond',
+      state,
+      owner,
+      span,
+      undefined,
+      cond as (...a: any[]) => unknown,
+      [ownerArg],
+    )
   }
 
   /** П6 — the current owner's per-state timer map (created on first access). */
@@ -1301,6 +1791,7 @@ export class StateMachine<
             await this.drainContext.run(epoch, () =>
               this.executeQueuedTransition(evt),
             )
+            this.tick('drain.internal')
           } catch (error) {
             // П2: a throw in the INTERNAL branch (e.g. an invoke timer that
             // raised an unknown event, or a `done.state.*` completion event with
@@ -1340,6 +1831,7 @@ export class StateMachine<
             threw = true
             thrownError = error
           }
+          this.tick('drain.external')
           if (threw) {
             // A genuine apply/runtime error rejects BOTH the boolean and the
             // detailed callers (evt.reject is set on both paths).
@@ -1428,8 +1920,10 @@ export class StateMachine<
       if (target) {
         surfaced = true
         try {
-          const handler = this.processError(target, context, this.onError)
-          const r = handler(target, error) as unknown
+          // The `processError` RETURN is an engine-built closure; the consumer
+          // handler it wraps is invoked inside the funnel, never here.
+          const routeConfigError = this.processError(target, context, this.onError)
+          const r = routeConfigError(target, error) as unknown
           if (r instanceof Promise) {
             r.catch((e) =>
               this.logger.error(
@@ -1557,6 +2051,7 @@ export class StateMachine<
         }>,
       }
     })
+    this.tick('select.set')
 
     if (enabled.length === 0) {
       // П9/EO-3: a guard REJECTION is an observable FAILURE path, not a no-op —
@@ -1641,6 +2136,7 @@ export class StateMachine<
       }
       throw error // Propagate error to caller (e.g. fireEvent rejection)
     })
+    this.tick('micro.apply')
 
     if (!committed) {
       // abort-observability (W3-C.1 / EO-5 residual): a candidate WAS selected and
@@ -1776,6 +2272,11 @@ export class StateMachine<
           activeLeaves,
           ...args,
         )
+        // A2 — one active leaf has been resolved. This is THE site that makes the
+        // old frozen-fingerprint proxy O(machine width): a 16-region machine runs
+        // this loop 16 times per selection, each iteration costing at least one
+        // await, with `queueDepth|isProcessing|inFlightAsync` unchanged throughout.
+        this.tick('select.leaf')
         // Dedup rejected by transition label: a candidate governing several
         // leaves is offered to selectTransition once per leaf, so the same
         // rejection would otherwise appear once per governed leaf (§7 contract:
@@ -2557,7 +3058,22 @@ export class StateMachine<
       stateEntryTimes: Object.fromEntries(this.entryTimesFor(this.adaptee)),
     }
 
-    await targetAdapter.save(stateData)
+    // A1 — the persistence adapter is consumer-supplied code like any other, and
+    // its `save` is an ordinary `await` that nothing observed. `self` is the
+    // adapter itself: unlike every other origin this callable is a METHOD and needs
+    // its receiver, which is why the funnel takes an explicit `this` binding rather
+    // than assuming a free function.
+    const saveOwner = this.ownerKey(this.adaptee)
+    const saveSpan = this.openSpan('persist', 'persist.save', currentState, saveOwner, 0, undefined)
+    await this.dispatchUser(
+      'persist.save',
+      currentState,
+      saveOwner,
+      saveSpan,
+      targetAdapter,
+      targetAdapter.save,
+      [stateData],
+    )
   }
 
   public async restoreState(adapter?: StatePersistenceAdapter): Promise<void> {
@@ -2566,7 +3082,18 @@ export class StateMachine<
       return
     }
 
-    const result = await targetAdapter.restore()
+    const restoreOwner = this.ownerKey(this.adaptee)
+    const restoreSpan = this.openSpan('persist', 'persist.restore', '', restoreOwner, 0, undefined)
+    /* tick-exempt: consumer-body */
+    const result = (await this.dispatchUser(
+      'persist.restore',
+      '',
+      restoreOwner,
+      restoreSpan,
+      targetAdapter,
+      targetAdapter.restore,
+      [],
+    )) as Awaited<ReturnType<StatePersistenceAdapter['restore']>>
     this.validateCompositeState(result.currentState)
     this.seedHistory(new Map(Object.entries(result.history)))
     if (result.stateEntryTimes) {
@@ -4368,6 +4895,11 @@ export class StateMachine<
             : undefined) as Error | undefined,
       )
     }
+    // A1 — `handler` starts as the ENGINE's own rethrow. Only if a CONSUMER handler
+    // is resolved below does this dispatch become a consumer callable; the two
+    // cases are told apart by the origin, so the in-flight counter and the span
+    // never claim the engine's synchronous rethrow as consumer work.
+    let userSupplied = false
     const handlers = (fallback ?? [this.onError]).filter(Boolean)
     if (handlers.length > 0) {
       const r = handlers
@@ -4389,7 +4921,10 @@ export class StateMachine<
         )
         .filter(Boolean)
         .find((t) => t)
-      if (r) handler = r
+      if (r) {
+        handler = r
+        userSupplied = true
+      }
     }
     return (...args: any[]) => {
       const targetAdaptee = args.length >= 2 ? args[0] : adaptee
@@ -4404,15 +4939,52 @@ export class StateMachine<
       // which runs under the epoch, not via processError) still rejects. The
       // default rethrow handler above propagates its throw through exit()
       // unchanged (exit only swaps the ALS context, it does not catch).
+      // A1 — the ONE `onError` dispatch shape. A consumer handler is spanned on the
+      // `error` plane (a slot the lifecycle channel could not see at all before
+      // A1: an async `onError` was a completely untracked continuation); the
+      // engine's default rethrow goes through the funnel purely so this file keeps
+      // a single invocation site, and is neither counted nor spanned.
+      const handlerOwner = this.resolveCallbackOwner(targetAdaptee) as object
+      // The engine's own rethrow is not consumer code, so it gets no span at all.
+      const errorSpan = userSupplied
+        ? this.openSpan(
+            'error',
+            'onError',
+            context.state ?? '',
+            handlerOwner,
+            this.currentMicrostep,
+            context.event,
+          )
+        : undefined
       return this.drainContext.exit(() =>
-        handler(this.resolveCallbackOwner(targetAdaptee), error),
+        this.dispatchUser(
+          userSupplied ? 'error.handler' : ENGINE_OWNED_DISPATCH,
+          context.state ?? '',
+          handlerOwner,
+          errorSpan,
+          undefined,
+          handler as (...a: any[]) => unknown,
+          [handlerOwner, error],
+        ),
       )
     }
   }
 
+  /**
+   * Resolve ONE action reference and run it.
+   *
+   * A1 — `span` is the caller's ALREADY-OPEN {@link DispatchSpan} (or `undefined`
+   * when the machine is unsubscribed, or the caller opened none). It is threaded
+   * down to {@link dispatchUser}, which closes it at the settle of the consumer
+   * BODY. It must NOT be closed by the caller once `span.taken` is set — see the
+   * timeout-zombie note on {@link DispatchSpan}. Resolution failures ("No action
+   * found") happen BEFORE the funnel is reached and therefore leave `taken` false,
+   * so the caller's own settle handler still closes the pair exactly as before A1.
+   */
   private async callAction<CallResult>(
     obj: Adapter<TOwner>,
     actionName: ActionOrString<TOwner, CallResult>,
+    span: DispatchSpan,
     ...args: any[]
   ): Promise<CallResult | void> {
     const targetOwner = this.resolveCallbackOwner(obj)
@@ -4425,6 +4997,8 @@ export class StateMachine<
       phase: 'action',
       action: typeof actionName === 'string' ? actionName : 'anonymous',
     }
+    const dispatchState = _callActionState ?? ''
+    const dispatchOwner = this.ownerKey(obj)
 
     const executeAction = async (): Promise<CallResult | void> => {
       try {
@@ -4444,14 +5018,32 @@ export class StateMachine<
           >
           /* c8 ignore next */
           if (typeof action === 'function') {
-            const result = action(targetOwner, ...args)
+            const result = this.dispatchUser(
+              'action.context',
+              dispatchState,
+              dispatchOwner,
+              span,
+              undefined,
+              action as (...a: any[]) => unknown,
+              [targetOwner, ...args],
+            ) as CallResult | Promise<CallResult>
+            /* tick-exempt: consumer-body */
             return result instanceof Promise ? await result : result
           }
         }
 
         // 2. Check if it's an inline function (Compatibility mode)
         else if (typeof actionName === 'function') {
-          const result = actionName(targetOwner, ...args)
+          const result = this.dispatchUser(
+            'action.inline',
+            dispatchState,
+            dispatchOwner,
+            span,
+            undefined,
+            actionName as (...a: any[]) => unknown,
+            [targetOwner, ...args],
+          ) as CallResult | Promise<CallResult>
+          /* tick-exempt: consumer-body */
           return result instanceof Promise ? await result : result
         }
 
@@ -4464,8 +5056,17 @@ export class StateMachine<
           const action = obj.get(actionName as any)
           /* c8 ignore next */
           if (typeof action === 'function') {
-            const result = action(targetOwner, ...args)
+            const result = this.dispatchUser(
+              'action.method',
+              dispatchState,
+              dispatchOwner,
+              span,
+              undefined,
+              action as (...a: any[]) => unknown,
+              [targetOwner, ...args],
+            ) as CallResult | Promise<CallResult>
             /* c8 ignore next */
+            /* tick-exempt: consumer-body */
             return result instanceof Promise ? await result : result
           }
         }
@@ -4485,12 +5086,18 @@ export class StateMachine<
     if (this.transitionTimeout && this.transitionTimeout > 0) {
       const timeoutMs = this.transitionTimeout
       let timeoutHandle: any
+      // A1 — set iff the DEADLINE leg settled the race. Read in the `finally`
+      // below to report the timeout WITHOUT closing the consumer body's span.
+      let timedOut = false
       const timeoutPromise = new Promise<never>((_, reject) => {
-        const fire = () => reject(new StateMachineError('Transition timeout', {
-          /* c8 ignore next */
-          action: typeof actionName === 'string' ? actionName : 'anonymous',
-          phase: 'action',
-        }))
+        const fire = () => {
+          timedOut = true
+          reject(new StateMachineError('Transition timeout', {
+            /* c8 ignore next */
+            action: typeof actionName === 'string' ? actionName : 'anonymous',
+            phase: 'action',
+          }))
+        }
         timeoutHandle = this.setTimer(fire, timeoutMs)
       })
       // The deadline handle is disposed on EVERY outcome and on EVERY scheduler.
@@ -4509,8 +5116,31 @@ export class StateMachine<
       // and `finally` runs exactly once — so this can neither double-clear nor
       // clear a foreign handle. When the TIMEOUT wins, the handle has already
       // fired and `clearTimeout` is a harmless no-op.
+      //
+      // A1 — THE TIMEOUT ZOMBIE. The span is NOT attached to this race. Before A1
+      // the `end` edge closed on the RACE result, so a deadline win reported the
+      // callback as settled while the consumer body was still running: an
+      // invisible continuation, and — because `invoke.action` feeds the harness
+      // settledness counter — a "quiescent" reading over a live callback. The
+      // bracket now lives in {@link dispatchUser}, around the BODY, exactly as
+      // `src/sim/env.ts` `bracketAsync` already brackets the wrapped action's own
+      // promise and never `callAction`'s outer return.
+      //
+      // The deadline is still reported, as an ADJACENT begin+end POINT pair on a
+      // `<hook>.timeout` slot — the `invoke.abort` precedent. `LifecycleEvent.edge`
+      // is deliberately NOT widened with a third member: the narrowness of that
+      // union is the load-bearing half of the "a `begin` with no `end` means HUNG"
+      // contract, and after this change a timed-out body is PRECISELY such an open
+      // `begin` until it really finishes. A consumer correlates the two by
+      // `owner` + `state` + `microstep`.
       return Promise.race([executeAction(), timeoutPromise]).finally(() => {
         this.clearTimer(timeoutHandle)
+        if (timedOut && !span.closed && this.lifecycleEnabled) {
+          const hook = `${span.hook}.timeout`
+          const ctx = span.event !== undefined ? { event: span.event } : undefined
+          this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'begin', ctx)
+          this.emitLifecycle(span.kind, hook, span.state, span.owner, span.microstep, 'end', ctx)
+        }
       })
     }
 
@@ -4756,36 +5386,32 @@ export class StateMachine<
       // exactly ONE guard pair per microstep — the channel reports guard
       // EXECUTIONS, matching the engine's "each guard runs at most once per
       // microstep" contract rather than the number of times it was consulted.
-      const guardOwner = this.lifecycleEnabled
-        ? this.ownerKey(obj as unknown as Adapter<any>)
-        : (undefined as unknown as object)
-      if (this.lifecycleEnabled) {
-        this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'begin', {
-          transition: label,
-        })
-      }
+      const guardSpan = this.openSpan(
+        'guard',
+        'guard',
+        transition.from as string,
+        this.ownerKey(obj as unknown as Adapter<any>),
+        guardMicrostep,
+        undefined,
+        true,
+        label,
+      )
       try {
         passed = Boolean(
-          await this.callAction(obj as any, transition.guard, ...args),
+          await this.callAction(obj as any, transition.guard, guardSpan, ...args),
         )
-        if (this.lifecycleEnabled) {
-          this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'end', {
-            transition: label,
-            failed: false,
-            outcome: passed,
-          })
-        }
+        // A1 — the funnel already closed the span with the coerced `outcome` at the
+        // predicate's own settle. This fallback covers resolution failure only.
+        if (!guardSpan.taken) this.closeSpan(guardSpan, false, passed)
+        // A2 — one guarded candidate has been evaluated: an engine phase advance
+        // whose cost is one await, adjacent to this statement.
+        this.tick('select.guard')
       } catch (error) {
-        if (this.lifecycleEnabled) {
-          // A THROWING guard leaves the transition DISABLED, so the outcome the
-          // consumer must count for coverage is `false` — alongside `failed:true`,
-          // which distinguishes it from an honest rejection.
-          this.emitLifecycle('guard', 'guard', transition.from as string, guardOwner, guardMicrostep, 'end', {
-            transition: label,
-            failed: true,
-            outcome: false,
-          })
-        }
+        // A THROWING guard leaves the transition DISABLED, so the outcome the
+        // consumer must count for coverage is `false` — alongside `failed:true`,
+        // which distinguishes it from an honest rejection.
+        if (!guardSpan.taken) this.closeSpan(guardSpan, true, false)
+        this.tick('select.guard')
         threw = true
         // F7: a guard EXCEPTION must reach the OBSERVABLE monitor.recordError
         // channel (context phase:'guard') — invisible otherwise to a consumer's
@@ -4828,6 +5454,7 @@ export class StateMachine<
             transition.onError,
             this.onError,
           )(error)
+          this.tick('error.route')
         } catch {
           /* onError best-effort: a throwing/rejecting handler stays contained */
         }
@@ -4996,10 +5623,23 @@ export class StateMachine<
 
     const risky = async (): Promise<Outcome> => {
       // Phase 2: before-event action.
+      // A1 — routed through {@link runLifecycleAction} on the `transition` plane.
+      // Before A1 this was a bare `callAction(...).catch(route)` that NO span
+      // covered: an async `onBefore` was an untracked continuation holding the
+      // whole microstep open with nothing observable to attribute it to.
       if (event.onBefore) {
-        await this.callAction(obj, event.onBefore, ...args).catch(
+        await this.runLifecycleAction(
+          obj,
+          event.onBefore,
+          args,
           this.processError(obj, { ...context }, undefined, this.onError),
+          'transition',
+          'onBefore',
+          currentState,
+          microstep,
+          String(eventName),
         )
+        this.tick('micro.onBefore')
       }
 
       // Phase 3: exit ACTIONS — descendant-first over the combined exit set. NO
@@ -5016,6 +5656,7 @@ export class StateMachine<
             String(eventName),
           )
           await this.executeExitActions(obj, exitStateName, args, context, exitCtx, microstep)
+          this.tick('micro.exit')
         }
       } catch (error) {
         if (this.abortOnExitError) return { kind: 'abort-exit' }
@@ -5030,14 +5671,24 @@ export class StateMachine<
       // Phase 5: transition actions — one per fired transition.
       for (const { transition } of enabled) {
         if (transition.onTransition) {
-          await this.callAction(obj, transition.onTransition, ...args).catch(
+          // A1 — same treatment as `onBefore`: spanned on the `transition` plane.
+          await this.runLifecycleAction(
+            obj,
+            transition.onTransition,
+            args,
             this.processError(
               obj,
               { ...context },
               transition.onError,
               this.onError,
             ),
+            'transition',
+            'onTransition',
+            transition.from as string,
+            microstep,
+            String(eventName),
           )
+          this.tick('micro.onTransition')
         }
       }
 
@@ -5047,6 +5698,7 @@ export class StateMachine<
       try {
         for (const enterStateName of enterStates) {
           await this.executeEnterActions(obj, enterStateName, args, context, false, microstep)
+          this.tick('micro.enter')
         }
       } catch (error) {
         if (this.errorState) return { kind: 'error-state' }
@@ -5056,17 +5708,49 @@ export class StateMachine<
       // Phase 7: after-event action — BEFORE the commit so a throw aborts the
       // microstep cleanly with NO committed state and NO orphan timer (EO-4).
       if (event.onAfter) {
+        // A1 — `onAfter` cannot go through `runLifecycleAction`: its recovery is
+        // SYNCHRONOUS (a throwing handler must abort the microstep), not a
+        // `.catch(route)`. So the span is opened here and handed down; the funnel
+        // still closes it at the consumer body's settle, timeout included.
+        const afterSpan = this.openSpan(
+          'transition',
+          'onAfter',
+          currentState,
+          this.ownerKey(obj),
+          microstep,
+          String(eventName),
+        )
         try {
-          await this.callAction(obj, event.onAfter, ...args)
+          await this.callAction(obj, event.onAfter, afterSpan, ...args)
+          if (!afterSpan.taken) this.closeSpan(afterSpan, false)
+          this.tick('micro.onAfter')
         } catch (error) {
+          if (!afterSpan.taken) this.closeSpan(afterSpan, true)
+          this.tick('micro.onAfter')
           try {
-            const errorHandler = this.processError(
+            const routeAfterError = this.processError(
               obj,
               { ...context },
               event.onError,
               this.onError,
             )
-            errorHandler(this.resolveCallbackOwner(obj), error)
+            // A1 — the recovery handler is FIRE-AND-FORGET here (its result is not
+            // awaited, because a throwing handler must abort the microstep
+            // SYNCHRONOUSLY). Before A1 an ASYNC handler's promise floated with no
+            // `.catch` at all, so its rejection surfaced only as a process-level
+            // unhandledRejection. The funnel now spans it, and this `.catch`
+            // mirrors the config-level `onError` precedent in `reportRuntimeError`
+            // so both fire-and-forget error paths log identically.
+            const recovery = routeAfterError(this.resolveCallbackOwner(obj), error) as unknown
+            if (recovery instanceof Promise) {
+              recovery.catch((e) =>
+                this.logger.error(
+                  'onError handler rejected',
+                  { ...context },
+                  e instanceof Error ? e : new Error(String(e)),
+                ),
+              )
+            }
           } catch (rethrown) {
             return { kind: 'throw', error: rethrown }
           }
@@ -5078,6 +5762,7 @@ export class StateMachine<
 
     try {
       const result = await risky()
+      this.tick('micro.body')
 
       if (result.kind === 'abort-exit') {
         // EO-5: an aborted (onExit-failed) microstep returns to the source with
@@ -5285,9 +5970,21 @@ export class StateMachine<
 
     // Execute exit actions in sequence. Only `onExit` receives the ExitContext
     // as a trailing argument (SPEC §6а): onExit(adaptee, ...payload, exitCtx).
+    //
+    // A2 — the ticks are CALLER-SIDE, and that placement is load-bearing rather
+    // than stylistic. {@link runExitAction} returns early when the slot has no
+    // hook (`if (!action) return`), but these three `await`s are paid REGARDLESS:
+    // an exited state with no exit hooks at all still costs three microtask hops.
+    // A tick placed inside the callee's hook branch would emit NOTHING on that
+    // path, leaving three un-ticked hops per hookless exited state — O(depth) per
+    // microstep, which is precisely the machine-width-dependent blind window the
+    // heartbeat exists to remove.
     await this.runExitAction(obj, fromState, fromStateName, 'onBeforeExit', fromState.onBeforeExit, args, exitErrorContext, microstep)
+    this.tick('exit.slot')
     await this.runExitAction(obj, fromState, fromStateName, 'onExit', fromState.onExit, [...args, exitCtx], exitErrorContext, microstep)
+    this.tick('exit.slot')
     await this.runExitAction(obj, fromState, fromStateName, 'onAfterExit', fromState.onAfterExit, args, exitErrorContext, microstep)
+    this.tick('exit.slot')
   }
 
   /**
@@ -5317,6 +6014,7 @@ export class StateMachine<
       microstep,
       exitErrorContext.event,
     )
+    this.tick('exit.slot')
   }
 
   /**
@@ -5403,6 +6101,13 @@ export class StateMachine<
       toState.onAfterEnter,
     ]
 
+    // A2 — the ENTER side is structurally UNLIKE the exit side: the `if (action)`
+    // guard sits OUTSIDE the await, so a hookless enter slot costs NO hop at all
+    // and there is nothing to tick. (The exit side guards INSIDE the callee and
+    // pays three hops regardless — see `executeExitActions`.) The tick therefore
+    // belongs inside the branch here and outside it there; the asymmetry is real
+    // and is the reason a single blanket rule about "one await per hook slot"
+    // is wrong at HEAD.
     for (let i = 0; i < enterActions.length; i++) {
       const action = enterActions[i]
       if (action) {
@@ -5417,6 +6122,7 @@ export class StateMachine<
           microstep,
           enterContext.event,
         )
+        this.tick('enter.slot')
       }
     }
 
@@ -5474,7 +6180,13 @@ export class StateMachine<
       // Check condition (cond) before starting the timer / operation.
       if (invocation.cond) {
         try {
-          const shouldInvoke = invocation.cond(obj.adaptee)
+          const shouldInvoke = this.evaluateInvokeCond(
+            invocation.cond,
+            obj.adaptee,
+            toStateName,
+            this.ownerKey(obj),
+            microstep,
+          )
           if (!shouldInvoke) continue
         } catch (e) {
           this.logger.error(
@@ -5531,6 +6243,7 @@ export class StateMachine<
                 microstep,
                 timer.event !== undefined ? String(timer.event) : undefined,
               )
+              this.tick('invoke.action')
             }
             this.raiseEvent(timer.event as string, obj as any, {
               hook: 'raise.invoke.timer',
@@ -5608,40 +6321,37 @@ export class StateMachine<
       // W8/V1b — `begin` marks the moment `src` is ACTUALLY invoked (after the
       // still-in-leaf / not-yet-aborted checks), so a scheduled-then-cancelled
       // launch never opens a pair that will not close.
-      const traced = this.lifecycleEnabled
-      const owner = traced ? this.ownerKey(obj) : (undefined as unknown as object)
-      const opCtx =
-        op.onDone !== undefined ? { event: String(op.onDone) } : undefined
-      if (traced) {
-        this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'begin', opCtx)
-      }
+      const owner = this.ownerKey(obj)
+      const opEvent = op.onDone !== undefined ? String(op.onDone) : undefined
+      // A1 — the `invoke.operation` span is now OPENED here and CLOSED by the
+      // dispatch funnel at the settle of `src`'s OWN promise, which is where it
+      // always conceptually belonged; the hand-rolled pair below was the last
+      // instrumented site that duplicated the bracket logic.
+      const opSpan = this.openSpan('invoke', 'invoke.operation', toStateName, owner, microstep, opEvent)
       let result: Promise<unknown>
       try {
-        result = op.src(obj.adaptee, controller.signal)
+        result = this.dispatchUser(
+          'invoke.src',
+          toStateName,
+          owner,
+          opSpan,
+          undefined,
+          op.src as (...a: any[]) => unknown,
+          [obj.adaptee, controller.signal],
+        ) as Promise<unknown>
       } catch (err) {
         retire()
-        if (traced) {
-          this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
-            ...opCtx,
-            failed: true,
-          })
-        }
         this.handleInvokeRejection(obj, op, controller, err, toStateName, microstep)
         return
       }
       Promise.resolve(result).then(
         (value) => {
           retire()
-          // W8/V1b — `end` is emitted on SETTLE, even when the operation was
-          // aborted meanwhile: the work really did finish, and the dropped
-          // completion event below is a separate fact. An operation whose `src`
-          // never settles correctly shows as a `begin` with no `end`.
-          if (traced) {
-            this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
-              ...opCtx,
-              failed: false,
-            })
-          }
+          // W8/V1b — `end` is emitted on SETTLE (by the funnel), even when the
+          // operation was aborted meanwhile: the work really did finish, and the
+          // dropped completion event below is a separate fact. An operation whose
+          // `src` never settles correctly shows as a `begin` with no `end`.
+          //
           // Cancelled (leaf left before settle) → drop the completion event.
           if (controller.signal.aborted) return
           if (op.onDone) {
@@ -5662,12 +6372,6 @@ export class StateMachine<
         },
         (err) => {
           retire()
-          if (traced) {
-            this.emitLifecycle('invoke', 'invoke.operation', toStateName, owner, microstep, 'end', {
-              ...opCtx,
-              failed: true,
-            })
-          }
           this.handleInvokeRejection(obj, op, controller, err, toStateName, microstep)
         },
       )
@@ -5752,7 +6456,16 @@ export class StateMachine<
       if (!this.isInvokeOperation(invocation)) continue
       if (invocation.cond) {
         try {
-          if (!invocation.cond(obj.adaptee)) continue
+          if (
+            !this.evaluateInvokeCond(
+              invocation.cond,
+              obj.adaptee,
+              stateName,
+              this.ownerKey(obj),
+              microstep,
+            )
+          )
+            continue
         } catch (e) {
           this.logger.error(
             'Error in invoke condition',
@@ -6224,7 +6937,16 @@ export class StateMachine<
               // Check condition (cond) at execution time, not at setup time
               if (invocation.cond && this.adaptee) {
                 try {
-                  if (!invocation.cond(this.adaptee.adaptee as any)) return
+                  if (
+                    !this.evaluateInvokeCond(
+                      invocation.cond,
+                      this.adaptee.adaptee,
+                      stateName,
+                      this.ownerKey(this.adaptee),
+                      0,
+                    )
+                  )
+                    return
                 } catch (_e) {
                   return
                 }
@@ -6242,6 +6964,7 @@ export class StateMachine<
                     ? String(invocation.event)
                     : undefined,
                 )
+                this.tick('invoke.action')
               }
               // П3: an invoke-generated event is engine-internal, so it goes on
               // the INTERNAL queue (like the primary invoke path in

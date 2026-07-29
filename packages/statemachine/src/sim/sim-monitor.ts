@@ -121,6 +121,13 @@ export class SimMonitor implements IMonitor {
    */
   private invokeActionInFlight = 0
   /**
+   * A1 — how many records arrived on a `kind` OUTSIDE the callback-timeline
+   * vocabulary this buffer retains (`'transition'` / `'error'` / `'persist'`, and
+   * anything a future engine adds). They are dropped on purpose; the counter is
+   * what keeps that drop honest and greppable from a test.
+   */
+  private extendedKindCount = 0
+  /**
    * W8/V5a — the {@link TransitionContext} of every recorded transition, in call
    * order. The engine now supplies it on the SUCCESS path too, which is the only
    * surface on which an INTERNALLY raised cause (`done.state.<C>`, an invoke
@@ -186,6 +193,33 @@ export class SimMonitor implements IMonitor {
       })
       return
     }
+    // A1 — the engine's `LifecycleEvent.kind` union is EXTENSIBLE and A1 widened it
+    // with `'transition'` / `'error'` / `'persist'` (the event-level onBefore /
+    // onAfter, onTransition, a consumer `onError`, and the persistence adapter).
+    // Those records are deliberately NOT retained here, for the SAME two reasons
+    // the `kind:'raise'` stream was split out:
+    //
+    //  1. VOCABULARY. {@link LifecycleObservation} is a CLOSED restatement owned by
+    //     the safety plane, and no checker reads these kinds — I-4 skips anything
+    //     that is not `enter`/`exit`, and the guard-coverage fold keys on
+    //     `kind:'guard'`. Widening the safety-plane vocabulary to carry records no
+    //     oracle consumes would couple the two planes for nothing.
+    //  2. BUDGET. The buffer STOPS GROWING at its cap rather than rotating. A1 adds
+    //     emission sites on the hottest paths there are (every transition action,
+    //     every error routing); admitting them would exhaust the shared 200k cap
+    //     sooner and blind the CALLBACK-TIMELINE oracles that do read it — the
+    //     channel would destroy observability in the act of adding it.
+    //
+    // The count is kept so the drop is never silent.
+    if (
+      event.kind !== 'enter' &&
+      event.kind !== 'exit' &&
+      event.kind !== 'invoke' &&
+      event.kind !== 'guard'
+    ) {
+      this.extendedKindCount += 1
+      return
+    }
     if (this.lifecycle.length >= LIFECYCLE_BUFFER_LIMIT) {
       this.lifecycleTruncated = true
       return
@@ -247,6 +281,17 @@ export class SimMonitor implements IMonitor {
    */
   invokeActionInFlightCount(): number {
     return this.invokeActionInFlight
+  }
+
+  /**
+   * A1 — count of records dropped because their `kind` is outside the
+   * callback-timeline vocabulary. Non-zero is EXPECTED on any run whose machine
+   * declares an `onTransition` / `onBefore` / `onAfter` / `onError`; it is exposed
+   * so a test can prove the engine really emits them and that the drop is a
+   * deliberate projection choice rather than a missing emission.
+   */
+  extendedKindDropCount(): number {
+    return this.extendedKindCount
   }
 
   /**

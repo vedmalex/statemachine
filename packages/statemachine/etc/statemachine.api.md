@@ -60,6 +60,15 @@ export function createVirtualScheduler(clock: Clock): ITimerScheduler;
 // @public (undocumented)
 export type DeepNestedStateName<S> = StatePathsOf<S>;
 
+// @public
+export interface EngineProgress {
+    readonly inFlightUserCallables: number;
+    readonly lastTickSeq: number;
+    readonly lastTickSite: string;
+    readonly openDispatches: readonly OpenDispatch[];
+    readonly tick: number;
+}
+
 // @public (undocumented)
 export class EnhancedErrorHandler {
     constructor();
@@ -394,7 +403,13 @@ export interface LifecycleEvent {
     readonly event?: string;
     readonly failed?: boolean;
     readonly hook: string;
-    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise';
+    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
+    /** The TRANSITION's own callbacks: `onBefore`, `onTransition`, `onAfter`. */
+    | 'transition'
+    /** A consumer `onError` handler. */
+    | 'error'
+    /** The `StatePersistenceAdapter` `save` / `restore` round trip. */
+    | 'persist';
     readonly microstep: number;
     readonly outcome?: boolean;
     readonly owner: object;
@@ -576,6 +591,15 @@ export type NestedStateName<S> = {
 }[keyof S & string];
 
 // @public
+export interface OpenDispatch {
+    readonly hook: string;
+    readonly openedAtTick: number;
+    readonly openTicks: number;
+    readonly owner: object;
+    readonly state: string;
+}
+
+// @public
 export interface OwnerDetachResult {
     operationsAborted: number;
     queuedEventsDropped: number;
@@ -712,6 +736,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     getCurrentStateInfo(): StateInfo | undefined;
     getMetrics(): MonitorMetricsSnapshot | undefined;
     getMonitor(): IMonitor;
+    getProgress(): EngineProgress;
     // (undocumented)
     getQueueDepth(): {
         internal: number;
@@ -940,6 +965,6 @@ export interface ValidationWarning extends ValidationError {
 // types/monitoring.d.ts:207:9 - (ae-forgotten-export) The symbol "HealthCheckResult" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:208:9 - (ae-forgotten-export) The symbol "PerformanceMonitor" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:209:9 - (ae-forgotten-export) The symbol "MetricsCollector" needs to be exported by the entry point index.d.ts
-// types/types.d.ts:608:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
+// types/types.d.ts:721:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
 
 ```

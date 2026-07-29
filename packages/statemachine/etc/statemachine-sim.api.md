@@ -499,6 +499,15 @@ export const ENGINE_MESSAGE_FIXTURES: {
 };
 
 // @public
+export interface EngineProgress {
+    readonly inFlightUserCallables: number;
+    readonly lastTickSeq: number;
+    readonly lastTickSite: string;
+    readonly openDispatches: readonly OpenDispatch[];
+    readonly tick: number;
+}
+
+// @public
 export interface Env extends SchedulerView {
     enterAsync(): void;
     exitAsync(): void;
@@ -1112,6 +1121,15 @@ export interface OpDriverView {
     }): Promise<unknown>;
 }
 
+// @public
+export interface OpenDispatch {
+    readonly hook: string;
+    readonly openedAtTick: number;
+    readonly openTicks: number;
+    readonly owner: object;
+    readonly state: string;
+}
+
 // @public (undocumented)
 export interface OpShrinkBudget {
     readonly maxRuns: number;
@@ -1532,6 +1550,7 @@ export type SimEventPayload = (event: string, rng: SimPayloadRng, snapshot: SimP
 
 // @public
 export class SimMonitor implements IMonitor {
+    extendedKindDropCount(): number;
     getDurations(): readonly number[];
     getErrorCount(): number;
     getFailureCount(): number;
@@ -1758,6 +1777,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     getCurrentStateInfo(): StateInfo | undefined;
     getMetrics(): MonitorMetricsSnapshot | undefined;
     getMonitor(): IMonitor;
+    getProgress(): EngineProgress;
     // (undocumented)
     getQueueDepth(): {
         internal: number;

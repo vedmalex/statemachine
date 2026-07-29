@@ -193,19 +193,40 @@ export interface MonitorMetricsSnapshot {
  * an ADJACENT `begin`+`end` pair. `edge` is deliberately NOT widened — the
  * "a `begin` with no `end` means HUNG" contract must stay unambiguous.
  *
+ * A1 — `transitionTimeout` follows the SAME precedent. The `end` edge of a
+ * callback is emitted at the settle of the callback's OWN promise, NEVER at the
+ * settle of the `Promise.race` the timeout runs. A deadline that wins the race
+ * therefore leaves the callback's `begin` OPEN — which is the honest reading, the
+ * body really is still running — and is itself reported as an adjacent
+ * `begin`+`end` POINT pair on a `'<hook>.timeout'` slot carrying the same `state`,
+ * `owner` and `microstep`. Before A1 the timeout closed the callback's span while
+ * the body ran on: an invisible continuation, and a false "settled" reading on the
+ * one slot (`invoke.action`) a settledness signal is derived from.
+ *
  * ## What this channel does NOT see
- * - the TRANSITION's own callbacks: `onTransition`, the event-level `onBefore` /
- *   `onAfter`. Only STATE hooks, invoke work, guards and internal event RAISES are
- *   instrumented.
  * - an EXTERNAL `fireEvent`: `kind:'raise'` covers the ENGINE-INTERNAL raise path
  *   only (the five sites that push onto the internal queue). A caller-issued event
  *   is already visible to the caller.
- * - the `onError` handler itself (by construction — see the pairing note above).
+ * - the ENGINE's own default rethrow handler, which runs when no `onError` was
+ *   configured. `kind:'error'` reports CONSUMER handlers only; instrumenting the
+ *   engine's synchronous rethrow would make in-flight readings lie.
  * - the `errorState` fallback path emits NO `enter` events: that recovery commits
  *   the error configuration DIRECTLY, bypassing the enter-hook executor. This is
  *   EXPECTED, not an anomaly — a consumer or oracle must NOT read the missing
  *   `enter` records as "the error state was never entered".
- * - `invoke.cond` predicates (evaluated at arm time, outside the callback lane).
+ *
+ * ## What A1 ADDED to the channel
+ * Three families that used to be listed above as unseen. Each of them can hand
+ * control to an ASYNCHRONOUS consumer callable, so leaving them out did not merely
+ * lose detail — it lost whole continuations:
+ * - `kind:'transition'` — the event-level `onBefore` / `onAfter` and the
+ *   transition's `onTransition`;
+ * - `kind:'error'` — a consumer `onError` handler (both the awaited routing path
+ *   and the fire-and-forget config-level one);
+ * - `kind:'invoke'`, `hook:'invoke.cond'` — the `invoke[].cond` predicate. Its
+ *   result is TRUTHINESS-COERCED by the engine, so an `async cond` is always
+ *   truthy and its continuation was entirely untracked;
+ * - `kind:'persist'` — the persistence adapter's `save` / `restore`.
  *
  * ## Relationship to the error channel
  * ONE throwing callback produces BOTH a `failed:true` `end` record here AND a
@@ -232,13 +253,33 @@ export interface LifecycleEvent {
    * Coarse family of the instrumented callback. EXTENSIBLE — never switch
    * exhaustively.
    */
-  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
+  readonly kind:
+    | 'enter'
+    | 'exit'
+    | 'invoke'
+    | 'guard'
+    | 'raise'
+    // A1 — the three families the channel could not see before the dispatch
+    // funnel existed. Each names a slot through which the engine hands control to
+    // CONSUMER code, so leaving them uninstrumented left real continuations
+    // invisible (an async `onError` or an async `cond` most of all).
+    /** The TRANSITION's own callbacks: `onBefore`, `onTransition`, `onAfter`. */
+    | 'transition'
+    /** A consumer `onError` handler. */
+    | 'error'
+    /** The `StatePersistenceAdapter` `save` / `restore` round trip. */
+    | 'persist'
   /**
    * Precise callback slot. EXTENSIBLE. Currently one of `'onBeforeEnter'`,
    * `'onEnter'`, `'onAfterEnter'`, `'onBeforeExit'`, `'onExit'`, `'onAfterExit'`,
-   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'guard'`, and the
-   * five `kind:'raise'` origins: `'raise.done'`, `'raise.invoke.timer'`,
+   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'invoke.cond'`,
+   * `'guard'`, the A1 slots `'onBefore'`, `'onTransition'`, `'onAfter'`,
+   * `'onError'`, `'persist.save'`, `'persist.restore'`, and the five
+   * `kind:'raise'` origins: `'raise.done'`, `'raise.invoke.timer'`,
    * `'raise.invoke.onDone'`, `'raise.invoke.onError'`, `'raise.invoke.resume'`.
+   *
+   * A1 also adds the DEADLINE point slots `'<hook>.timeout'` — see the
+   * `transitionTimeout` note under "Pairing".
    */
   readonly hook: string
   /**
@@ -333,6 +374,89 @@ export interface LifecycleEvent {
    * `state` alone.
    */
   readonly transition?: string
+}
+
+/**
+ * @unstable — A1/A2 debugging surface: ONE consumer callable the engine has
+ * entered and whose own promise has not settled yet.
+ *
+ * This is the half of the progress snapshot that answers "stuck ON WHAT". It is
+ * maintained by the dispatch funnel on entry/settle as a LIVE structure — it is
+ * NEVER derived by scanning a lifecycle buffer, because that buffer stops growing
+ * at its cap rather than rotating, so a retained `begin` whose `end` was dropped
+ * would jam any derived reading non-zero for the rest of the run.
+ */
+export interface OpenDispatch {
+  /** The dispatch slot — e.g. `'action.inline'`, `'invoke.src'`, `'invoke.cond'`. */
+  readonly hook: string
+  /**
+   * The state the dispatch belongs to, or `''` where the slot has no state (the
+   * persistence adapter, a config-level `onError` reached outside a microstep).
+   */
+  readonly state: string
+  /** The OWNER object this callable ran for, by REFERENCE (never serialize it). */
+  readonly owner: object
+  /** {@link EngineProgress.tick} at the moment the callable was entered. */
+  readonly openedAtTick: number
+  /**
+   * `tick - openedAtTick` — how many engine phase advances have happened since
+   * this callable was entered. THE diagnostic number: a span open across many
+   * ticks is slow but alive; a span open while the tick has not moved at all is
+   * the thing actually holding the drain.
+   */
+  readonly openTicks: number
+}
+
+/**
+ * @unstable — A2 public progress snapshot: the engine's monotonic phase-advance
+ * heartbeat plus the currently-open consumer callables.
+ *
+ * ## What problem it solves
+ * A harness observing a machine from outside cannot see whether the engine has a
+ * pending continuation. Every proxy for it that has been tried — an unchanged
+ * `queueDepth|isProcessing|inFlightAsync` fingerprint over an N-turn window —
+ * measures the WRONG thing: the engine `await`s once per hook slot per state even
+ * where no hook is defined, so a LEGITIMATE microstep's frozen fingerprint runs
+ * O(machine width) turns and any fixed window is refuted by a correct machine one
+ * turn wider than it.
+ *
+ * {@link tick} replaces that proxy with a DIRECT observation. It advances on every
+ * engine phase advance, so the number of microtask turns between two ticks is a
+ * property of the ENGINE'S CODE, not of the machine's shape.
+ *
+ * ## How to read it
+ * The snapshot is a reading, not a verdict. "The engine has not ticked since turn
+ * N, and `onEnter@work.r1` has been open for M ticks" is a DESCRIPTION of where
+ * the drain is; deciding whether that is a defect needs knowledge this channel
+ * does not have (a consumer hook is allowed to take as long as it likes). Nothing
+ * in the engine reads these fields.
+ */
+export interface EngineProgress {
+  /**
+   * Monotonic count of engine phase advances since construction. Never reset,
+   * never decremented; `0` means the engine has not advanced a phase yet.
+   */
+  readonly tick: number
+  /**
+   * Label of the site that produced the most recent tick (e.g. `'drain.internal'`,
+   * `'exit.slot'`). EXTENSIBLE — never switch exhaustively over it.
+   */
+  readonly lastTickSite: string
+  /**
+   * {@link LifecycleEvent.seq} at the moment of the most recent tick. Lets a
+   * consumer align the heartbeat with the lifecycle record stream without the
+   * engine having to emit the heartbeat INTO that stream — which it deliberately
+   * does not: at ~10+ ticks per microstep, buffered tick records would exhaust a
+   * non-rotating observation buffer and blind every OTHER reader of it.
+   */
+  readonly lastTickSeq: number
+  /**
+   * Live count of consumer callables entered and not yet settled. A rolling
+   * scalar maintained on entry/settle — never derived.
+   */
+  readonly inFlightUserCallables: number
+  /** The open callables, in entry order. Empty when the engine holds none. */
+  readonly openDispatches: readonly OpenDispatch[]
 }
 
 /**

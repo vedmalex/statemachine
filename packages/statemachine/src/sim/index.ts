@@ -45,11 +45,17 @@ export { StateMachine, createVirtualScheduler, isAdapter } from '../index'
 export type {
   Adapter,
   Clock,
+  // A1/A2: the return shape of `StateMachine#getProgress()`. Re-exported here for
+  // the same reason as every other engine type on this barrel — the `./sim` entry
+  // is a CLOSED surface, and a public method whose return type is not nameable
+  // from it is an `ae-forgotten-export` hole in the sim api report.
+  EngineProgress,
   IContextTracker,
   IErrorHandler,
   ILogger,
   IMonitor,
   ITimerScheduler,
+  OpenDispatch,
   StateMachineConfig,
   StateMachineOptions,
 } from '../index'

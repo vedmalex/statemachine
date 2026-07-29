@@ -91,6 +91,10 @@ export type {
   // W8: the payload type of the optional `IMonitor.recordLifecycle` observability
   // channel — a consumer implementing that method must be able to name it.
   LifecycleEvent,
+  // A1/A2: the return shape of `StateMachine#getProgress()` — the engine
+  // phase-advance heartbeat plus the consumer callables it is currently inside.
+  EngineProgress,
+  OpenDispatch,
 } from './types'
 
 /**
