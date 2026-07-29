@@ -7,10 +7,14 @@
  *  §4а.1 META-TEST — every invariant is CLASSIFIED, and every invariant that
  *        CLAIMS teeth genuinely fires on a violator fixture. A new invariant that
  *        is neither classified nor able to fire turns this RED; the documented
- *        no-ops (I-4/I-5) are asserted to genuinely never fire, which is the
- *        red-test for the "removal findings" class where a direct red is
- *        impossible (an oracle that cannot fire must be HONESTLY a no-op, not a
- *        teeth-claiming stub).
+ *        no-op (I-5) is asserted to genuinely never fire, which is the red-test for
+ *        the "removal findings" class where a direct red is impossible (an oracle
+ *        that cannot fire must be HONESTLY a no-op, not a teeth-claiming stub).
+ *
+ *        The meta-test is DELIBERATELY TWO-SIDED and must stay so: teeth must FIRE
+ *        on their violator, no-ops must STAY SILENT on a battery that would tempt a
+ *        naive checker. A one-sided version would let a no-op quietly grow teeth, or
+ *        a teeth oracle quietly rot into a stub, without turning red.
  *
  *  §4а.2 ZERO-FALSE-POSITIVE CORPUS — the FULL builtin registry runs over a corpus
  *        of KNOWN-CORRECT machines and MUST emit zero violations. This is the
@@ -18,12 +22,25 @@
  *        an early W5b attempt shipped an I-5 false-positive — exactly the class a
  *        standing zero-false-positive corpus catches before it reaches a consumer.
  *
+ * ── W8 status ───────────────────────────────────────────────────────────────
+ *  - I-4 MOVED from `DOCUMENTED_NO_OPS` to teeth (V3a). W8/V11 aligned the engine's
+ *    callback order to W3C and W8/V1 made that order OBSERVABLE via the public
+ *    `IMonitor.recordLifecycle` channel, so the hierarchy-order class is now
+ *    checkable. Its violator fixture is a SYNTHETIC lifecycle feed — a hand-built
+ *    inverted sequence — deliberately NOT a wait-for-an-engine-bug fixture.
+ *  - I-5 STAYS a documented no-op (V5b). `doneDelta` is now sampled on the verdict
+ *    path (so half the blocker closed), but the `done.state.<C>` RAISE itself is
+ *    still not soundly observable; see invariants.ts for the residual.
+ *  - I-3 was PROMOTED into the DEFAULT builtin set (V8, ISS-030 closed), so §4а.2
+ *    now carries string-method-invoke and composite-join machines that specifically
+ *    exercise the false-positive I-3 used to produce.
+ *
  * §4а.3 differential (I-5 done-set vs the model compiler) is DEFERRED with I-5's
- * teeth to W5c (#35): while I-5 is a documented no-op there is nothing to diff.
+ * teeth: while I-5 is a documented no-op there is nothing to diff.
  */
 import { describe, expect, it } from 'vitest'
 import { buildConfigGraph, INVARIANTS } from '../../sim/invariants'
-import type { CheckerContext, Violation } from '../../sim/invariants'
+import type { CheckerContext, LifecycleObservation, Violation } from '../../sim/invariants'
 import { runSafety, runSafetyWithDeterminism } from '../../sim/invariants.runner'
 import { runSimulation } from '../../sim/public'
 import type { CanonicalHeader, CanonicalTrace, TraceFrame } from '../../sim/trace'
@@ -44,6 +61,19 @@ function frame(over: Partial<TraceFrame> & { step: number }): TraceFrame {
 function ctxFor(config: unknown, maxQueueDepth?: number): CheckerContext {
   return { graph: buildConfigGraph(config), header: HEADER, ...(maxQueueDepth !== undefined ? { maxQueueDepth } : {}) }
 }
+/** Owner sentinel for the synthetic lifecycle feed (`owner` is reference identity). */
+const FEED_OWNER: object = { owner: 'oracle-self-test' }
+/**
+ * A SYNTHETIC lifecycle feed: an `enter` sequence inside ONE microstep that enters
+ * a DESCENDANT (`root.rA.leaf`) before its ANCESTOR (`root`) — the exact W3C
+ * document-order violation I-4 exists to catch. Constructed by hand rather than
+ * waiting for the engine to regress, which is the only way a red test for an
+ * ordering oracle can exist at all.
+ */
+const I4_INVERTED_FEED: readonly LifecycleObservation[] = [
+  { kind: 'enter', hook: 'onEnter', state: 'root.rA.leaf', owner: FEED_OWNER, microstep: 7, seq: 0, edge: 'begin' },
+  { kind: 'enter', hook: 'onEnter', state: 'root', owner: FEED_OWNER, microstep: 7, seq: 1, edge: 'begin' },
+]
 function trace(...frames: TraceFrame[]): CanonicalTrace {
   return { header: HEADER, frames }
 }
@@ -66,6 +96,18 @@ const ORACLE_TEETH: readonly TeethCase[] = [
   },
   { id: 'I-2', fire: () => runSafety(INVARIANTS, trace(frame({ step: 1, cause: 'external', event: 'go' })), baseCtx()) },
   { id: 'I-3', fire: () => runSafety(INVARIANTS, trace(frame({ step: 1, fireOutcome: 'resolve-true', quiescent: false })), baseCtx()) },
+  {
+    id: 'I-4',
+    // Lifecycle-keyed teeth (W8/V3a): a clean trace plus a SYNTHETIC lifecycle feed
+    // whose enter sequence inverts the ancestor/descendant order inside ONE
+    // microstep. I-4 is final-scoped, so the trace must be otherwise clean for the
+    // sweep to reach it — frame 0 is a bare init snapshot.
+    fire: () =>
+      runSafety(INVARIANTS, trace(frame({ step: 0, cause: 'init', from: 'root', to: 'root' })), {
+        ...ctxFor({ states: { root: { regions: { rA: { leaf: {} } } } }, events: {} }, 8),
+        lifecycle: I4_INVERTED_FEED,
+      }),
+  },
   {
     id: 'I-6',
     fire: () =>
@@ -95,10 +137,12 @@ const ORACLE_TEETH: readonly TeethCase[] = [
   },
 ]
 
-// Documented no-ops (MASTER §4а.1 / W5b A3): their class is not soundly observable
-// from the content-only trace, so they are HONEST no-ops (I-12 covers the converse
-// done-event gating; enter-order is engine-tested). W5c (#35) may give them teeth.
-const DOCUMENTED_NO_OPS = ['I-4', 'I-5'] as const
+// Documented no-ops (MASTER §4а.1). I-4 LEFT this set in W8/V3a once the lifecycle
+// channel made callback order observable. I-5 remains: the `done.state.<C>` RAISE is
+// still not soundly observable (a raise that matched no candidate transition records
+// nothing at all and is indistinguishable from no raise), and the CONVERSE direction
+// is already covered with real teeth by I-12.
+const DOCUMENTED_NO_OPS = ['I-5'] as const
 
 describe('§4а.1 oracle meta-test: registry classification + teeth', () => {
   it('every INVARIANTS id is CLASSIFIED as either teeth or a documented no-op (no silent unaccounted oracle)', () => {
@@ -136,10 +180,20 @@ describe('§4а.1 oracle meta-test: registry classification + teeth', () => {
         frame({ step: 2, to: 'root', quiescent: false, fireOutcome: 'resolve-true' }),
         frame({ step: 3, to: 'x.y.z', queue: { internal: 5, external: 5 } }),
       ]
-      const ctx = ctxFor({ states: { root: { regions: { r1: { a: {} }, r2: { b: {} } } } }, events: { 'done.state.root': {} } }, 8)
+      const ctx: CheckerContext = {
+        ...ctxFor({ states: { root: { regions: { r1: { a: {} }, r2: { b: {} } } } }, events: { 'done.state.root': {} } }, 8),
+        // Feed the lifecycle plane too — including a sequence that DOES violate
+        // hierarchy order. A documented no-op must stay silent even when the richest
+        // available observation plane is present; otherwise it is not a no-op.
+        lifecycle: I4_INVERTED_FEED,
+      }
       for (const f of battery) {
         expect(inv?.checkStep?.(f, ctx) ?? null, `${id} fired on ${f.to} — a documented no-op must never emit`).toBeNull()
       }
+      expect(
+        inv?.checkFinal?.({ config: 'root.r1.a|root.r2.b', queue: { internal: 0, external: 0 }, quiescent: true }, ctx) ?? null,
+        `${id} fired at final scope — a documented no-op must never emit`,
+      ).toBeNull()
     })
   }
 })
@@ -195,6 +249,145 @@ const CORPUS: readonly CorpusEntry[] = [
         },
       },
       owner: { state: 'P' },
+    }),
+  },
+  // ── W8/V8 (ISS-030) shapes ────────────────────────────────────────────────
+  // These are the machines whose CORRECT behavior used to make I-3 fire. A
+  // string-method invoke action is resolved by NAME inside `callAction`, past the
+  // config-layer wrap boundary, so `bracketAsync` could not bracket it; the machine
+  // settled as `pending ∧ inFlight===0`, which settle.ts classifies
+  // WAITING_ON_INTERNAL — the I-3 witness. If the lifecycle-derived in-flight count
+  // ever regresses, THESE entries go red rather than a consumer's run.
+  {
+    name: 'ISS-030: async STRING-METHOD invoke action (unbracketable by bracketAsync)',
+    setup: () => ({
+      config: {
+        name: 'strInvoke',
+        stateAttribute: 'state',
+        initialState: 'working',
+        states: {
+          // Resolved by NAME at call time — the exact form no other observability
+          // surface could see before the lifecycle channel.
+          working: { invoke: [{ delay: 0, event: 'ping', action: 'doWork' }] },
+          done: { final: true },
+        },
+        events: { ping: { transitions: [{ from: 'working', to: 'done' }] } },
+      },
+      owner: {
+        state: 'working',
+        // Genuinely async: the await suspends across several microtasks, which is
+        // precisely the window in which the machine looked "wedged" to I-3.
+        doWork: async () => {
+          await Promise.resolve()
+          await Promise.resolve()
+        },
+      },
+    }),
+  },
+  {
+    name: 'ISS-030: string-method invoke action that CHAINS into another delayed invoke',
+    setup: () => ({
+      config: {
+        name: 'strInvokeChain',
+        stateAttribute: 'state',
+        initialState: 's1',
+        states: {
+          s1: { invoke: [{ delay: 0, event: 'go', action: 'stepA' }] },
+          s2: { invoke: [{ delay: 5, event: 'go2', action: 'stepB' }] },
+          s3: { final: true },
+        },
+        events: {
+          go: { transitions: [{ from: 's1', to: 's2' }] },
+          go2: { transitions: [{ from: 's2', to: 's3' }] },
+        },
+      },
+      owner: {
+        state: 's1',
+        stepA: async () => {
+          await Promise.resolve()
+        },
+        stepB: async () => {
+          await Promise.resolve()
+        },
+      },
+    }),
+  },
+  {
+    name: 'ISS-030 + join: parallel composite whose regions run string-method invokes to a done.state join',
+    setup: () => ({
+      config: {
+        name: 'joinStrInvoke',
+        stateAttribute: 'state',
+        initialState: 'C',
+        states: {
+          C: {
+            regions: {
+              r1: { w1: { invoke: [{ delay: 0, event: 'f1', action: 'work1' }] }, d1: { final: true } },
+              r2: { w2: { invoke: [{ delay: 0, event: 'f2', action: 'work2' }] }, d2: { final: true } },
+            },
+          },
+          after: { final: true },
+        },
+        events: {
+          f1: { transitions: [{ from: 'C.r1.w1', to: 'C.r1.d1' }] },
+          f2: { transitions: [{ from: 'C.r2.w2', to: 'C.r2.d2' }] },
+          // The DECLARED join: the composite reaching all-final raises this
+          // internally, and it must leave the composite without any oracle firing.
+          'done.state.C': { transitions: [{ from: 'C', to: 'after' }] },
+        },
+      },
+      owner: {
+        state: 'C',
+        work1: async () => {
+          await Promise.resolve()
+        },
+        work2: async () => {
+          await Promise.resolve()
+        },
+      },
+    }),
+  },
+  {
+    name: 'composite join with nested enter/exit hooks (I-4 hierarchy order on a REAL engine run)',
+    setup: () => ({
+      config: {
+        name: 'joinHooks',
+        stateAttribute: 'state',
+        initialState: 'C',
+        states: {
+          C: {
+            // Hooks at BOTH levels so the lifecycle stream carries real
+            // ancestor/descendant enter and exit pairs for I-4 to check.
+            onEnter: (o: Box) => {
+              o.log = `${String(o.log ?? '')}+C`
+            },
+            onExit: (o: Box) => {
+              o.log = `${String(o.log ?? '')}-C`
+            },
+            regions: {
+              r1: {
+                w1: {
+                  onEnter: (o: Box) => {
+                    o.log = `${String(o.log ?? '')}+w1`
+                  },
+                  onExit: (o: Box) => {
+                    o.log = `${String(o.log ?? '')}-w1`
+                  },
+                },
+                d1: { final: true },
+              },
+              r2: { w2: {}, d2: { final: true } },
+            },
+          },
+          after: { final: true },
+        },
+        events: {
+          f1: { transitions: [{ from: 'C.r1.w1', to: 'C.r1.d1' }] },
+          f2: { transitions: [{ from: 'C.r2.w2', to: 'C.r2.d2' }] },
+          'done.state.C': { transitions: [{ from: 'C', to: 'after' }] },
+        },
+      },
+      owner: { state: 'C', log: '' },
     }),
   },
 ]

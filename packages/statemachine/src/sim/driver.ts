@@ -25,6 +25,17 @@
  * taken. The wrapped Adapter is ALWAYS passed as the EXPLICIT 2nd positional arg
  * to `fireEvent` (ADR-7 c13), never via the `:469-471` unshift path.
  *
+ * **Event payload (W8).** `DriverOp.fire.args` is `readonly unknown[]` and the
+ * driver forwards it VERBATIM — it does NOT filter to numbers. An OBJECT payload
+ * (the typical case: a verdict object meaningful relative to the current state)
+ * therefore reaches the machine's guard/action callbacks, which is the only way
+ * arg-dependent transition branches get covered. This is SAFE with respect to the
+ * `isAdapter` duck-check (`'set' in inp && 'get' in inp`, types.ts:301-303)
+ * BECAUSE the driver always passes the wrapped Adapter EXPLICITLY as the 2nd
+ * positional arg: payload values start at position 3 and `state_machine.ts`
+ * :469-471 only inspects position 2. Never call `sm.fireEvent(event, ...args)`
+ * without the explicit adapter from this module.
+ *
  * Determinism premise (M5): V8 microtask order is FIFO within one isolate and
  * the virtual scheduler creates no real timers/IO; vitest does NOT fake
  * `queueMicrotask`. `header.runtime` pins that premise into the hash.
@@ -130,6 +141,49 @@ interface LiveSink extends CaptureSink {
   drain(): CapturedWrite[]
 }
 
+/**
+ * Every REGIONS-BEARING composite id of a config, as the engine renders its dotted
+ * path (`root`, `root.region.child`, …). Duck-typed on the same structural fields
+ * `buildConfigGraph` walks, so it has no dependency on any topology type.
+ *
+ * ALL composites are enumerated, not only those with a declared `done.state.<C>`:
+ * a parallel composite that reaches all-final and STAYS there has no join
+ * transition to leave it, and its done-ness is exactly what the liveness
+ * `terminal` derivation needs to see.
+ */
+function compositeIdsOf(config: unknown): string[] {
+  const out: string[] = []
+  const visit = (name: string, node: unknown, prefix: string): void => {
+    const path = prefix === '' ? name : `${prefix}.${name}`
+    const n = (node ?? {}) as Record<string, unknown>
+    const regions = n['regions']
+    if (regions && typeof regions === 'object') {
+      out.push(path)
+      for (const [rn, rstates] of Object.entries(regions as Record<string, unknown>)) {
+        if (rstates && typeof rstates === 'object') {
+          for (const [sn, sv] of Object.entries(rstates as Record<string, unknown>)) {
+            visit(sn, sv, `${path}.${rn}`)
+          }
+        }
+      }
+    }
+    const states = n['states']
+    if (states && typeof states === 'object') {
+      for (const [sn, sv] of Object.entries(states as Record<string, unknown>)) {
+        visit(sn, sv, path)
+      }
+    }
+  }
+  const cfg = (config ?? {}) as Record<string, unknown>
+  const top = cfg['states']
+  if (top && typeof top === 'object') {
+    for (const [name, node] of Object.entries(top as Record<string, unknown>)) {
+      visit(name, node, '')
+    }
+  }
+  return out
+}
+
 function makeLiveSink(): LiveSink {
   let buf: CapturedWrite[] = []
   return {
@@ -156,6 +210,14 @@ export class SimDriver<T extends object> {
   private readonly frames: TraceFrame[] = []
   private readonly header: CanonicalHeader
   private readonly initialNormalized: string
+  /**
+   * W8/V5b — every REGIONS-BEARING composite id of the wired config, as the engine
+   * renders its dotted path. Sampled through the PUBLIC `isDone(C)` at every settle
+   * boundary and stamped onto the boundary frame as {@link TraceFrame.doneDelta}.
+   * Empty for a config with no composite (the sampling is then a no-op and the
+   * frames stay byte-identical to a pre-W8 run).
+   */
+  private readonly doneComposites: readonly string[]
   private stepIndex = 0
   private initialized = false
 
@@ -177,7 +239,43 @@ export class SimDriver<T extends object> {
   constructor(private readonly cfg: DriverConfig<T>) {
     this.sink = makeLiveSink()
     const counter = makeAsyncCounter()
-    this.env = makeEnv(counter, cfg.schedulerView)
+    const baseEnv = makeEnv(counter, cfg.schedulerView)
+    // W8/V8 (ISS-030) — COMPOSE the settledness signal from BOTH in-flight sources.
+    //
+    // `bracketAsync` wraps FUNCTION-VALUED invoke actions at the CONFIG layer, so a
+    // STRING-METHOD invoke action — resolved INSIDE `callAction`, past that wrap
+    // boundary — was invisible to `inFlightAsyncCount`. A machine legitimately
+    // awaiting one settled as `pending ∧ inFlight===0`, which settle.ts classifies
+    // WAITING_ON_INTERNAL — the I-3 witness. That was ISS-030: a reachable I-3
+    // FALSE POSITIVE on a correct machine, and the sole reason I-3 was opt-in.
+    //
+    // The W8/V1b lifecycle channel wraps the CALL rather than the action VALUE, so
+    // `invoke.action` begin/end pairs cover the string-method case identically. Only
+    // `invoke.action` is folded in — NOT `invoke.operation`, whose pair spans the
+    // ENTIRE lifetime of a long-running `src` promise (a subscription-style
+    // operation would hold `inFlightAsyncCount` non-zero forever and no macrostep
+    // could ever reach quiescence), and NOT the `invoke.abort` POINT pair (adjacent
+    // begin+end, net zero).
+    //
+    // A function-valued invoke action is counted TWICE (bracket + channel). That is
+    // harmless by construction: settle.ts only ever asks `> 0` / `=== 0`, and both
+    // counters are incremented and decremented around the SAME call, so they reach
+    // zero together.
+    //
+    // Enter/exit HOOKS are also observable on the channel but are deliberately NOT
+    // folded in. They are awaited inside `applyMicrostep`, where
+    // `isProcessingEvents()` is already `true`, so the structural conjunct of the
+    // quiescence predicate covers them. The one place it does not — the
+    // construction-time fire-and-forget `executeEnterActions` — is covered by the
+    // pump's QUIET_FLUSH window by design (settle.ts); folding it in here would move
+    // the settle fixed point itself, which is a separate change from ISS-030.
+    const monitor = cfg.monitor
+    this.env = {
+      ...baseEnv,
+      inFlightAsyncCount(): number {
+        return baseEnv.inFlightAsyncCount() + monitor.invokeActionInFlightCount()
+      },
+    }
     this.plan = cfg.faults ?? { faults: [] }
     this.faultsActive = this.plan.faults.length > 0
 
@@ -232,16 +330,23 @@ export class SimDriver<T extends object> {
     })
 
     this.initialNormalized = normalizeParts(String(cfg.config.initialState))
+    this.doneComposites = compositeIdsOf(cfg.config)
     this.header = {
       seed: cfg.prng.seed.toString(),
       configHash: configHash(cfg.config),
       engine: '@vedmalex/statemachine',
-      // '3' (was '1'→'2'): '2' added the hashed `settleReason` field (C1); '3'
-      // re-semantizes its closed union (U1: the `pending ∧ inFlight==0` case that
-      // hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as WAITING_ON_INTERNAL),
-      // so per the trace.ts version contract ("bump on closed-union/hashed-field
-      // change") the schema version advances again.
-      version: '3',
+      // '4' (was '1'→'2'→'3'): '2' added the hashed `settleReason` field (C1); '3'
+      // re-semantized its closed union (U1: the `pending ∧ inFlight==0` case that
+      // hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as WAITING_ON_INTERNAL).
+      // '4' (W8/V5b) POPULATES the hashed `doneDelta` field on this path for the
+      // first time: the boundary frame of every step now carries the sampled
+      // isDone(C) projection per declared composite. `doneDelta` was always part of
+      // the frame schema and always hashed, but only coverage.ts ever set it — a
+      // Simulator trace of a composite machine now hashes DIFFERENTLY than it did
+      // under '3'. Per the trace.ts version contract ("bump on closed-union/
+      // hashed-field change") that is corpus-breaking and the schema version
+      // advances. MUST stay in lockstep with public.ts `emptyHeader`.
+      version: '4',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,
@@ -353,7 +458,10 @@ export class SimDriver<T extends object> {
     const drainedWrites = this.sink.drain()
 
     // Frame 0: the init snapshot, recorded AFTER the drain. cause:'init',
-    // normalized from===to===initialState.
+    // normalized from===to===initialState. W8/V5b: it carries the init-boundary
+    // doneDelta sample (a degenerate all-final initial configuration is done
+    // immediately) — the same boundary coverage.ts has always sampled.
+    const initDone = this.sampleDoneDelta()
     this.frames.push({
       step: this.stepIndex,
       t: this.cfg.clock.now(),
@@ -362,6 +470,7 @@ export class SimDriver<T extends object> {
       to: this.initialNormalized,
       queue: this.queueSnapshot(),
       quiescent: result.quiescent,
+      ...(initDone !== undefined ? { doneDelta: initDone } : {}),
     })
 
     // Any state-writes captured DURING the construction drain (e.g. a
@@ -472,7 +581,10 @@ export class SimDriver<T extends object> {
         // No-fault fast path: the ORIGINAL Step-3 raw fire (ADR-7 c13 explicit
         // Adapter), byte-identical to the pre-Step-5 driver so a clean run's trace,
         // hash and PERF are unchanged by the fault wiring.
-        const r = await this.fireOne(op.event, (op.args ?? []).filter((a): a is number => typeof a === 'number'))
+        // W8: args are forwarded VERBATIM (`unknown[]`) — no number-filter. The
+        // explicit-Adapter 2nd positional arg keeps the :469-471 unshift path out
+        // of reach, so an object payload is safe here (see module doc).
+        const r = await this.fireOne(op.event, op.args ?? [])
         fireOutcome = r.outcome
         if (r.errorClass !== undefined) {
           errorClassOnFire = r.errorClass
@@ -501,6 +613,12 @@ export class SimDriver<T extends object> {
     // is a no-op snapshot; for resolve-false / reject / errorState fallback it is
     // the BACKSTOP record (ADR-1 c10) — a try/catch-wrapped getCurrentState diff.
     const afterState = this.safeCurrentState()
+    // W8/V5b: the settle-boundary doneDelta sample — the SAME boundary and the same
+    // PUBLIC isDone(C) reader coverage.ts injects post-hoc, now recorded inline so
+    // the Simulator/runSafety VERDICT path carries it too (it previously did not,
+    // which made every doneDelta-keyed oracle and the liveness `terminal`
+    // derivation vacuous e2e).
+    const doneDelta = this.sampleDoneDelta()
     const boundaryFrame: TraceFrame = {
       step: this.stepIndex,
       t: this.cfg.clock.now(),
@@ -516,6 +634,7 @@ export class SimDriver<T extends object> {
       // C1: record WHY a non-quiescent boundary is non-quiescent so I-3 can exclude
       // a legitimate WAITING_ON_* (a concurrent region's own future timer).
       ...(result.reason ? { settleReason: result.reason } : {}),
+      ...(doneDelta !== undefined ? { doneDelta } : {}),
     }
     this.frames.push(boundaryFrame)
 
@@ -622,8 +741,14 @@ export class SimDriver<T extends object> {
     opFault: { kind: 'reorder' | 'drop' | 'dup' | 'overflow'; floodCount?: number } | undefined,
   ): Promise<{ outcome: FireOutcome; errorClass?: TraceFrame['errorClass']; faultApplied?: FaultKind }> {
     const opId = op.opId ?? `step-${this.stepIndex}`
-    const numericArgs = (op.args ?? []).filter((a): a is number => typeof a === 'number')
-    const entry: SubmissionEntry = { opId, event: op.event, args: numericArgs }
+    // W8: the FAULT path carries the payload IDENTICALLY to the no-fault path —
+    // args are forwarded VERBATIM into the submission entry (no number-filter), so
+    // every downstream consumer (applyQueueFaults dup/reorder/drop, the overflow
+    // flood, fireOne) fires with the SAME arguments a fault-free run would use.
+    // Dropping the payload here would make a fault run observably diverge from its
+    // no-fault twin for reasons unrelated to the fault — a new class of
+    // irreproducibility.
+    const entry: SubmissionEntry = { opId, event: op.event, args: op.args ?? [] }
 
     // Overflow: flood maxQueueDepth+1 copies; the (max+1)-th fire rejects
     // synchronously at enqueue (state_machine.ts:228-240). The flood entries are
@@ -712,7 +837,7 @@ export class SimDriver<T extends object> {
    * the FROZEN structural classifier — never misread as a queue error. Used for
    * every non-overflow fire (no fault, drop, dup).
    */
-  private async fireOne(event: string, args: readonly number[]): Promise<{ outcome: FireOutcome; errorClass?: ErrorClass }> {
+  private async fireOne(event: string, args: readonly unknown[]): Promise<{ outcome: FireOutcome; errorClass?: ErrorClass }> {
     try {
       const resolved = await this.sm.fireEvent(event as never, this.wrapped as never, ...args)
       return { outcome: resolved ? 'resolve-true' : 'resolve-false' }
@@ -729,7 +854,7 @@ export class SimDriver<T extends object> {
    * reorder/overflow integration tests; the normal {@link step} drives one op.
    */
   async fireMany(
-    ops: ReadonlyArray<{ event: string; args?: readonly number[]; opId: string }>,
+    ops: ReadonlyArray<{ event: string; args?: readonly unknown[]; opId: string }>,
   ): Promise<readonly FireResult[]> {
     if (!this.initialized) {
       throw new Error('SimDriver.fireMany() called before init()')
@@ -750,13 +875,18 @@ export class SimDriver<T extends object> {
     return results
   }
 
-  /** The engine `fireEvent` bound for {@link fireBuffered} (explicit-Adapter path). */
-  private boundFireEvent(): (event: never, adapter: never, ...args: number[]) => Promise<boolean> {
-    return ((event: never, adapter: never, ...args: number[]) =>
-      this.sm.fireEvent(event, adapter, ...args)) as (
+  /**
+   * The engine `fireEvent` bound for {@link fireBuffered} (explicit-Adapter path).
+   * W8: the rest parameter is `unknown[]` so an OBJECT payload reaches the
+   * machine's callbacks. The adapter stays the EXPLICIT 2nd positional arg, so the
+   * `isAdapter` unshift branch (state_machine.ts:469-471) is never entered.
+   */
+  private boundFireEvent(): (event: never, adapter: never, ...args: unknown[]) => Promise<boolean> {
+    return ((event: never, adapter: never, ...args: unknown[]) =>
+      this.sm.fireEvent(event, adapter, ...(args as never[]))) as (
       event: never,
       adapter: never,
-      ...args: number[]
+      ...args: unknown[]
     ) => Promise<boolean>
   }
 
@@ -790,6 +920,33 @@ export class SimDriver<T extends object> {
   private queueSnapshot(): { internal: number; external: number } {
     const q = this.sm.getQueueDepth()
     return { internal: q.internal, external: q.external }
+  }
+
+  /**
+   * W8/V5b — sample the PUBLIC `isDone(C)` for every composite of the config at the
+   * CURRENT (settled) instant. The RUNNER legitimately drives the engine here; the
+   * result is stored as DERIVED frame data so the checkers read the captured
+   * projection and never make a live call (ADR-6 c3 purity).
+   *
+   * Returns `undefined` for a config with no composite, so the frame keeps its
+   * pre-W8 shape (an absent optional is dropped by the hash serializer) and a
+   * composite-free scenario's traceHash is unchanged by this feature.
+   */
+  private sampleDoneDelta(): ReadonlyArray<{ composite: string; done: boolean }> | undefined {
+    if (this.doneComposites.length === 0) {
+      return undefined
+    }
+    return this.doneComposites.map((composite) => {
+      let done = false
+      try {
+        done = this.sm.isDone(composite)
+      } catch {
+        // A corrupt-state probe can make the read path throw; an unreadable
+        // configuration is reported as not-done rather than crashing the driver.
+        done = false
+      }
+      return { composite, done }
+    })
   }
 
   /**

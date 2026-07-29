@@ -57,7 +57,10 @@ export type {
 export { Simulator, runSimulation, wire } from './public'
 export type {
   SimEnv,
+  SimEventPayload,
   SimOptions,
+  SimPayloadRng,
+  SimPayloadSnapshot,
   SimResult,
   SimSetup,
   SimSnapshot,
@@ -201,6 +204,9 @@ export type {
   FinalState,
   Invariant,
   InvariantScope,
+  // W8/V3a: the lifecycle observation a custom invariant reads from
+  // `CheckerContext.lifecycle` (I-4 keys its ordering predicate on it).
+  LifecycleObservation,
   Violation,
 } from './invariants'
 export { runSafety, runSafetyWithDeterminism } from './invariants.runner'

@@ -55,15 +55,58 @@ export const SCENARIO_RUNTIME = 'node-sim-v1'
 
 /**
  * Cheap syntactic gate on a literal-callback `source` BEFORE it reaches
- * `new Function` (W7 U2 / task #26 / defect B4-учёт). NOT a sandbox and NOT an
- * attacker mitigation — a determined caller can still craft a `source` that
- * matches this pattern and does harm; it is fail-fast hygiene against an
- * empty/malformed/non-function `source` (e.g. an accidental `''`, `undefined`
- * coerced to a string, or a stray non-callable expression) reaching the
- * compiler, with a message that names the TRUSTED-INPUT-ONLY boundary instead
- * of surfacing an opaque `SyntaxError` from inside `new Function`.
+ * `new Function` (W7 U2 / task #26 / defect B4-учёт; W8 V6a widened the
+ * accepted-shape set). NOT a sandbox and NOT an attacker mitigation — a
+ * determined caller can still craft a `source` that matches this pattern and
+ * does harm; it is fail-fast HYGIENE against an empty/malformed/non-function
+ * `source` (e.g. an accidental `''`, `undefined` coerced to a string, or a
+ * stray non-callable expression) reaching the compiler, with a message that
+ * names the TRUSTED-INPUT-ONLY boundary instead of surfacing an opaque
+ * `SyntaxError` from inside `new Function`.
+ *
+ * Matched AFTER {@link stripLeadingCommentsAndWhitespace} runs on the
+ * trimmed source, so it accepts (in addition to a bare `function`/`async
+ * function` literal and any arrow form):
+ *  - a parenthesis-wrapped function literal: `(function(o){...})`;
+ *  - a function literal preceded by a leading block comment (`/* ... *\/`)
+ *    and/or line comment(s) (`// ...\n`), in any combination, before the
+ *    `function`/`async function`/`(function` keyword.
+ *
+ * It still rejects (throws before `new Function` is ever reached): an empty
+ * or whitespace-only source, a non-string source, and source that is not
+ * function-shaped at all (e.g. `'42'`, `'{ evil: 1 }'`, `'alert(1)'`).
+ *
+ * PRECISION OF THE CHECK (do not mistake it for a filter). The `function`
+ * alternative is anchored; the ARROW alternative (`=>`) is NOT — a source that
+ * merely CONTAINS `=>` anywhere passes the shape check (e.g.
+ * `'alert(1), (x) => x'` is a valid comma-expression and WOULD run). Likewise a
+ * paren-wrapped IIFE with a trailing statement now passes the shape check and
+ * fails later, inside `new Function`, as a raw SyntaxError. Neither is a
+ * regression of SAFETY — this is hygiene for author typos, NOT a sandbox and NOT
+ * an attacker mitigation; the whole path is trusted-input-only (see below).
  */
-const FUNCTION_LITERAL_PATTERN = /^(async\s+)?function\b|=>/
+const FUNCTION_LITERAL_PATTERN = /^\(?\s*(async\s+)?function\b|=>/
+
+/**
+ * Strip leading whitespace and leading comments (block `/* *\/` and line
+ * `// ...`) from `source` so {@link FUNCTION_LITERAL_PATTERN} can anchor on
+ * the actual `function`/`(function` keyword instead of false-rejecting a
+ * well-formed literal that merely has a leading comment (W8 V6a). Hygiene
+ * pre-processing ONLY — the ORIGINAL untouched `source` string is still what
+ * gets embedded into the `new Function` body below; this stripped `probe` is
+ * used solely for the guard's pattern test, never for compilation.
+ */
+function stripLeadingCommentsAndWhitespace(source: string): string {
+  let probe = source
+  for (;;) {
+    const before = probe
+    probe = probe.replace(/^\s+/, '')
+    probe = probe.replace(/^\/\*[\s\S]*?\*\//, '')
+    probe = probe.replace(/^\/\/[^\r\n]*(\r\n|\r|\n)?/, '')
+    if (probe === before) break
+  }
+  return probe
+}
 
 /**
  * Re-create the live function for a closure-free literal callback. The source is
@@ -76,11 +119,15 @@ const FUNCTION_LITERAL_PATTERN = /^(async\s+)?function\b|=>/
  * present. The created function ignores extra args and reads only the owner.
  *
  * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26). `source` is COMPILED via
- * `new Function` below; the {@link FUNCTION_LITERAL_PATTERN} guard is fail-fast
- * hygiene on an empty/malformed source, NOT a sandbox — it does not defend
- * against a crafted, syntactically-valid-looking malicious literal. Callers
- * MUST treat `source` as author-side trusted input (see `./index` barrel doc
- * and `toEngineConfig`/`runScenario` for the full contract). The engine's own
+ * `new Function` below; the {@link FUNCTION_LITERAL_PATTERN} guard (run against
+ * a {@link stripLeadingCommentsAndWhitespace}-cleaned probe) is fail-fast
+ * HYGIENE on an empty/malformed source — it accepts a bare `function`/`async
+ * function` literal, the SAME wrapped in parentheses (`(function(){})`), any
+ * of those with a leading block/line comment, and any arrow-function form —
+ * it is NOT a sandbox and does not defend against a crafted,
+ * syntactically-valid-looking malicious literal. Callers MUST treat `source`
+ * as author-side trusted input (see `./index` barrel doc and
+ * `toEngineConfig`/`runScenario` for the full contract). The engine's own
  * untrusted-JSON path (`StateMachine.fromJSON`/`fromSecureJSON`) never reaches
  * this function — it resolves callbacks by NAME from a caller-supplied
  * `FunctionRegistry` (`state_machine.ts` `deserializeAction`), never compiling
@@ -88,7 +135,8 @@ const FUNCTION_LITERAL_PATTERN = /^(async\s+)?function\b|=>/
  */
 function recreateLiteral(source: string): (...args: unknown[]) => unknown {
   const trimmed = typeof source === 'string' ? source.trim() : ''
-  if (trimmed.length === 0 || !FUNCTION_LITERAL_PATTERN.test(trimmed)) {
+  const probe = stripLeadingCommentsAndWhitespace(trimmed)
+  if (trimmed.length === 0 || !FUNCTION_LITERAL_PATTERN.test(probe)) {
     const shown = typeof source === 'string' ? source : String(source)
     const truncated = shown.length > 120 ? `${shown.slice(0, 120)}…` : shown
     throw new Error(

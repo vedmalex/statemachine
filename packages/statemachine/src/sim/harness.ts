@@ -56,7 +56,15 @@ export interface SubmissionEntry {
   /** Stable op-id of the issuing op (R22) — the per-fire identity for overflow. */
   readonly opId: string
   readonly event: string
-  readonly args: readonly number[]
+  /**
+   * The event payload, forwarded VERBATIM (W8). `unknown[]` — NOT `number[]` — so
+   * an OBJECT payload survives the queue-fault plane (drop/dup/reorder/overflow)
+   * exactly as it survives a fault-free fire. The queue faults are PURE over the
+   * buffer and never rewrite an entry, so a duplicated/reordered entry carries the
+   * IDENTICAL args reference: the fault path is payload-identical to the no-fault
+   * path by construction.
+   */
+  readonly args: readonly unknown[]
 }
 
 /**
@@ -191,7 +199,7 @@ export interface FireResult {
  * resolve.
  */
 export async function fireBuffered<T extends object>(
-  fireEvent: (event: never, adapter: never, ...args: number[]) => Promise<boolean>,
+  fireEvent: (event: never, adapter: never, ...args: unknown[]) => Promise<boolean>,
   wrapped: Adapter<T>,
   entry: SubmissionEntry,
 ): Promise<FireResult> {

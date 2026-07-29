@@ -60,6 +60,45 @@ export interface ConfigGraph {
   readonly declaredDoneEvents: ReadonlySet<string>
 }
 
+/**
+ * W8/V3a — ONE retained record of the engine's PUBLIC lifecycle observability
+ * channel (`IMonitor.recordLifecycle`, types.ts `LifecycleEvent`), as the harness
+ * projects it into the SAFETY plane.
+ *
+ * This is deliberately a LOCAL STRUCTURAL restatement, not an import of the
+ * engine's `LifecycleEvent`: the SAFETY plane owns its own closed observation
+ * vocabulary (the same reason {@link ConfigGraph} REPLICATES `getRegionKey` and
+ * `TraceFrame` restates `FaultKind`). Any `LifecycleEvent` is structurally
+ * assignable to it, so the projection cannot silently drift.
+ *
+ * Reading these records is NOT a live engine read (ADR-6 c3): they are CAPTURED
+ * observations recorded by the monitor seam during the drain, exactly like the
+ * `doneDelta` projection — the checker never calls the machine.
+ *
+ * ## Field caveats a checker MUST honor
+ * - `state` is a full dot-path ONLY for `kind:'enter'|'exit'|'invoke'`. For
+ *   `kind:'guard'` it is the transition's `from` SELECTOR, which may be `'*'`,
+ *   `'p.*'` or a multi-source `'a|b'` list — NEVER dot-parse it.
+ * - `microstep === 0` is the RESERVED "no microstep" id shared by construction,
+ *   `reset` and `resumeTimers`. Records from those three UNRELATED paths are
+ *   therefore indistinguishable, so a per-microstep window keyed on `0` would
+ *   conflate them.
+ * - `owner` is a REFERENCE-identity discriminator (one machine can drive many
+ *   objects). Never serialize it; never compare it structurally.
+ */
+export interface LifecycleObservation {
+  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard'
+  readonly hook: string
+  readonly state: string
+  readonly owner: object
+  readonly microstep: number
+  readonly seq: number
+  readonly edge: 'begin' | 'end'
+  readonly event?: string
+  readonly failed?: boolean
+  readonly transition?: string
+}
+
 /** The pure context every checker receives (graph + header; NO live engine). */
 export interface CheckerContext {
   readonly graph: ConfigGraph
@@ -70,6 +109,18 @@ export interface CheckerContext {
    * a live engine read; the harness supplies it from the same options it wired.
    */
   readonly maxQueueDepth?: number
+  /**
+   * W8/V3a — the CAPTURED lifecycle observation stream of this run, in engine
+   * `seq` order (the harness monitor's live view). Absent when the run wired no
+   * lifecycle sink, which makes every lifecycle-keyed oracle VACUOUS rather than
+   * failing — a missing observation plane must never manufacture a violation.
+   *
+   * It lives on the CONTEXT, not on {@link TraceFrame}, for two reasons: the
+   * callback timeline is a per-MICROSTEP structure with no 1:1 frame mapping, and
+   * putting it on a frame would drag a non-deterministic `owner` object reference
+   * into the content hash.
+   */
+  readonly lifecycle?: readonly LifecycleObservation[]
 }
 
 /**
@@ -327,11 +378,21 @@ const I3: Invariant = {
     //    async + a timer — a wedged processing-flag / undrained internal queue.
     //  - microtask-budget: a livelock the run could not drain.
     //  - a resolve-true boundary with NO settleReason at all (should have settled).
-    // CAVEAT (ISS-030): `inFlightAsyncCount` does not track string-method invoke
-    // actions, so a machine legitimately awaiting one can surface as
-    // WAITING_ON_INTERNAL — which is why I-3's DEFAULT-set membership is gated on the
-    // zero-false-positive corpus (see oracle_self_test); if that corpus shows the FP
-    // reachable, I-3 stays opt-in.
+    // ISS-030 — CLOSED in W8/V8, which is what promoted I-3 into the DEFAULT builtin
+    // set (public.ts). The residual was: `bracketAsync` wraps only FUNCTION-VALUED
+    // invoke actions at the CONFIG layer, so a STRING-METHOD invoke action — resolved
+    // by name INSIDE `callAction`, past that boundary — was untracked, and a machine
+    // legitimately awaiting one could surface as WAITING_ON_INTERNAL (an I-3
+    // false-positive on a CORRECT machine). The W8/V1b lifecycle channel wraps the
+    // CALL rather than the action VALUE, so `invoke.action` begin/end pairs cover the
+    // string-method form; driver.ts composes that count into `Env.inFlightAsyncCount`,
+    // and such a boundary now classifies as WAITING_ON_TRANSITION_TIMEOUT (excluded)
+    // or reaches true quiescence. NOTE the scope: this covers awaited INVOKE actions.
+    // Enter/exit hooks are awaited where `isProcessingEvents()` is already true, so
+    // the structural conjunct covers them; `invoke.operation` is deliberately NOT
+    // counted (its begin/end pair spans a whole long-running `src`).
+    // The §4а.2 zero-false-positive corpus carries string-method-invoke and
+    // composite-join machines as the standing guard on this promotion.
     const legitimateWait =
       frame.settleReason === 'WAITING_ON_TIMER' || frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT'
     if (
@@ -354,39 +415,131 @@ const I3: Invariant = {
 }
 
 /**
- * I-4 HIERARCHY-ORDER (step). The engine enters shallow→deep and exits deep→
- * shallow (state_machine.ts:1596-1603), enforced and tested THERE. This oracle is
- * a documented no-op backstop — that CALLBACK order is not soundly re-derivable
- * from the content-only trace (see the body comment for the two reasons). Its
- * capability tag keeps the enter-exit-order class visible in the Step-9 coverage
- * map; real sound teeth would require enriching the observation plane with ordered
- * onEnter owner-marker probes (follow-up), not a checker change.
+ * True iff `descendant` is a STRICT descendant of `ancestor` in the dotted state
+ * hierarchy (`'p'` is an ancestor of `'p.r.c'`; `'p'` is NOT an ancestor of
+ * `'px'`). The `'.'` in the prefix test is what makes it a segment boundary
+ * rather than a string prefix.
+ *
+ * This is the ANCESTOR RELATION, deliberately NOT a depth NUMBER. A
+ * depth-comparison predicate would order two SIBLING branches against each other
+ * (`a.r1.leaf` vs `a.r2` differ in depth but neither contains the other), and the
+ * W3C order the engine implements only constrains ancestor/descendant pairs —
+ * sibling order is document order and is free to interleave. Comparing depths
+ * would therefore FALSE-POSITIVE on a legitimate parallel-region entry.
+ */
+function isStrictDescendant(descendant: string, ancestor: string): boolean {
+  return descendant.length > ancestor.length + 1 && descendant.startsWith(`${ancestor}.`)
+}
+
+/**
+ * I-4 HIERARCHY-ORDER (final, lifecycle-keyed). W8/V11 aligned the engine's
+ * callback order to W3C: entry runs in DOCUMENT ORDER (DFS preorder, ancestor
+ * before descendant) and exit in REVERSE document order (descendant before
+ * ancestor). W8/V1 made that order OBSERVABLE for the first time through the
+ * public `IMonitor.recordLifecycle` channel, so I-4 is no longer a no-op backstop:
+ * it now checks the real callback timeline the engine emitted.
+ *
+ * ## Predicate (per MICROSTEP window, per owner)
+ * - enter: there is NO pair `enter(s1)` before `enter(s2)` where s1 is a
+ *   DESCENDANT of s2 (a child must never be entered before its parent).
+ * - exit:  there is NO pair `exit(s1)` before `exit(s2)` where s1 is an ANCESTOR
+ *   of s2 (a parent must never exit before its child).
+ *
+ * Relation is the dot-prefix ANCESTOR relation, never a depth number — see
+ * {@link isStrictDescendant} for why depth comparison is unsound here.
+ *
+ * ## Why this is SOUND (no false positive is reachable)
+ * - Only `edge:'begin'` records define the order. The engine awaits each hook
+ *   sequentially (`executeEnterActions` / `executeExitActions` loop over states,
+ *   and over the three hook slots inside a state), so `begin` order IS invocation
+ *   order.
+ * - A state with NO hook emits NO record. The observed sequence is therefore a
+ *   SUBSEQUENCE of the real one — and a subsequence of a correctly-ordered
+ *   sequence still satisfies the predicate, so a hook-less state can never
+ *   manufacture an inversion.
+ * - `kind:'guard'` is EXCLUDED: its `state` is the transition's `from` SELECTOR
+ *   (`'*'` / `'p.*'` / `'a|b'`), not a path — dot-parsing it would compare
+ *   selectors against paths and invent ancestry.
+ * - `kind:'invoke'` is EXCLUDED: an invoke is not an entry/exit hook at all, and
+ *   its `microstep` is the ARMING step (types.ts INVOKE ASYMMETRY), so it would
+ *   land in the wrong window.
+ * - `microstep === 0` is EXCLUDED: it is the RESERVED id shared by construction,
+ *   `reset` and `resumeTimers`. Those are three UNRELATED entry passes; merging
+ *   them into one window would compare a construction entry against a later
+ *   `resumeTimers` entry and report a phantom inversion. Their ordering is covered
+ *   by the engine's own conformance tests, which observe each pass in isolation.
+ * - An ABORTED microstep (a throw before the point of no return) HAS emitted enter
+ *   records for a configuration that was never committed — but those records were
+ *   still emitted in hook order, so the predicate holds on them too. No exclusion
+ *   is needed and none is made.
+ * - Windows are split by (`microstep`, `owner`): a machine driving several owners
+ *   interleaves their timelines, and comparing across owners would compare two
+ *   independent hierarchies.
+ *
+ * A run that wired no lifecycle sink leaves `ctx.lifecycle` absent and I-4 is
+ * VACUOUS — a missing observation plane never fabricates a violation.
  */
 const I4: Invariant = {
   id: 'I-4',
-  scope: 'step',
+  scope: 'final',
   capabilityTags: ['hierarchy.enter-exit-order'],
-  // A3 — HONEST accounting (deliberately a documented no-op backstop, NOT a
-  // fabricated oracle). The engine's shallow→deep enter / deep→shallow exit
-  // CALLBACK order (state_machine.ts:1596-1603) is enforced there and covered by
-  // the engine's OWN unit tests. It is NOT soundly re-derivable from the
-  // content-only trace, for two independent reasons:
-  //   (1) this engine renders one ACTIVE LEAF per region (the deepest), so
-  //       drilling into a nested target is a sequence of single-leaf REPLACEMENTS
-  //       — every leaf-depth change (up OR down) is a legitimate transition, and
-  //       the per-onEnter-callback ordering the invariant targets is not
-  //       observable at leaf-snapshot granularity. A leaf-depth-regression check
-  //       would false-POSITIVE on an ordinary exit-to-shallower transition.
-  //   (2) an unregistered rendered part is already I-10's config-graph-valid
-  //       class — duplicating it here would STEAL I-10's lowest-step witness.
-  // Fabricating teeth for I-4 therefore trades a structural no-op for a
-  // false-positive / witness-collision — strictly worse. I-4 stays a clean
-  // backstop; its `capabilityTags` keep the enter-exit-order CLASS visible in the
-  // Step-9 coverage map (the real coverage is the engine's own ordering tests).
-  // The A3 remediation gives REAL cross-frame teeth to I-5 (parallel-join miss)
-  // and a live e2e bound to I-9 (queue-depth) — the two dead oracles that COULD be
-  // soundly revived.
-  checkStep(): Violation | null {
+  checkFinal(_state, ctx): Violation | null {
+    const stream = ctx.lifecycle
+    if (stream === undefined || stream.length === 0) {
+      return null
+    }
+    // ONE linear pass over the seq-ordered stream, carrying the current
+    // (microstep, owner) window. Enter/exit hooks run INSIDE their microstep and
+    // microsteps are run-to-completion serialized, so the relevant records arrive
+    // window-contiguous. If they ever did not, the window would merely SPLIT — a
+    // conservative outcome that can drop a comparison but never invent one.
+    let windowKind: 'enter' | 'exit' | null = null
+    let windowStep = -1
+    let windowOwner: object | null = null
+    /** `state` paths seen so far in the current window, in begin order. */
+    let seen: string[] = []
+
+    const inversionIn = (kind: 'enter' | 'exit', earlier: string, later: string): boolean =>
+      kind === 'enter'
+        ? // a DESCENDANT was entered before its ANCESTOR
+          isStrictDescendant(earlier, later)
+        : // an ANCESTOR exited before its DESCENDANT
+          isStrictDescendant(later, earlier)
+
+    for (const rec of stream) {
+      if (rec.edge !== 'begin') {
+        continue
+      }
+      if (rec.kind !== 'enter' && rec.kind !== 'exit') {
+        continue // guard selectors + invoke arming steps are not orderable here
+      }
+      if (rec.microstep === 0) {
+        continue // reserved construction / reset / resumeTimers id
+      }
+      if (rec.kind !== windowKind || rec.microstep !== windowStep || rec.owner !== windowOwner) {
+        windowKind = rec.kind
+        windowStep = rec.microstep
+        windowOwner = rec.owner
+        seen = []
+      }
+      for (const earlier of seen) {
+        if (inversionIn(rec.kind, earlier, rec.state)) {
+          const order = rec.kind === 'enter' ? 'ancestor before descendant' : 'descendant before ancestor'
+          return makeViolation({
+            invariantId: 'I-4',
+            // A lifecycle window has no TRACE step (the callback timeline is a
+            // per-microstep structure with no 1:1 frame mapping), so the final-scope
+            // sentinel is used and the microstep is carried in the witness/message.
+            step: Number.MAX_SAFE_INTEGER,
+            witness: `${rec.kind}@${rec.microstep}:${earlier}>${rec.state}`,
+            message: `${rec.kind} hooks ran out of hierarchy order in microstep ${rec.microstep}: '${earlier}' before '${rec.state}'`,
+            observed: `${rec.kind}('${earlier}') preceded ${rec.kind}('${rec.state}')`,
+            expected: `${rec.kind} runs ${order}`,
+          })
+        }
+      }
+      seen.push(rec.state)
+    }
     return null
   },
 }
@@ -398,37 +551,64 @@ const I4: Invariant = {
  * (the PUBLIC isDone(C) :1433; isCompositeDone :1366 is private). The checker reads
  * THIS captured projection — NEVER a live `sm.isDone()` (ADR-6 c3 purity).
  *
- * Violation: a frame whose `doneDelta` marks a composite done BUT the trace never
- * recorded the corresponding `done.state.<C>` raise the config declares.
+ * TARGET class: a frame whose `doneDelta` marks a composite done BUT the declared
+ * `done.state.<C>` was never raised. I-5 remains a DOCUMENTED NO-OP: post-W8 the
+ * `doneDelta` half of the observation plane is real on the verdict path, but the
+ * RAISE itself is still not soundly observable. See the body comment for exactly
+ * which blocker closed, which residual remains, and why fabricating teeth for it
+ * would false-positive on a correct machine.
  */
 const I5: Invariant = {
   id: 'I-5',
   scope: 'step',
   capabilityTags: ['composite.parallel-join', 'composite.join.done-state'],
-  // A3 — HONEST accounting (documented no-op backstop, NOT a fabricated oracle).
-  // The real parallel-join miss — "a composite joined but its declared
-  // `done.state.<C>` was never raised" — is NOT soundly observable from the
-  // current trace plane, for TWO independent reasons a static-analysis pass
-  // confirmed:
-  //   (1) INTERNAL-RAISE INVISIBILITY: the engine raises `done.state.<C>` on the
-  //       INTERNAL queue (state_machine.ts edge-triggered join), but a trace
-  //       frame's `event` is populated ONLY from the step's EXTERNAL op
-  //       (driver.ts:491/:507) — an internally-raised join event NEVER appears as
-  //       `frame.event`. So a checker keying on "done.state.<C> absent from the
-  //       trace" cannot distinguish "the engine never raised it" from "it was
-  //       raised, its guard was false, and the composite stayed all-final" — the
-  //       latter is a CORRECT machine, so the check would FALSE-POSITIVE (the
-  //       worst class of oracle error).
-  //   (2) doneDelta ABSENT ON THE VERDICT PATH: `doneDelta` is injected only by
-  //       the COVERAGE path (coverage.ts:injectDoneDeltas), which never runs the
-  //       safety sweep; the Simulator/`runSafety` verdict path produces frames
-  //       WITHOUT doneDelta, so any doneDelta-keyed check is a no-op e2e anyway.
-  // Sound teeth require enriching the observation plane (tag internal join events
-  // on the frame + sample isDone on the verdict path) — a driver/seam change, not
-  // a checker change. Until then I-5 stays a clean backstop (its capability tags
-  // keep the parallel-join CLASS visible in the Step-9 coverage map; the converse
-  // done-event gating IS enforced by I-12). Tracked for observation-plane
-  // enrichment as follow-up.
+  // ── W8/V5b RE-ASSESSMENT: still an HONEST no-op, with ONE of the two original
+  // blockers now genuinely CLOSED and the other NARROWED but NOT closed.
+  //
+  // CLOSED — (2) "doneDelta absent on the verdict path". The driver now samples
+  // `isDone(C)` per declared composite at EVERY settle boundary and stamps
+  // {@link TraceFrame.doneDelta} on the boundary frame, on the Simulator/runSafety
+  // path, not only in coverage.ts. `doneDelta` is real e2e data now (it also makes
+  // the liveness `terminal` derivation honest for the first time). This is why the
+  // trace-schema `header.version` moved '3' -> '4'.
+  //
+  // STILL OPEN — (1) INTERNAL-RAISE INVISIBILITY, narrowed to its residual. W8/V5a
+  // added the {@link TransitionContext} to the SUCCESS `recordTransition` call, so
+  // the observation plane can now attribute an internally-raised cause to the state
+  // write it produced. Combined with the two refusal sites the engine already
+  // reported, a raised `done.state.<C>` is observable when it
+  //   - COMMITTED a transition        (success + context.eventName), or
+  //   - was GUARD-REJECTED            (recordTransition(0,false,{eventName})), or
+  //   - ABORTED mid-microstep         (same refusal site).
+  // That is EXACTLY the distinction W5b's shipped false-positive lacked ("raise
+  // happened, guard said false, composite stayed all-final" is now distinguishable
+  // from "no raise"). It is NOT sufficient, because a THIRD case remains
+  // indistinguishable from "no raise": the event was raised and matched NO
+  // candidate transition at all. `selectTransition` records NOTHING when
+  // `rejected.length === 0` — no commit, no refusal, no guard record on the
+  // lifecycle channel (guards only run on candidates that already matched a
+  // `from` selector). A correct machine whose declared `done.state.<C>` has no
+  // enabled transition in the reached configuration is therefore identical, from
+  // outside, to a machine that failed to raise it.
+  //
+  // Closing THAT residual requires the oracle to decide "was a transition for
+  // `done.state.<C>` enabled in this configuration?" — i.e. to REPLICATE the
+  // engine's selection semantics (wildcard and ancestor `from` selectors,
+  // multi-source `'a|b'` lists, LCA/conflict resolution, documentIndex priority).
+  // A checker that re-implements selection is the fabricated-oracle trap: every
+  // divergence from the engine is a FALSE POSITIVE on a CORRECT machine, and this
+  // exact invariant already shipped one. It would also have to enumerate the
+  // engine's legitimate NON-raise paths exhaustively (the join is EDGE-triggered,
+  // so an initial configuration that is already all-final never raises, and
+  // `restoreState` deliberately does not re-fire the join — persistence.test.ts).
+  // Missing any one of them is another false positive.
+  //
+  // So I-5 stays a CLEAN backstop rather than shipping teeth that can fire on a
+  // correct machine. Its capability tags keep the parallel-join CLASS visible in
+  // the Step-9 coverage map, and the CONVERSE direction ("a done event fired that
+  // was not declared / fell through a wildcard") IS enforced with real teeth by
+  // I-12. Sound teeth here need an ENGINE-side signal that the raise happened
+  // (e.g. a lifecycle `kind:'raise'` edge), not another checker rewrite.
   checkStep(): Violation | null {
     return null
   },

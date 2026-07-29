@@ -67,7 +67,7 @@ import { type DriverOp, SimDriver } from './driver'
 import { settleMacrostep } from './settle'
 import { SimErrorHandler } from './sim-error-handler'
 import { SimMonitor } from './sim-monitor'
-import { type CanonicalHeader, type CanonicalTrace, type TraceFrame, hashTrace } from './trace'
+import { type CanonicalHeader, type CanonicalTrace, type TraceFrame, hashTrace, normalizeParts } from './trace'
 
 // ============================================================================
 // SimEnv — the FIVE deterministic seams + random/now. logger is FIRST-CLASS and
@@ -106,6 +106,80 @@ export type SimTarget<T extends object = object> =
 export type SimSetup<T extends object = object> = (env: SimEnv) => SimTarget<T> | Promise<SimTarget<T>>
 
 // ============================================================================
+// Event payload (W8) — the object-payload substrate for fuzzing.
+// ============================================================================
+
+/**
+ * The deterministic RNG a {@link SimEventPayload} generator draws from. Minimal
+ * by design; structurally compatible with the {@link Prng} number facade and with
+ * `check-machine.ts`'s public `Rng`.
+ *
+ * @unstable
+ */
+export interface SimPayloadRng {
+  /** A float in [0,1). */
+  float(): number
+  /** An int in [0,max). */
+  int(max: number): number
+  /** Pick one element (throws on an empty array). */
+  pick<A>(xs: readonly A[]): A
+}
+
+/**
+ * What a payload generator SEES when it is asked for the next fire's arguments:
+ * the SETTLED configuration reached before this step's op is chosen, plus the
+ * live owner data. Without this the fuzzer is blind to state and can only emit
+ * state-independent payloads (a verdict object is meaningful only relative to the
+ * gate it is answering).
+ *
+ * @unstable
+ */
+export interface SimPayloadSnapshot {
+  /** normalized '|'-sorted active configuration. */
+  readonly config: string
+  /** the active leaf/state string as the engine reports it. */
+  readonly state: string
+  /** the live owner data (read-only view); `{}` when the owner is not unwrappable. */
+  readonly data: Readonly<object>
+  readonly queueDepth: number
+}
+
+/**
+ * Generate the arguments for the NEXT `fire` op. Called ONCE per fire opportunity,
+ * AFTER the event has been picked, with a snapshot of the pre-fire settled state.
+ *
+ * **PRNG neutrality (mandatory contract).** The generator is handed a FORKED
+ * child stream, never the driving PRNG: `Prng.fork(label)` derives the child from
+ * `state()` WITHOUT advancing the parent (prng.ts), so however many draws a
+ * payload generator makes, the op-selection stream is bit-for-bit unchanged. The
+ * fork itself is created LAZILY on first use, so a run with NO `eventPayload`
+ * performs ZERO extra PRNG work and reproduces the pre-W8 corpus byte-identically.
+ *
+ * Return `[]` for an event that takes no arguments.
+ *
+ * @unstable
+ */
+export type SimEventPayload = (
+  event: string,
+  rng: SimPayloadRng,
+  snapshot: SimPayloadSnapshot,
+) => readonly unknown[]
+
+/**
+ * Narrow the internal {@link Prng} to the minimal {@link SimPayloadRng} facade a
+ * payload generator sees. Renames `nextFloat` → `float`; `int`/`pick` pass
+ * through unchanged, so every draw goes through the SAME frozen splitmix64
+ * primitives the rest of the sim uses (no second RNG implementation).
+ */
+function payloadRngOf(prng: Prng): SimPayloadRng {
+  return {
+    float: () => prng.nextFloat(),
+    int: (max: number) => prng.int(max),
+    pick: <A,>(xs: readonly A[]): A => prng.pick(xs),
+  }
+}
+
+// ============================================================================
 // SimOptions — seed is bigint|string (ADR-2 #4; bigint not JSON-able => string
 // wire form). Optional fields use bare `?` under exactOptionalPropertyTypes:true.
 // ============================================================================
@@ -128,6 +202,12 @@ export interface SimOptions {
    * vacuous (the engine default 1000 applies but no oracle bound is asserted).
    */
   readonly maxQueueDepth?: number
+  /**
+   * W8 object-payload substrate: generate the arguments for each fuzzed `fire`.
+   * ABSENT (the default) ⇒ every fire is arg-free AND no PRNG draw is made for
+   * payload, so the generated corpus stays byte-identical to pre-W8.
+   */
+  readonly eventPayload?: SimEventPayload
   readonly onTrace?: (frame: TraceFrame) => void
 }
 
@@ -167,7 +247,7 @@ export type SimViolation = Violation & { readonly kind?: 'engine' | 'liveness' }
 // ============================================================================
 /** @unstable */
 export interface SimWarning {
-  readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles'
+  readonly kind: 'timer-escape' | 'unhandled-rejection' | 'no-oracles' | 'lifecycle-truncated'
   readonly message: string
   readonly count?: number
 }
@@ -213,22 +293,32 @@ export interface SimResult {
  * legitimate machine — it can never false-positive on a correct run. The always-on
  * engine-error channel (A1) supplements this set.
  *
- * W5b membership decisions:
- *  - I-9 is INCLUDED: after the A3 fix it only fires on a QUIESCENT boundary whose
- *    combined queue exceeds an explicitly-configured `maxQueueDepth`, and it is
- *    VACUOUS when no bound is set (the default path sets none) — sound and inert.
- *  - I-3 is still EXCLUDED: the C1 + U1 fixes now make BOTH WAITING_ON_TIMER and
- *    (precise, inFlight>0) WAITING_ON_TRANSITION_TIMEOUT sound exclusions, so I-3 no
- *    longer false-positives on a legitimate function-async in-flight boundary. It
- *    stays opt-in because of the ISS-030 residual: `inFlightAsyncCount` does NOT
- *    track STRING-METHOD invoke actions, so a correct machine awaiting one surfaces
- *    as WAITING_ON_INTERNAL (which I-3 flags) → a reachable false-positive in the
- *    DEFAULT path. Until string-method actions are tracked, I-3 is explicit-only.
- *  - I-5 is EXCLUDED: it is a documented no-op (its class is not soundly observable
- *    from the current trace plane), so including it would add nothing.
+ * Membership decisions:
+ *  - I-9 is INCLUDED (W5b): after the A3 fix it only fires on a QUIESCENT boundary
+ *    whose combined queue exceeds an explicitly-configured `maxQueueDepth`, and it
+ *    is VACUOUS when no bound is set (the default path sets none) — sound and inert.
+ *  - I-3 is now INCLUDED (W8/V8) — ISS-030 CLOSED. C1 + U1 had already made
+ *    WAITING_ON_TIMER and (precise, inFlight>0) WAITING_ON_TRANSITION_TIMEOUT sound
+ *    exclusions; the one reachable false-positive left was ISS-030: a STRING-METHOD
+ *    invoke action is resolved INSIDE `callAction`, past the config-layer wrap
+ *    boundary, so `bracketAsync` could not see it and a correct machine awaiting one
+ *    settled as `pending ∧ inFlight===0` → WAITING_ON_INTERNAL → I-3 fires on a
+ *    CORRECT machine. The W8/V1b lifecycle channel wraps the CALL instead of the
+ *    action VALUE, so `invoke.action` begin/end pairs cover the string-method form
+ *    identically; driver.ts composes that count into `Env.inFlightAsyncCount`, and
+ *    such a boundary is now classified WAITING_ON_TRANSITION_TIMEOUT (excluded) or
+ *    reaches true quiescence. Guarded by the §4а.2 zero-false-positive corpus, which
+ *    carries string-method-invoke and composite-join machines specifically for this.
+ *  - I-4 is INCLUDED (W8/V3a): it reads the CAPTURED lifecycle stream and fires only
+ *    on a genuine in-microstep ancestor/descendant inversion. It is VACUOUS when no
+ *    lifecycle plane is present, so it cannot fabricate a violation.
+ *  - I-5 is EXCLUDED: it remains a documented no-op (the `done.state.<C>` RAISE is
+ *    still not soundly observable — see invariants.ts), so including it adds nothing.
  */
 const DEFAULT_BUILTIN_INVARIANT_IDS: ReadonlySet<string> = new Set([
   'I-2',
+  'I-3',
+  'I-4',
   'I-6',
   'I-7',
   'I-9',
@@ -380,9 +470,10 @@ function emptyHeader(seed: string): CanonicalHeader {
     seed,
     configHash: '',
     engine: '@vedmalex/statemachine',
-    // '3': kept in lockstep with the driver's canonical header (C1 settleReason +
-    // U1 WAITING_ON_INTERNAL re-semantization).
-    version: '3',
+    // '4': kept in lockstep with the driver's canonical header (C1 settleReason +
+    // U1 WAITING_ON_INTERNAL re-semantization + W8/V5b doneDelta now populated on
+    // the verdict path). See driver.ts for the full version rationale.
+    version: '4',
     runtime: 'node-sim-v1',
     prngVersion: 'splitmix64-bigint-v1',
     errorHandlerEnabled: true,
@@ -448,6 +539,20 @@ export class Simulator<T extends object = object> {
    * the SAME bound). Absent ⇒ I-9 vacuous (A3).
    */
   private readonly maxQueueDepth: number | undefined
+  /**
+   * W8: the consumer-supplied payload generator (opts.eventPayload). Absent ⇒ the
+   * arg-free pre-W8 behavior AND zero payload PRNG work.
+   */
+  private readonly eventPayload: SimEventPayload | undefined
+  /**
+   * The FORKED payload RNG facade. Created LAZILY on the first payload draw so a
+   * run without `eventPayload` never touches it. `fork` reads `state()` WITHOUT
+   * advancing the parent (prng.ts), so even creating it cannot perturb the
+   * op-selection stream.
+   */
+  private payloadRng?: SimPayloadRng
+  /** The resolved owner adapter, kept so a payload snapshot can read live data. */
+  private ownerAdapter?: Adapter<T>
 
   private driver?: SimDriver<T>
   private machine?: StateMachine<T, StateMachineConfig<T>>
@@ -493,6 +598,8 @@ export class Simulator<T extends object = object> {
     // CheckerContext (I-9 reads the SAME bound) so a flood past the bound is caught,
     // not silently accepted. Absent ⇒ I-9 stays vacuous (documented, not fake).
     this.maxQueueDepth = opts.maxQueueDepth
+    // W8: absent ⇒ arg-free fuzzing, and `pickOp` makes ZERO extra PRNG draws.
+    this.eventPayload = opts.eventPayload
     if (opts.onTrace) {
       this.onTrace = opts.onTrace
     }
@@ -513,6 +620,8 @@ export class Simulator<T extends object = object> {
     }
     const target = await this.setup(this._env)
     const resolved = this.resolveTarget(target)
+    // Kept for the W8 payload snapshot (live owner data). Read-only use.
+    this.ownerAdapter = resolved.owner
 
     // Build the Step-3 driver over the resolved {config, owner}. The driver
     // forwards all five seams (it never omits scheduler) — the DI-first
@@ -554,6 +663,11 @@ export class Simulator<T extends object = object> {
         header: driver.trace().header,
         // A3 (I-9): give the queue-depth oracle the SAME bound the engine enforces.
         ...(this.maxQueueDepth !== undefined ? { maxQueueDepth: this.maxQueueDepth } : {}),
+        // W8/V3a: the CAPTURED lifecycle observation stream, handed to the checkers
+        // BY REFERENCE so this once-built context observes the run as it grows. It
+        // is not a live engine read — the monitor seam recorded these during the
+        // drain, exactly like the doneDelta projection.
+        lifecycle: (this._env.monitor as SimMonitor).getLifecycle(),
       }
     }
 
@@ -696,6 +810,17 @@ export class Simulator<T extends object = object> {
 
     // ── A5: real-timer escape warning + residual-rejection observability.
     const warnings: SimWarning[] = []
+    // W8 (critic A-2): the lifecycle buffer is bounded, and I-4 keys its ordering
+    // predicate on that stream — a truncated prefix is a FALSE-NEGATIVE window for
+    // the oracle. Silence would make the run look more verified than it is, so the
+    // truncation is surfaced rather than left to an unread accessor.
+    if ((this._env.monitor as SimMonitor).isLifecycleTruncated?.()) {
+      warnings.push({
+        kind: 'lifecycle-truncated',
+        message:
+          'the lifecycle observation buffer was truncated: the ordering oracle (I-4) saw only a PREFIX of the callback stream, so a late ordering violation could have been missed',
+      })
+    }
     if (guardReport.timerEscapes > 0) {
       warnings.push({
         kind: 'timer-escape',
@@ -748,6 +873,13 @@ export class Simulator<T extends object = object> {
   /**
    * Serializable mid-run checkpoint. Engine state via `toJSON()` (NOT
    * toSecureJSON), the PRNG state, the logical clock. NEVER hashed.
+   *
+   * KNOWN GAP (W8, latent until restore lands): the checkpoint captures the
+   * DRIVING prng state but NOT the lazily-forked `event-payload` child stream. No
+   * public `restore` exists yet, so nothing breaks today — but a restore
+   * implementation must also carry the payload child's state, otherwise a
+   * payload-heavy run resumed from a snapshot re-forks from the restored parent
+   * and diverges from the uninterrupted run.
    */
   snapshot(): SimSnapshot {
     if (!this.machine) {
@@ -823,9 +955,19 @@ export class Simulator<T extends object = object> {
 
   /**
    * Pick the next op (ISS-040 deterministic driving). Probes the available-event
-   * set; PRNG-picks one to fire, else a noop. Args are an empty list (a number
-   * fails isAdapter, so the :469-471 arg-misparse hazard cannot arise; here the
-   * list is empty so no positional Adapter ambiguity is possible at all).
+   * set; PRNG-picks one to fire, else a noop.
+   *
+   * W8 payload: when (and ONLY when) `opts.eventPayload` is supplied, the picked
+   * event's arguments are drawn from it. The generator sees the pre-fire settled
+   * snapshot and draws from a FORKED child PRNG, so the op-selection stream is
+   * untouched no matter how many draws it makes. With no `eventPayload` the args
+   * stay `[]` and NOT ONE extra PRNG draw happens — the pre-W8 generated corpus
+   * replays byte-identically.
+   *
+   * The arg list is never positionally ambiguous with an Adapter: the driver
+   * always passes the wrapped Adapter EXPLICITLY as the 2nd positional arg, so
+   * payload values start at position 3 and the `:469-471` unshift branch is
+   * unreachable (driver.ts module doc).
    */
   private pickOp(): DriverOp {
     const sm = this.machine
@@ -838,13 +980,69 @@ export class Simulator<T extends object = object> {
     } catch {
       available = []
     }
+    // `done.state.<C>` is ENGINE-RAISED (edge-triggered on an all-final join). The
+    // engine does not special-case it in `canFireEvent`, so it shows up in the
+    // available set and used to be drawn like any other event — letting the fuzzer
+    // force a join the real system could never reach at that moment, and thereby
+    // FALSELY breaking a consumer invariant that legitimately assumes "join only
+    // after every region completed". Excluding it costs no coverage: the internal
+    // raise path exercises the join for real, and I-12 still audits declaration.
+    available = available.filter((e) => !e.startsWith('done.state.'))
     if (available.length === 0) {
       return { kind: 'noop', opId: `sim-op-${this.stepCount}` }
     }
     const event = this.prng.pick(available)
+    const args = this.drawPayload(event)
     // Stable per-step op-id so the driver can resolve a per-op channel fault keyed
     // by `opId` (a plan may target `sim-op-<n>`). R22 stable op-id addressing.
-    return { kind: 'fire', event, args: [], opId: `sim-op-${this.stepCount}` }
+    return { kind: 'fire', event, args, opId: `sim-op-${this.stepCount}` }
+  }
+
+  /**
+   * Draw the payload for `event`, or `[]` when no generator is wired.
+   *
+   * PRNG neutrality is structural, not incidental: the early return happens
+   * BEFORE any PRNG interaction, and the child stream is obtained via
+   * {@link Prng.fork}, which derives from `state()` without advancing the parent.
+   * A generator that throws is NOT swallowed — a broken payload generator is a
+   * consumer bug that must surface loudly, never as silently arg-free fuzzing
+   * (which would look like passing coverage).
+   */
+  private drawPayload(event: string): readonly unknown[] {
+    const gen = this.eventPayload
+    if (gen === undefined) {
+      return []
+    }
+    if (this.payloadRng === undefined) {
+      // `fork` derives the child from `state()` WITHOUT advancing the parent
+      // (prng.ts), so creating this stream cannot shift op selection.
+      this.payloadRng = payloadRngOf(this.prng.fork('event-payload'))
+    }
+    return gen(event, this.payloadRng, this.payloadSnapshot())
+  }
+
+  /** The pre-fire settled snapshot handed to a {@link SimEventPayload}. */
+  private payloadSnapshot(): SimPayloadSnapshot {
+    const sm = this.machine
+    let state = ''
+    try {
+      state = sm?.getCurrentState() ?? ''
+    } catch {
+      state = ''
+    }
+    let queueDepth = 0
+    try {
+      const q = sm?.getQueueDepth()
+      queueDepth = q ? q.internal + q.external : 0
+    } catch {
+      queueDepth = 0
+    }
+    // The owner data behind the adapter (MemoryAdapter exposes `adaptee`,
+    // types.ts:561); a consumer adapter without one yields `{}` rather than a
+    // throw — the generator can still see config/state/queueDepth.
+    const maybe = this.ownerAdapter as unknown as { adaptee?: object } | undefined
+    const data: Readonly<object> = maybe?.adaptee ?? {}
+    return { config: normalizeParts(state), state, data, queueDepth }
   }
 
   /**

@@ -15,6 +15,7 @@ import {
   type CheckerContext,
   INVARIANTS,
   type Invariant,
+  type LifecycleObservation,
   buildConfigGraph,
   finalStateOf,
   makeViolation,
@@ -32,6 +33,14 @@ interface Box {
   log: number[]
   k: number
 }
+
+/**
+ * Two distinct owner sentinels for the W8/V3a lifecycle fixtures. `owner` is a
+ * REFERENCE-identity discriminator (one machine can drive many objects), so the
+ * fixtures need two objects that are never `===`.
+ */
+const OWNER_A: object = { owner: 'A' }
+const OWNER_B: object = { owner: 'B' }
 
 /** A canonical header for synthetic-trace tests. */
 const HEADER: CanonicalHeader = {
@@ -662,12 +671,134 @@ describe('checker purity grep + config-graph (DoD 9)', () => {
 // ── I-4 / I-5 clean-path coverage (the order + join invariants do not false-fire) ─
 
 describe('I-4 / I-5 do not false-fire on well-formed composites', () => {
-  it('I-4 stays clean for distinct-region parts and for a shared-region (deferred to I-6)', () => {
-    const cfg = { states: { root: { regions: { rA: { l1: {} }, rB: { l2: {} } } } }, events: {} }
-    // distinct region keys → clean.
-    const distinct: CanonicalTrace = { header: HEADER, frames: [frame({ step: 1, to: 'root.rA.l1|root.rB.l2' })] }
-    const inv4 = INVARIANTS.find((i) => i.id === 'I-4') as Invariant
-    expect(inv4.checkStep?.(distinct.frames[0]!, ctxFor(cfg, 8))).toBeNull()
+  // ── W8/V3a — I-4 moved from a documented no-op to LIFECYCLE-KEYED teeth. It no
+  // longer inspects the content-only frame at all (the callback ORDER is simply
+  // not in it); it reads the captured `IMonitor.recordLifecycle` stream on the
+  // CheckerContext. These cases pin the FALSE-POSITIVE frontier — the shapes a
+  // naive ancestor/depth check would wrongly flag.
+  const inv4 = (): Invariant => INVARIANTS.find((i) => i.id === 'I-4') as Invariant
+  const FINAL = { config: 'a', queue: { internal: 0, external: 0 }, quiescent: true }
+  const life = (
+    over: Partial<LifecycleObservation> & { state: string; microstep: number },
+  ): LifecycleObservation => ({ kind: 'enter', hook: 'onEnter', owner: OWNER_A, seq: 0, edge: 'begin', ...over })
+  const withLifecycle = (cfg: unknown, lifecycle: readonly LifecycleObservation[]): CheckerContext => ({
+    ...ctxFor(cfg, 8),
+    lifecycle,
+  })
+  const CFG_NESTED = { states: { root: { regions: { rA: { l1: {} }, rB: { l2: {} } } } }, events: {} }
+
+  it('I-4 exposes no checkStep: the content-only frame carries no callback order to check', () => {
+    // Guards the SOUNDNESS boundary: a frame-shaped I-4 check would have to infer
+    // hook order from leaf snapshots, which is exactly the false-positive the old
+    // documented-no-op comment refused to ship.
+    expect(inv4().checkStep).toBeUndefined()
+    expect(inv4().scope).toBe('final')
+  })
+
+  it('I-4 is VACUOUS without a lifecycle plane (a missing observation never fabricates a violation)', () => {
+    expect(inv4().checkFinal?.(FINAL, ctxFor(CFG_NESTED, 8))).toBeNull()
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, []))).toBeNull()
+  })
+
+  it('I-4 stays clean on a correct W3C order: enter ancestor→descendant, exit descendant→ancestor', () => {
+    const stream: LifecycleObservation[] = [
+      life({ state: 'root', microstep: 1, seq: 0 }),
+      life({ state: 'root.rA.l1', microstep: 1, seq: 1 }),
+      life({ state: 'root.rB.l2', microstep: 1, seq: 2 }),
+      life({ kind: 'exit', hook: 'onExit', state: 'root.rA.l1', microstep: 2, seq: 3 }),
+      life({ kind: 'exit', hook: 'onExit', state: 'root', microstep: 2, seq: 4 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
+  })
+
+  it('I-4 stays clean on SIBLING branches in any order (the depth-number trap)', () => {
+    // `root.rA.l1` (depth 2) entered BEFORE `root.rB` (depth 1). A depth-comparison
+    // predicate would flag this; the ancestor relation correctly does not, because
+    // neither state contains the other. Parallel-region entry order is document
+    // order and is free to interleave.
+    const stream: LifecycleObservation[] = [
+      life({ state: 'root', microstep: 3, seq: 0 }),
+      life({ state: 'root.rA.l1', microstep: 3, seq: 1 }),
+      life({ state: 'root.rB', microstep: 3, seq: 2 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
+  })
+
+  it('I-4 stays clean when an inversion spans DIFFERENT microsteps or DIFFERENT owners', () => {
+    // Two independent microsteps: entering a descendant in one and its ancestor in
+    // a later one is an ordinary drill-down, not an in-microstep order break.
+    const crossStep: LifecycleObservation[] = [
+      life({ state: 'root.rA.l1', microstep: 4, seq: 0 }),
+      life({ state: 'root', microstep: 5, seq: 1 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, crossStep))).toBeNull()
+    // Same microstep, two DIFFERENT owners: two independent hierarchies whose
+    // timelines interleave — never comparable against each other.
+    const crossOwner: LifecycleObservation[] = [
+      life({ state: 'root.rA.l1', microstep: 6, seq: 0, owner: OWNER_A }),
+      life({ state: 'root', microstep: 6, seq: 1, owner: OWNER_B }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, crossOwner))).toBeNull()
+  })
+
+  it('I-4 ignores guard records (their `state` is a SELECTOR, not a path) and invoke records', () => {
+    // 'root.rA.*' would dot-parse as a descendant of 'root' — treating a selector
+    // as a path is precisely how a naive checker invents ancestry.
+    const stream: LifecycleObservation[] = [
+      life({ kind: 'guard', hook: 'guard', state: 'root.rA.*', microstep: 7, seq: 0, transition: 'root.rA.* -> x' }),
+      life({ kind: 'guard', hook: 'guard', state: 'root', microstep: 7, seq: 1, transition: 'root -> y' }),
+      life({ kind: 'invoke', hook: 'invoke.action', state: 'root.rA.l1', microstep: 8, seq: 2 }),
+      life({ kind: 'invoke', hook: 'invoke.action', state: 'root', microstep: 8, seq: 3 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
+  })
+
+  it('I-4 ignores microstep 0 (construction / reset / resumeTimers share that reserved id)', () => {
+    const stream: LifecycleObservation[] = [
+      life({ state: 'root.rA.l1', microstep: 0, seq: 0 }),
+      life({ state: 'root', microstep: 0, seq: 1 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
+  })
+
+  it('I-4 ignores `end` edges: only `begin` defines invocation order', () => {
+    // `end` order is SETTLE order. Ordering on it would flag a correct machine
+    // whose ancestor onEnter simply resolves after its descendant's.
+    const stream: LifecycleObservation[] = [
+      life({ state: 'root', microstep: 9, seq: 0, edge: 'begin' }),
+      life({ state: 'root.rA.l1', microstep: 9, seq: 1, edge: 'begin' }),
+      life({ state: 'root.rA.l1', microstep: 9, seq: 2, edge: 'end' }),
+      life({ state: 'root', microstep: 9, seq: 3, edge: 'end' }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
+  })
+
+  it('I-4 FIRES on a descendant entered before its ancestor in ONE microstep', () => {
+    const stream: LifecycleObservation[] = [
+      life({ state: 'root.rA.l1', microstep: 11, seq: 0 }),
+      life({ state: 'root', microstep: 11, seq: 1 }),
+    ]
+    const v = inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))
+    expect(v?.invariantId).toBe('I-4')
+    expect(v?.witness).toBe('enter@11:root.rA.l1>root')
+  })
+
+  it('I-4 FIRES on an ancestor exited before its descendant in ONE microstep', () => {
+    const stream: LifecycleObservation[] = [
+      life({ kind: 'exit', hook: 'onExit', state: 'root', microstep: 12, seq: 0 }),
+      life({ kind: 'exit', hook: 'onExit', state: 'root.rA.l1', microstep: 12, seq: 1 }),
+    ]
+    const v = inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))
+    expect(v?.invariantId).toBe('I-4')
+    expect(v?.witness).toBe('exit@12:root>root.rA.l1')
+  })
+
+  it('I-4 does not confuse a NAME PREFIX with an ancestor (root vs rootish)', () => {
+    const stream: LifecycleObservation[] = [
+      life({ state: 'rootish', microstep: 13, seq: 0 }),
+      life({ state: 'root', microstep: 13, seq: 1 }),
+    ]
+    expect(inv4().checkFinal?.(FINAL, withLifecycle(CFG_NESTED, stream))).toBeNull()
   })
 
   it('I-5 stays clean when a declared-done composite is observed done via doneDelta', () => {

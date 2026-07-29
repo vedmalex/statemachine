@@ -89,6 +89,56 @@ describe('sim/define recreateLiteral — trusted-compile / untrusted-boundary co
     )
   })
 
+  it('(b) recreateLiteral guard throws on a non-function-shaped numeric-literal source', () => {
+    const topology = minimalTopology('42')
+    expect(() => toEngineConfig<Owner>(topology)).toThrow(
+      /recreateLiteral: refusing to compile a non-function \/ empty source/,
+    )
+  })
+
+  it('(b) recreateLiteral guard throws on a non-function-shaped call-expression source', () => {
+    const topology = minimalTopology('alert(1)')
+    expect(() => toEngineConfig<Owner>(topology)).toThrow(
+      /recreateLiteral: refusing to compile a non-function \/ empty source/,
+    )
+  })
+
+  it('(a) W8 V6a: trusted define/toEngineConfig compiles a parenthesis-wrapped function literal', () => {
+    const topology = minimalTopology('(function(o){ o.k = (o.k ?? 0) + 1; return o.k; })')
+    const config = toEngineConfig<Owner>(topology)
+    const onEnter = (config.states as any).a.onEnter as (o: Owner) => unknown
+
+    expect(typeof onEnter).toBe('function')
+    const owner: Owner = { state: 'a', k: 0 }
+    const result = onEnter(owner)
+    expect(owner.k).toBe(1)
+    expect(result).toBe(1)
+  })
+
+  it('(a) W8 V6a: trusted define/toEngineConfig compiles a function literal with a leading block comment', () => {
+    const topology = minimalTopology('/* comment */ function(o){ o.k = (o.k ?? 0) + 1; return o.k; }')
+    const config = toEngineConfig<Owner>(topology)
+    const onEnter = (config.states as any).a.onEnter as (o: Owner) => unknown
+
+    expect(typeof onEnter).toBe('function')
+    const owner: Owner = { state: 'a', k: 0 }
+    const result = onEnter(owner)
+    expect(owner.k).toBe(1)
+    expect(result).toBe(1)
+  })
+
+  it('(a) W8 V6a: trusted define/toEngineConfig compiles a function literal with a leading line comment', () => {
+    const topology = minimalTopology('// comment\nfunction(o){ o.k = (o.k ?? 0) + 1; return o.k; }')
+    const config = toEngineConfig<Owner>(topology)
+    const onEnter = (config.states as any).a.onEnter as (o: Owner) => unknown
+
+    expect(typeof onEnter).toBe('function')
+    const owner: Owner = { state: 'a', k: 0 }
+    const result = onEnter(owner)
+    expect(owner.k).toBe(1)
+    expect(result).toBe(1)
+  })
+
   it('(c) the UNTRUSTED fromJSON path does not compile a source-carrying payload at all', async () => {
     const MARKER = '__w7_u2_boundary_marker__'
     delete (globalThis as any)[MARKER]

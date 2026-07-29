@@ -32,6 +32,15 @@
  *   • test505/506 — entry order: предки входят раньше потомков (document order).
  *   • test405/406 — порядок исполняемого контента в микрошаге:
  *     onExit → контент перехода (onTransition) → onEnter.
+ *   • W8/V3b + W8/V11 — SIBLING-ось: порядок enter/exit ОДНОУРОВНЕВЫХ состояний в
+ *     РАЗНЫХ параллельных регионах, и форма обхода при ВЛОЖЕННЫХ композитах.
+ *     ИЗМЕРЕНО через публичный канал `IMonitor.recordLifecycle` (W8/V1). V3b нашёл
+ *     на этой оси ДВЕ дивергенции (D1 — sibling-порядок на выходе был прямым вместо
+ *     обратного; D2 — обход был depth-major вместо DFS-preorder) и ЗАПИННИЛ их.
+ *     W8/V11 ПОЧИНИЛ обе в ядре (одна сортировка по `documentIndex` модели), и
+ *     векторы ПЕРЕВЁРНУТЫ на W3C-ожидания. ВСЯ ось теперь ПОКРЫТА как conformance:
+ *     entry = document order (DFS preorder), exit = reverse document order.
+ *     ДИВЕРГЕНЦИЙ НА ЭТОЙ ОСИ БОЛЬШЕ НЕТ — см. футер файла.
  *
  * НАМЕРЕННО НЕ ПРИМЕНИМО (легитимное расхождение/расширение — НЕ пробел conformance,
  * НЕ подгоняется):
@@ -60,7 +69,7 @@
  * библиотека расширяет стандарт (`priority`), намеренно оставлены своим тестам.
  */
 import { describe, expect, it } from 'vitest'
-import { createMachine } from '../index'
+import { createMachine, type IMonitor, type LifecycleEvent } from '../index'
 
 const base = { name: 'Conformance', stateAttribute: 'state' as const }
 
@@ -406,24 +415,549 @@ describe('IRP test405/406 — microstep content order: onExit → transition →
   })
 })
 
+// ═════════════════════════════════════════════════════════════════════════════
+// W8/V3b — MEASURING the previously-UNASSERTED axis: same-depth SIBLING order
+// across parallel regions, and the traversal shape over NESTED composites.
+//
+// WHY THIS IS NOW MEASURABLE. Until W8 the ORDER of enter/exit callbacks was only
+// observable by side-effect logging inside user hooks — which cannot distinguish
+// "the engine called r1 first" from "the engine called both and my log raced".
+// W8/V1 added the PUBLIC lifecycle observability channel (`IMonitor.recordLifecycle`,
+// see `LifecycleEvent` in types.ts): the engine emits a `begin`/`end` edge for every
+// state hook it invokes, with a per-machine monotonic `seq`. Filtering `edge:'begin'`
+// yields the exact INVOCATION sequence. That is the instrument this section uses.
+//
+// The vectors below are NOT a re-run of test504/505-506 (those assert only the
+// LAYER relation — all leaves before/after the composite — order-INSENSITIVELY
+// across siblings). These assert the SEQUENCE those tests deliberately left open.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/** A monitor that records nothing but the lifecycle stream. */
+function lifecycleSink(): { events: LifecycleEvent[]; monitor: IMonitor } {
+  const events: LifecycleEvent[] = []
+  return {
+    events,
+    monitor: {
+      recordTransition() {},
+      recordError() {},
+      recordLifecycle(event) {
+        events.push(event)
+      },
+    },
+  }
+}
+
 /**
- * ── DIVERGENCE FROM W3C (found by §4в) ─────────────────────────────────────────
- * None found ON THE 8 ASSERTED VECTORS: the library's observed behaviour matches
- * the W3C SCXML §3.13 pass-criteria. Had any gone red it would have been pinned
- * here with `it.fails` + a W3C-vs-library note (never silently retargeted) for the
- * orchestrator to adjudicate bug-vs-extension.
+ * The INVOCATION sequence of the `onEnter`/`onExit` slot: `edge:'begin'` only (an
+ * `end` edge would report SETTLE order, a different question), one entry per state,
+ * in `seq` order. `onBeforeX`/`onAfterX` are filtered out — they are per-state
+ * grouped around the same slot and would only triple the noise (verified: the six
+ * hooks of one state always run as one contiguous block, see the assertion below).
+ */
+const enterExitSequence = (events: LifecycleEvent[], kind: 'enter' | 'exit'): string[] =>
+  events
+    .filter(
+      (e) =>
+        e.kind === kind &&
+        e.edge === 'begin' &&
+        e.hook === (kind === 'enter' ? 'onEnter' : 'onExit'),
+    )
+    .map((e) => e.state)
+
+const settle = () => new Promise((r) => setTimeout(r, 0))
+
+/**
+ * Build `wrap` (a composite with `regions`), enter it from `START`, then leave it
+ * to `done`; return the measured enter- and exit-invocation sequences.
+ */
+async function measureWrap(regions: Record<string, any>, initial: string) {
+  const { events, monitor } = lifecycleSink()
+  const sm = createMachine(
+    {
+      ...base,
+      initialState: 'START',
+      states: {
+        START: {},
+        wrap: { initial, onEnter: () => {}, onExit: () => {}, regions },
+        done: {},
+      },
+      events: {
+        go: { transitions: [{ from: 'START', to: 'wrap' }] },
+        fin: { transitions: [{ from: 'wrap', to: 'done' }] },
+      },
+    } as any,
+    { state: 'START' } as any,
+    { monitor } as any,
+  )
+  await settle()
+  events.length = 0
+  await sm.fireEvent('go')
+  const entered = enterExitSequence(events, 'enter')
+  const config = sm.getCurrentState()
+  events.length = 0
+  await sm.fireEvent('fin')
+  const exited = enterExitSequence(events, 'exit')
+  return { entered, exited, config, events }
+}
+
+/** A leaf with both hooks present (the channel only reports hooks that exist). */
+const leaf = () => ({ onEnter: () => {}, onExit: () => {} })
+/** A composite leaf-carrier: `<name>` holding one region `<rk>` with one leaf. */
+const nest = (rk: string, child: string) => ({
+  initial: `${rk}.${child}`,
+  onEnter: () => {},
+  onExit: () => {},
+  regions: { [rk]: { [child]: leaf() } },
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFORMANT AXIS — ENTRY sibling order across parallel regions.
+//
+// W3C SCXML §3.13 (enterStates): the entry set is entered in ENTRY ORDER =
+// document order. For two orthogonal regions r1, r2 declared in that order, the
+// leaf of r1 is entered BEFORE the leaf of r2.
+//
+// MEASURED (2 regions): ['wrap', 'wrap.r1.a', 'wrap.r2.x']
+// MEASURED (3 regions): ['wrap', 'wrap.r1.a', 'wrap.r2.x', 'wrap.r3.p']
+// VERDICT: MATCHES W3C. This axis is hereby a CONFORMANCE VECTOR, no longer
+// "unasserted". (It was unasserted only because there was no way to observe the
+// sequence; W8/V1's channel made it observable.)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('IRP test505/506 (sibling axis) — parallel ENTRY order is forward document order (W3C §3.13)', () => {
+  it('2 regions: composite first, then r1 leaf, then r2 leaf', async () => {
+    const { entered, config } = await measureWrap(
+      { r1: { a: leaf() }, r2: { x: leaf() } },
+      'r1.a|r2.x',
+    )
+    expect(config).toBe('wrap.r1.a|wrap.r2.x')
+    expect(entered).toEqual(['wrap', 'wrap.r1.a', 'wrap.r2.x'])
+  })
+
+  it('3 regions: r1, r2, r3 in declaration order', async () => {
+    const { entered } = await measureWrap(
+      { r1: { a: leaf() }, r2: { x: leaf() }, r3: { p: leaf() } },
+      'r1.a|r2.x|r3.p',
+    )
+    expect(entered).toEqual(['wrap', 'wrap.r1.a', 'wrap.r2.x', 'wrap.r3.p'])
+  })
+
+  it('the sibling order tracks the REGIONS declaration order, not the initial-string order', async () => {
+    // Same `initial` string, mirrored `regions` declaration → mirrored sequence.
+    // This is what makes "document order" a meaningful claim here: the order is a
+    // property of the CONFIG's region declaration (the library's stand-in for SCXML
+    // document order), not of how the initial configuration happens to be spelled.
+    const declaredR1First = await measureWrap(
+      { r1: { a: leaf() }, r2: { x: leaf() } },
+      'r2.x|r1.a', // initial spelled r2-first on purpose
+    )
+    expect(declaredR1First.entered).toEqual(['wrap', 'wrap.r1.a', 'wrap.r2.x'])
+
+    const declaredR2First = await measureWrap(
+      { r2: { x: leaf() }, r1: { a: leaf() } },
+      'r2.x|r1.a',
+    )
+    expect(declaredR2First.entered).toEqual(['wrap', 'wrap.r2.x', 'wrap.r1.a'])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFORMANT AXIS — EXIT sibling order and NESTED traversal shape (W8/V11).
+//
+// HISTORY (why this block reads as a repaired divergence, not a fresh vector).
+// W8/V3b MEASURED this axis for the first time (the W8/V1 `IMonitor.recordLifecycle`
+// channel made callback order observable from outside the machine) and found TWO
+// divergences from W3C §3.13. They were PINNED here as `describe('DIVERGENCE FROM
+// W3C …')`, deliberately asserting the ACTUAL (non-conformant) output so the call
+// bug-vs-extension could be made by the maintainer instead of being silently
+// papered over. The maintainer adjudicated: BUG. W8/V11 fixed the engine, and the
+// vectors below are now flipped to the W3C-NORMATIVE expectations. The historical
+// pre-V11 sequences are kept verbatim in the comments so the change is auditable
+// and so a regression back to the old shape is legible at a glance.
+//
+// ── D1 (FIXED in W8/V11): EXIT sibling order is REVERSE document order ─────────
+// W3C SCXML §3.13 (exitStates): "the states are exited in EXIT ORDER, which is the
+// REVERSE of document order". For regions declared r1, r2 the document order of the
+// leaves is (r1.a, r2.x), so the normative exit order is (r2.x, r1.a, wrap).
+//   W3C / NOW:      ['wrap.r2.x', 'wrap.r1.a', 'wrap']
+//   PRE-V11 (bug):  ['wrap.r1.a', 'wrap.r2.x', 'wrap']   ← siblings were NOT reversed
+//   3 regions —
+//   W3C / NOW:      ['wrap.r3.p', 'wrap.r2.x', 'wrap.r1.a', 'wrap']
+//   PRE-V11 (bug):  ['wrap.r1.a', 'wrap.r2.x', 'wrap.r3.p', 'wrap']
+// The pre-V11 engine reversed the DEPTH axis (deepest-first — conformant) but kept
+// the SIBLING axis forward. W3C reverses BOTH, because it reverses ONE flat
+// document-order list — which is exactly what the fix now does.
+//
+// ── D2 (FIXED in W8/V11): nested traversal is DFS preorder ────────────────────
+// W3C document order is a DEPTH-FIRST PREORDER walk of the state tree: a region is
+// entered COMPLETELY (down to its leaf) before its next sibling region is entered
+// at all. The pre-V11 engine instead ordered the whole entry set by DEPTH (ascending
+// on entry, descending on exit), tie-broken by declaration order — i.e. a
+// BREADTH-FIRST / level-order interleaving across regions.
+//   Symmetric nesting (r1▸a▸s▸deep, r2▸x▸t▸low) —
+//   W3C / NOW      entry: ['wrap','wrap.r1.a','wrap.r1.a.s.deep','wrap.r2.x','wrap.r2.x.t.low']
+//   PRE-V11 (bug)  entry: ['wrap','wrap.r1.a','wrap.r2.x','wrap.r1.a.s.deep','wrap.r2.x.t.low']
+//   W3C / NOW      exit : ['wrap.r2.x.t.low','wrap.r2.x','wrap.r1.a.s.deep','wrap.r1.a','wrap']
+//   PRE-V11 (bug)  exit : ['wrap.r1.a.s.deep','wrap.r2.x.t.low','wrap.r1.a','wrap.r2.x','wrap']
+// Note this divergence was INVISIBLE on flat regions: when every region's leaf sits
+// at the same depth, level-order and preorder coincide. It only appeared once a
+// region contained a nested composite, which is exactly why the pre-W8 layer-only
+// assertions could not have caught it.
+//
+// ── THE FIX (one sort key) ────────────────────────────────────────────────────
+// `computeEnterExitSets` now sorts BOTH sets by the compiled model's
+// `documentIndex` (model.ts `compileModel` — a deterministic DFS-PREORDER rank of
+// the config tree): ASCENDING for entry (= document order), DESCENDING for exit
+// (= reverse document order). Because documentIndex IS the preorder rank, ONE key
+// repairs D1 and D2 simultaneously and preserves the layer relation for free (an
+// ancestor's index is handed out on ENTERING the node, hence always smaller than
+// any descendant's). It replaces the `(depth, insertion-order)` key that caused both.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('IRP test404/504 (sibling axis) — parallel EXIT order is REVERSE document order (W3C §3.13)', () => {
+  it('2 regions: r2 leaf first, then r1 leaf, then the composite', async () => {
+    const two = await measureWrap({ r1: { a: leaf() }, r2: { x: leaf() } }, 'r1.a|r2.x')
+    expect(two.exited).toEqual(['wrap.r2.x', 'wrap.r1.a', 'wrap'])
+    // Pre-V11 this was ['wrap.r1.a', 'wrap.r2.x', 'wrap'] (D1). Assert the old
+    // shape is gone, so a revert cannot pass this file quietly.
+    expect(two.exited).not.toEqual(['wrap.r1.a', 'wrap.r2.x', 'wrap'])
+  })
+
+  it('3 regions: r3, r2, r1 — the exact reverse of the declaration order', async () => {
+    const three = await measureWrap(
+      { r1: { a: leaf() }, r2: { x: leaf() }, r3: { p: leaf() } },
+      'r1.a|r2.x|r3.p',
+    )
+    expect(three.exited).toEqual(['wrap.r3.p', 'wrap.r2.x', 'wrap.r1.a', 'wrap'])
+    // The layer relation (test504) is unchanged by the V11 fix: the composite
+    // still exits LAST, after every one of its descendants.
+    expect(three.exited[three.exited.length - 1]).toBe('wrap')
+  })
+
+  it('the exit sibling order is the REVERSE of the declaration order (mirrored config → mirrored exit)', async () => {
+    // Declaring r2 FIRST makes r2 exit LAST. Under the pre-V11 forward walk this
+    // was r2-first; reversing the declaration must reverse the exit sequence, which
+    // is what distinguishes "reverse document order" from "arbitrary but stable".
+    const mirrored = await measureWrap({ r2: { x: leaf() }, r1: { a: leaf() } }, 'r1.a|r2.x')
+    expect(mirrored.exited).toEqual(['wrap.r1.a', 'wrap.r2.x', 'wrap'])
+
+    // …and the ENTRY axis of the same config stays forward document order, i.e.
+    // entry and exit are exact mirrors of each other.
+    expect(mirrored.entered).toEqual(['wrap', 'wrap.r2.x', 'wrap.r1.a'])
+    expect([...mirrored.exited].reverse()).toEqual(mirrored.entered)
+  })
+})
+
+describe('IRP test404/505-506 (traversal shape) — nested composites walk DFS preorder (W3C §3.13)', () => {
+  it('symmetric nesting: each region is walked CONTIGUOUSLY, no cross-region interleave', async () => {
+    const { entered, exited, config } = await measureWrap(
+      { r1: { a: nest('s', 'deep') }, r2: { x: nest('t', 'low') } },
+      'r1.a|r2.x',
+    )
+    // The reached CONFIGURATION is unchanged by V11 — only the callback ORDER moved.
+    expect(config).toBe('wrap.r1.a.s.deep|wrap.r2.x.t.low')
+
+    // W3C preorder keeps each region contiguous. Pre-V11 (D2) the two regions
+    // INTERLEAVED by depth:
+    //   ['wrap','wrap.r1.a','wrap.r2.x','wrap.r1.a.s.deep','wrap.r2.x.t.low']
+    expect(entered).toEqual([
+      'wrap',
+      'wrap.r1.a',
+      'wrap.r1.a.s.deep',
+      'wrap.r2.x',
+      'wrap.r2.x.t.low',
+    ])
+    // Exit = reverse preorder. Pre-V11 (D2):
+    //   ['wrap.r1.a.s.deep','wrap.r2.x.t.low','wrap.r1.a','wrap.r2.x','wrap']
+    expect(exited).toEqual([
+      'wrap.r2.x.t.low',
+      'wrap.r2.x',
+      'wrap.r1.a.s.deep',
+      'wrap.r1.a',
+      'wrap',
+    ])
+    // Exit is the EXACT mirror of entry — the strongest single statement of
+    // "document order / reverse document order over one flat list".
+    expect([...exited].reverse()).toEqual(entered)
+
+    // The W3C LAYER relation holds on both edges (it held pre-V11 too; the fix
+    // must not have traded the sibling axis for the ancestor/descendant one).
+    expect(entered.indexOf('wrap.r1.a')).toBeLessThan(entered.indexOf('wrap.r1.a.s.deep'))
+    expect(entered.indexOf('wrap.r2.x')).toBeLessThan(entered.indexOf('wrap.r2.x.t.low'))
+    expect(exited.indexOf('wrap.r1.a.s.deep')).toBeLessThan(exited.indexOf('wrap.r1.a'))
+    expect(exited.indexOf('wrap.r2.x.t.low')).toBeLessThan(exited.indexOf('wrap.r2.x'))
+  })
+
+  it('ASYMMETRIC depths: the deep region finishes ENTIRELY before the shallow sibling starts', async () => {
+    // r1 nests THREE levels deep, r2 is a bare leaf. This is the discriminating
+    // vector: level-order put the shallow r2 leaf BETWEEN two r1 descendants on
+    // entry — impossible under a preorder walk, which finishes r1 entirely first.
+    const deepR1 = {
+      initial: 's.mid',
+      onEnter: () => {},
+      onExit: () => {},
+      regions: { s: { mid: nest('u', 'deep') } },
+    }
+    const { entered, exited, config } = await measureWrap(
+      { r1: { a: deepR1 }, r2: { x: leaf() } },
+      'r1.a|r2.x',
+    )
+    expect(config).toBe('wrap.r1.a.s.mid.u.deep|wrap.r2.x')
+
+    // Pre-V11 (D2) entry was depth-major:
+    //   ['wrap','wrap.r1.a','wrap.r2.x','wrap.r1.a.s.mid','wrap.r1.a.s.mid.u.deep']
+    expect(entered).toEqual([
+      'wrap',
+      'wrap.r1.a',
+      'wrap.r1.a.s.mid',
+      'wrap.r1.a.s.mid.u.deep',
+      'wrap.r2.x',
+    ])
+    // Pre-V11 (D1+D2) exit was:
+    //   ['wrap.r1.a.s.mid.u.deep','wrap.r1.a.s.mid','wrap.r1.a','wrap.r2.x','wrap']
+    expect(exited).toEqual([
+      'wrap.r2.x',
+      'wrap.r1.a.s.mid.u.deep',
+      'wrap.r1.a.s.mid',
+      'wrap.r1.a',
+      'wrap',
+    ])
+    expect([...exited].reverse()).toEqual(entered)
+
+    // The shallow r2 leaf can NEVER sit between two r1 descendants — the exact
+    // property that was violated pre-V11.
+    expect(entered.indexOf('wrap.r2.x')).toBeGreaterThan(
+      entered.indexOf('wrap.r1.a.s.mid.u.deep'),
+    )
+    // NOTE the layer relation is a WEAKER claim than preorder and is NOT what
+    // moved: a bare-leaf sibling has no ancestor/descendant relation to r1's
+    // chain at all, so only the traversal shape can order them.
+    expect(exited.indexOf('wrap.r1.a.s.mid.u.deep')).toBeLessThan(exited.indexOf('wrap.r1.a'))
+  })
+
+  it('mixed depths across THREE regions: preorder = (r1 subtree) then r2 then r3', async () => {
+    const { entered, exited } = await measureWrap(
+      { r1: { a: nest('s', 'deep') }, r2: { x: leaf() }, r3: { p: leaf() } },
+      'r1.a|r2.x|r3.p',
+    )
+    expect(entered).toEqual([
+      'wrap',
+      'wrap.r1.a',
+      'wrap.r1.a.s.deep',
+      'wrap.r2.x',
+      'wrap.r3.p',
+    ])
+    expect(exited).toEqual([
+      'wrap.r3.p',
+      'wrap.r2.x',
+      'wrap.r1.a.s.deep',
+      'wrap.r1.a',
+      'wrap',
+    ])
+  })
+
+  it('the W3C order is DETERMINISTIC — 12 independent constructions agree byte-for-byte', async () => {
+    // The measurement would be worthless if the order merely happened to come out
+    // this way once. A NON-deterministic order would be a far more serious finding
+    // than either divergence (it would make onExit/onEnter side effects unorderable),
+    // so it is pinned explicitly. Post-V11 the order derives from the compiled
+    // model's `documentIndex`, a pure function of the config's shape — determinism
+    // is now structural rather than incidental. (Also verified across processes.)
+    const runs: string[] = []
+    for (let i = 0; i < 12; i++) {
+      const { entered, exited } = await measureWrap(
+        { r1: { a: nest('s', 'deep') }, r2: { x: leaf() }, r3: { p: leaf() } },
+        'r1.a|r2.x|r3.p',
+      )
+      runs.push(JSON.stringify({ entered, exited }))
+    }
+    expect(new Set(runs).size).toBe(1)
+    // Pre-V11 this same config produced
+    //   entered: ['wrap','wrap.r1.a','wrap.r2.x','wrap.r3.p','wrap.r1.a.s.deep']
+    //   exited : ['wrap.r1.a.s.deep','wrap.r1.a','wrap.r2.x','wrap.r3.p','wrap']
+    expect(JSON.parse(runs[0]!)).toEqual({
+      entered: ['wrap', 'wrap.r1.a', 'wrap.r1.a.s.deep', 'wrap.r2.x', 'wrap.r3.p'],
+      exited: ['wrap.r3.p', 'wrap.r2.x', 'wrap.r1.a.s.deep', 'wrap.r1.a', 'wrap'],
+    })
+  })
+
+  it('CAVEAT — "declaration order" is JS own-property order: INTEGER-LIKE region keys re-sort numerically', async () => {
+    // Not a divergence so much as a trap in the PREMISE of the two vectors above:
+    // the engine's stand-in for document order is the iteration order of the
+    // `regions` object (that is what `compileModel` walks), and ECMAScript orders
+    // integer-like keys ASCENDING ahead of string keys — regardless of how they
+    // were written. So a config declaring `{ '2': …, '1': … }` has document order
+    // (1, 2). Fully DETERMINISTIC, but a config author cannot read source order as
+    // document order when region keys are numeric.
+    const { entered, exited } = await measureWrap(
+      { 2: { b: leaf() }, 1: { a: leaf() } },
+      '2.b|1.a',
+    )
+    expect(entered).toEqual(['wrap', 'wrap.1.a', 'wrap.2.b'])
+    // Exit reverses THAT effective order, not the source order.
+    expect(exited).toEqual(['wrap.2.b', 'wrap.1.a', 'wrap'])
+  })
+
+  it('hook GRANULARITY: the six hooks of one state form one contiguous block (justifies the onEnter/onExit-only filter)', async () => {
+    // The sequences above read only the `onEnter`/`onExit` slot. That is only a
+    // faithful summary if a state's other hooks do not interleave with a sibling's —
+    // pinned here so the filter cannot silently start hiding an interleave.
+    const hooks = () => ({
+      onBeforeEnter: () => {},
+      onEnter: () => {},
+      onAfterEnter: () => {},
+      onBeforeExit: () => {},
+      onExit: () => {},
+      onAfterExit: () => {},
+    })
+    const { events } = await measureWrap({ r1: { a: hooks() }, r2: { x: hooks() } }, 'r1.a|r2.x')
+    // `events` holds the EXIT microstep (measureWrap clears before each fire).
+    // `wrap` itself is built by measureWrap with only `onExit`, and the channel
+    // reports only hooks that EXIST — so its block is a single record. The point of
+    // the vector is the two LEAVES: r2.x's three exit hooks all run before r1.a's
+    // first (V11 reverse order), i.e. the blocks do not interleave. Pre-V11 the
+    // r1.a block came first; the GRANULARITY claim — one contiguous block per
+    // state — is what this vector protects, and it is unchanged by V11.
+    expect(events.filter((e) => e.edge === 'begin').map((e) => `${e.hook}@${e.state}`)).toEqual([
+      'onBeforeExit@wrap.r2.x',
+      'onExit@wrap.r2.x',
+      'onAfterExit@wrap.r2.x',
+      'onBeforeExit@wrap.r1.a',
+      'onExit@wrap.r1.a',
+      'onAfterExit@wrap.r1.a',
+      'onExit@wrap',
+    ])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W8/V11 SAFETY NET — what the reordering must NOT have changed.
+//
+// The V11 fix is a PERMUTATION of the enter/exit sets, nothing else. The two
+// vectors above prove the new SEQUENCE; these prove the fix did not smuggle in a
+// semantic change alongside it. Distinguishing "the order of equal-standing
+// callbacks moved" (intended) from "a callback went missing / the configuration
+// changed / the layer relation broke" (a defect) is the whole point — a fix that
+// achieved the right sequence by dropping a state would satisfy every assertion
+// above and fail every one below.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('W8/V11 invariants — the reorder is a PERMUTATION, not a semantic change', () => {
+  const shapes: Array<{ name: string; regions: Record<string, any>; initial: string }> = [
+    { name: '2 flat regions', regions: { r1: { a: leaf() }, r2: { x: leaf() } }, initial: 'r1.a|r2.x' },
+    {
+      name: '3 flat regions',
+      regions: { r1: { a: leaf() }, r2: { x: leaf() }, r3: { p: leaf() } },
+      initial: 'r1.a|r2.x|r3.p',
+    },
+    {
+      name: 'symmetric nesting',
+      regions: { r1: { a: nest('s', 'deep') }, r2: { x: nest('t', 'low') } },
+      initial: 'r1.a|r2.x',
+    },
+    {
+      name: 'asymmetric depth',
+      regions: {
+        r1: {
+          a: {
+            initial: 's.mid',
+            onEnter: () => {},
+            onExit: () => {},
+            regions: { s: { mid: nest('u', 'deep') } },
+          },
+        },
+        r2: { x: leaf() },
+      },
+      initial: 'r1.a|r2.x',
+    },
+    {
+      name: 'mixed depths, 3 regions',
+      regions: { r1: { a: nest('s', 'deep') }, r2: { x: leaf() }, r3: { p: leaf() } },
+      initial: 'r1.a|r2.x|r3.p',
+    },
+  ]
+
+  it.each(shapes)('$name — the SET of enter callbacks equals the SET of exit callbacks', async ({ regions, initial }) => {
+    const { entered, exited } = await measureWrap(regions, initial)
+    // Every state entered is exited exactly once, and vice versa: no callback was
+    // dropped, duplicated, or invented by the reordering.
+    expect([...entered].sort()).toEqual([...exited].sort())
+    expect(new Set(entered).size).toBe(entered.length)
+    expect(new Set(exited).size).toBe(exited.length)
+  })
+
+  it.each(shapes)('$name — exit is the EXACT reverse of entry (document order ⇄ reverse document order)', async ({ regions, initial }) => {
+    const { entered, exited } = await measureWrap(regions, initial)
+    expect([...exited].reverse()).toEqual(entered)
+  })
+
+  it.each(shapes)('$name — LAYER invariant: strictly ancestor-before-descendant on entry, descendant-before-ancestor on exit', async ({ regions, initial }) => {
+    const { entered, exited } = await measureWrap(regions, initial)
+    // `a` is an ancestor of `b` iff b starts with a + '.'. Checked over every
+    // ordered pair present, so a nested chain of any depth is covered.
+    for (const a of entered) {
+      for (const b of entered) {
+        if (a === b || !b.startsWith(`${a}.`)) continue
+        expect(entered.indexOf(a)).toBeLessThan(entered.indexOf(b))
+        expect(exited.indexOf(b)).toBeLessThan(exited.indexOf(a))
+      }
+    }
+    // The composite itself always bookends the sequence.
+    expect(entered[0]).toBe('wrap')
+    expect(exited[exited.length - 1]).toBe('wrap')
+  })
+
+  it.each(shapes)('$name — the reached CONFIGURATION is order-independent', async ({ regions, initial }) => {
+    const { config, entered } = await measureWrap(regions, initial)
+    // Every active leaf in the configuration was entered, and the configuration
+    // holds exactly the leaves (no composite parents leak into it).
+    const leaves = config!.split('|')
+    for (const l of leaves) expect(entered).toContain(l)
+    expect(leaves.every((l) => !leaves.some((o) => o !== l && o.startsWith(`${l}.`)))).toBe(true)
+  })
+})
+
+/**
+ * ── DIVERGENCE FROM W3C (found by §4в) — CURRENT STATUS: NONE ──────────────────
+ * None on the 8 ORIGINAL vectors (preemption, document-order, OTS, exit-order ×2,
+ * entry-order, exec-content-order): the library's observed behaviour matches the
+ * W3C SCXML §3.13 pass-criteria there.
  *
- * KNOWN UNASSERTED W3C-NORMED AXIS (honest scope, NOT "none found"): the same-depth
- * SIBLING exit/entry order ACROSS parallel regions. W3C §3.13 NORMS it (exit =
- * reverse document order ⇒ region r2's leaf exits before region r1's; entry = the
- * mirror). The library documents this order as INSERTION-DEPENDENT, so test504/
- * 505-506 deliberately assert only the ROBUST layer relation (all leaves before/
- * after the composite parent), order-INSENSITIVELY across siblings — they do NOT
- * pin the sibling sequence. This is a REAL W3C-normed axis left unasserted (a
- * POTENTIAL divergence if the engine's insertion order disagrees with document
- * order), distinct from `priority` (an axis the standard does not have at all).
- * Pinning it is tracked as a §4в follow-up; it is called out here so the "none
- * found" claim is scoped to what is actually asserted, not read as full coverage.
+ * None, ANY LONGER, on the ninth axis (sibling order + nested traversal shape).
+ * Its history, kept because the fix is a BREAKING behaviour change and the audit
+ * trail is the point:
+ *
+ *   • W8/V1 added the lifecycle observability channel (`IMonitor.recordLifecycle`),
+ *     making callback order observable from outside the machine for the first time.
+ *   • W8/V3b MEASURED the axis and split the outcome three ways:
+ *       – ENTRY sibling order across parallel regions — MATCHED W3C (forward
+ *         document order = the `regions` declaration order). Promoted then, and
+ *         still asserted, in `describe('IRP test505/506 (sibling axis) …')`.
+ *       – EXIT sibling order — DIVERGED (D1): the engine exited siblings FORWARD
+ *         where W3C §3.13 exits in the REVERSE of document order.
+ *       – Nested-composite traversal shape — DIVERGED (D2): the engine ordered the
+ *         whole set by DEPTH and interleaved regions level-by-level, where W3C
+ *         walks DFS preorder (each region contiguous). Invisible on flat regions.
+ *     V3b pinned the ACTUAL behaviour deliberately and explicitly declined to
+ *     adjudicate bug-vs-extension, leaving the reproduction for the maintainer.
+ *   • W8/V11 — the maintainer adjudicated BUG and fixed the engine.
+ *     `computeEnterExitSets` now sorts both sets by the compiled model's
+ *     `documentIndex` (a DFS-preorder rank — see model.ts): ASCENDING for entry
+ *     (document order), DESCENDING for exit (reverse document order). One key,
+ *     both divergences. The V3b vectors were FLIPPED to the W3C expectations and
+ *     now live in `describe('IRP test404/504 (sibling axis) …')` and
+ *     `describe('IRP test404/505-506 (traversal shape) …')`, each carrying the
+ *     pre-V11 sequence in a comment plus a `not.toEqual` / mirror assertion so a
+ *     revert to the old shape goes RED rather than drifting. The determinism
+ *     vector (12 constructions agree) and the integer-key caveat carry over.
+ *
+ * BREAKING (1.0.0-beta.x, accepted by the maintainer): user `onExit` callbacks of
+ * sibling states in parallel regions now fire in the REVERSE of the declaration
+ * order, and nested regions are walked to completion one at a time on BOTH edges.
+ * The SET of callbacks invoked, and the reached configuration, are unchanged — only
+ * the sequence moved. See README «Callback ordering» and docs/regions-and-parallel.md.
+ *
+ * Note what never diverged and did not move: the W3C LAYER relations (ancestor
+ * before descendant on entry, descendant before ancestor on exit, every descendant
+ * of a parallel state before the parallel state itself) — covered by
+ * test404/504/505-506 and re-asserted inside the V11 vectors.
  *
  * Legitimate EXTENSIONS (numeric `priority`) are covered under «НАМЕРЕННО НЕ
  * ПРИМЕНИМО» above and are not conformance failures.

@@ -286,10 +286,12 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
       //  - pendingNow && inFlight === 0   -> queued/processing work with NO tracked
       //    in-flight async, accompanied by a future timer: WAITING_ON_INTERNAL — a
       //    wedged processing flag / undrained internal queue is a real RTC concern
-      //    (I-3 witness). CAVEAT (ISS-030): inFlightAsyncCount does NOT track
-      //    string-method invoke actions, so a machine awaiting one can appear here
-      //    with inFlight==0 — hence I-3's DEFAULT-set promotion is gated on the
-      //    zero-false-positive corpus (string-method configs included).
+      //    (I-3 witness). ISS-030 CLOSED (W8/V8): `inFlightAsyncCount` now ALSO
+      //    counts un-settled `invoke.action` callbacks observed on the
+      //    `recordLifecycle` channel, so a STRING-METHOD invoke action — which
+      //    `bracketAsync` never wrapped — is tracked too and no longer masquerades
+      //    as a wedged queue. I-3 is consequently in the DEFAULT builtin set, gated
+      //    on a zero-false-positive corpus that includes string-method configs.
       let reason: SettleReason
       if (!pendingNow) {
         reason = 'WAITING_ON_TIMER'
