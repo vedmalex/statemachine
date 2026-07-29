@@ -9,12 +9,15 @@
 //      `initial: 'a.run|b.run'` is claimed (bullet "Expansion") to expand to the
 //      active configuration `proc.a.run|proc.b.run` on entry;
 //   2. the "A batch over a table" block under "Driving several objects with one
-//      machine" — see the comment above that describe.
+//      machine" — see the comment above that describe;
+//   3. the timer trap under "The per-record runtime that does not live in the
+//      record", whose `detachOwner(row)` call and whose claim about what happens
+//      WITHOUT it are both executed.
 
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { createMachine } from '../index'
 
 // Resolve README.md relative to THIS test file (src/tests/ → package root),
@@ -86,8 +89,9 @@ describe('README examples · verbatim guard + executed expansion (M-1)', () => {
 // machine via `fireEventDetailedFor`, and the record's own `state` field is the
 // persisted machine state. The prose makes three load-bearing claims that are
 // executed below — the detailed form reports `no-transition` where the plain
-// `fireEventFor` THROWS, a composite parent name is not expanded for a `*For`
-// owner, and `toJSON` covers the construction owner alone.
+// `fireEventFor` THROWS, a bare composite parent name in the column is completed
+// to that composite's `initial` configuration, and `toJSON` covers the
+// construction owner alone.
 
 type Order = { id: number; state: string }
 
@@ -140,7 +144,7 @@ describe('README examples · multi-owner batch loop (state, not machine)', () =>
     )
   })
 
-  it('a `*For` owner is read as it stands — a composite parent is not expanded', async () => {
+  it('a composite parent in the column is completed to its `initial` configuration', async () => {
     const sm = createMachine<{ state: string }>({
       name: 'flow',
       stateAttribute: 'state',
@@ -154,14 +158,23 @@ describe('README examples · multi-owner batch loop (state, not machine)', () =>
         pause: { transitions: [{ from: 'work', to: 'paused' }] },
       },
     })
-    // A row whose column holds the composite PARENT offers only `work`'s own
-    // transitions — the documented "seed the leaf path, not the parent name".
-    expect(sm.getAvailableEventsFor({ state: 'work' })).toEqual(['pause'])
-    // The leaf path is what the engine writes and what it reads back.
-    expect(sm.getAvailableEventsFor({ state: 'work.r.stepA' })).toEqual([
+    // B2: a row whose column holds the composite PARENT is read as the
+    // configuration entering that parent produces — the same completion every
+    // write path performs. It answers identically to the expanded leaf path.
+    expect(sm.getAvailableEventsFor({ state: 'work' })).toEqual(
+      sm.getAvailableEventsFor({ state: 'work.r.stepA' }),
+    )
+    expect(sm.getAvailableEventsFor({ state: 'work' })).toEqual([
       'next',
       'pause',
     ])
+    // Completing is not the same as normalizing away: firing writes the leaf
+    // path back, so the column ends up holding what the engine writes.
+    const row = { state: 'work' }
+    expect(sm.canFireEventFor(row, 'next')).toBe(true)
+    expect(README).toContain(
+      'A row whose column holds a bare composite parent name',
+    )
   })
 
   it('toJSON covers the CONSTRUCTION owner only, not a `*For` record', async () => {
@@ -173,5 +186,87 @@ describe('README examples · multi-owner batch loop (state, not machine)', () =>
     expect(owner.state).toBe('draft')
     // The record that actually moved is absent from the payload.
     expect(JSON.parse(sm.toJSON()).currentState).toBe('draft')
+  })
+})
+
+// Guarded example: the timer trap under "The per-record runtime that does not
+// live in the record". The README tells the reader to release each row with
+// `detachOwner(row)` and claims that WITHOUT it a timer writes into a row the
+// loop has already saved. Both halves are executed below, so the documented
+// call cannot drift from the surface and the claim cannot outlive the defect.
+describe('README examples · detachOwner releases a row before its timer fires', () => {
+  it('README still documents the detach call verbatim', () => {
+    expect(README).toContain('sm.detachOwner(row)')
+    expect(README).toContain('{ timersCleared, operationsAborted,')
+  })
+
+  it('the documented loop leaves a released row exactly as it was saved', async () => {
+    vi.useFakeTimers()
+    try {
+      const timed = createMachine<{ id: number; state: string }>({
+        name: 'timed',
+        stateAttribute: 'state',
+        initialState: 'draft',
+        states: {
+          draft: {},
+          review: { invoke: [{ delay: 1000, event: 'expire' }] },
+          expired: {},
+        },
+        events: {
+          submit: { transitions: [{ from: 'draft', to: 'review' }] },
+          expire: { transitions: [{ from: 'review', to: 'expired' }] },
+        },
+      } as never)
+
+      const page = [
+        { id: 1, state: 'draft' },
+        { id: 2, state: 'draft' },
+      ]
+      const saved: Array<[number, string]> = []
+      for (const row of page) {
+        const res = await timed.fireEventDetailedFor(row, 'submit')
+        if (res.fired) saved.push([row.id, row.state])
+        timed.detachOwner(row)
+      }
+
+      await vi.advanceTimersByTimeAsync(5000)
+
+      // Every row still holds exactly what `save(row)` wrote.
+      expect(saved).toEqual([
+        [1, 'review'],
+        [2, 'review'],
+      ])
+      expect(page.map((r) => r.state)).toEqual(['review', 'review'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('and WITHOUT the detach the README’s claim holds — the row is written late', async () => {
+    vi.useFakeTimers()
+    try {
+      const timed = createMachine<{ id: number; state: string }>({
+        name: 'timedLeak',
+        stateAttribute: 'state',
+        initialState: 'draft',
+        states: {
+          draft: {},
+          review: { invoke: [{ delay: 1000, event: 'expire' }] },
+          expired: {},
+        },
+        events: {
+          submit: { transitions: [{ from: 'draft', to: 'review' }] },
+          expire: { transitions: [{ from: 'review', to: 'expired' }] },
+        },
+      } as never)
+
+      const row = { id: 1, state: 'draft' }
+      await timed.fireEventDetailedFor(row, 'submit')
+      expect(row.state).toBe('review') // what was saved
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(row.state).toBe('expired') // what the orphaned object now says
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

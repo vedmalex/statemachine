@@ -575,6 +575,13 @@ export type NestedStateName<S> = {
     }[keyof R & string] : never : never;
 }[keyof S & string];
 
+// @public
+export interface OwnerDetachResult {
+    operationsAborted: number;
+    queuedEventsDropped: number;
+    timersCleared: number;
+}
+
 // @public (undocumented)
 export type PropertiesOf<T> = {
     [K in keyof T as T[K] extends (...args: any[]) => any ? never : K]: T[K];
@@ -678,6 +685,7 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    detachOwner(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): OwnerDetachResult;
     // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
     fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult>;

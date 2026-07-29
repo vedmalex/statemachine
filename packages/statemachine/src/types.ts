@@ -783,6 +783,37 @@ export type FireResult =
       }>
     }
 
+/**
+ * B3 — what `StateMachine.detachOwner` actually released.
+ *
+ * Every count is of work that would otherwise have reached an object the caller
+ * has already saved and let go, so the numbers are the useful ones for a log
+ * line ("released row 42, cancelled 3 timers") and for asserting that a detach
+ * had teeth. A detach of an owner with no live runtime returns all zeros, which
+ * is also what a second detach of the same owner returns.
+ *
+ * Deliberately NOT counted: the per-owner history / entry-time / restart-count
+ * maps that detach also drops. Dropping them frees memory the garbage collector
+ * would have freed anyway once the owner became unreachable; reporting it would
+ * claim credit for work that is not detach's.
+ */
+export interface OwnerDetachResult {
+  /** Armed `invoke` timers cancelled — the writes that would have landed late. */
+  timersCleared: number
+  /**
+   * In-flight `invoke` operations aborted. Counts only operations that were not
+   * already aborted, so a leaf whose operation had settled contributes nothing.
+   */
+  operationsAborted: number
+  /**
+   * Events already queued for this owner and dropped before the drain reached
+   * them — the window between a timer firing and the microtask that processes
+   * what it raised. A dropped event that a caller was awaiting is settled, never
+   * left pending.
+   */
+  queuedEventsDropped: number
+}
+
 ///Record<StateName, Omit<State<T>, 'name'>>
 export type States<T extends object> = Record<StateName, Omit<State<T>, 'name'>>
 export type Events<T extends object, S extends States<T>> = Record<

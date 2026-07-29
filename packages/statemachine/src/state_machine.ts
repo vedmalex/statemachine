@@ -41,6 +41,7 @@ import {
   type LifecycleEvent,
   MemoryAdapter,
   type MethodsOf,
+  type OwnerDetachResult,
   type PropertiesOf,
   type RegionsConfig,
   type State,
@@ -2243,6 +2244,179 @@ export class StateMachine<
     this.setInitialState(this.initialState as string, targetAdaptee)
   }
 
+  /**
+   * B3 — RELEASE an owner: tell the machine it no longer manages this object.
+   *
+   * ## The boundary this closes
+   * The documented batch shape is `load → fire → save`, and it is unsound for a
+   * machine whose states arm `invoke` timers. The reason is NOT that timers fire
+   * later — that is what a timer is. It is that nothing ever told the machine the
+   * row had been released. A timer armed on entry closes over the owner, stays
+   * armed after the loop saved the row and moved on, fires on its own schedule,
+   * finds its leaf still active, and writes a new state into an object nobody is
+   * going to persist. The database says `working`, the orphaned object says
+   * `timedOut`, and no error is raised. The same holds for a long-running
+   * `invoke.src` operation, whose completion event arrives just as late.
+   *
+   * Both halves of the teardown already existed per owner
+   * ({@link teardownStateTimers} over `activeTimersByOwner`, and
+   * {@link invokesFor} + `controller.abort()`), and {@link reset} already ran
+   * them — but `reset` then RE-ENTERS the initial state, re-arming exactly what
+   * it tore down. It is the wrong verb for a row you are done with. This is the
+   * right one.
+   *
+   * ## What this does that garbage collection does not
+   * The per-owner maps are `WeakMap`s keyed by the raw adaptee, so it is tempting
+   * to think dropping the object is enough. It is not, and the WeakMaps are the
+   * part that needs no help:
+   *
+   * - **GC never cancels a scheduled timer.** The pending callback runs whether
+   *   or not anything else still refers to the owner. That is the entire defect,
+   *   and only `clearTimer` closes it.
+   * - **GC never aborts an operation.** An in-flight `invoke.src` promise settles
+   *   on its own and raises its completion event; only `controller.abort()`
+   *   suppresses it.
+   * - **Until both happen, the owner is not even collectable.** The armed timer's
+   *   callback holds a strong reference to the adapter, which holds the raw row,
+   *   so the object is reachable from the scheduler for as long as the timer is
+   *   pending. Detach removes the last strong root; without it the WeakMap keys
+   *   never go weak in practice.
+   * - Dropping the per-owner history / entry-time / restart-count maps is the one
+   *   thing GC WOULD have done unaided, once the owner became unreachable. Detach
+   *   does it immediately and deterministically rather than eventually — a
+   *   convenience, not the fix.
+   *
+   * ## History and entry times are DROPPED — a data decision
+   * Detach means "released", so the machine forgets the owner completely: its
+   * recorded `history` states, its state entry times, and its invoke-restart
+   * budget all go. The alternative — keeping them — buys nothing and costs
+   * correctness. A released row is reloaded as a NEW object, and every per-owner
+   * map is keyed on object identity, so the retained history is unreachable by
+   * the only party that would want it. Keeping it would leave a per-owner leak
+   * that is by construction unusable. The visible consequence is the one the
+   * README already documents as inherent to `load → fire → save`: re-entering a
+   * `history` composite after a reload falls back to its `initial`. Detaching
+   * does not create that loss, it makes it honest and immediate instead of
+   * dependent on when the object happens to be collected.
+   *
+   * If you need history to survive, do not release the owner — hold the SAME
+   * object resident for the whole batch, which is also what a timer-arming
+   * machine requires.
+   *
+   * ## What it does not do
+   * - It does not touch the `stateAttribute` field. The position you saved is the
+   *   machine's last word on the row, and detach must not rewrite it.
+   * - It does not clear the construction owner. `detachOwner(primary)` releases
+   *   that owner's runtime, but the machine still points at the object, so a
+   *   later `fireEvent()` re-adopts it with an empty history — as would any other
+   *   re-adopted owner.
+   * - It does not undo {@link attachToObject}. Those listeners live on the
+   *   caller's object and are removed by the caller.
+   *
+   * Idempotent: detaching an owner twice releases nothing the second time and
+   * returns all zeros.
+   *
+   * @param owner - The released object, raw or wrapped, resolved exactly as the
+   *   `*For` family resolves it (see {@link fireEventFor}).
+   * @returns What was actually released — see {@link OwnerDetachResult}.
+   *
+   * @example
+   * ```ts
+   * for (const row of page) {
+   *   const res = await sm.fireEventDetailedFor(row, 'submit')
+   *   if (res.fired) await save(row)
+   *   sm.detachOwner(row)   // released: no timer of this row's may fire now
+   * }
+   * ```
+   */
+  public detachOwner(
+    owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>,
+  ): OwnerDetachResult {
+    const key = this.ownerKey(this.resolveOwnerAdapter(owner))
+
+    let timersCleared = 0
+    const ownerTimers = this.activeTimersByOwner.get(key)
+    if (ownerTimers) {
+      for (const timers of ownerTimers.values()) {
+        for (const id of timers) {
+          this.clearTimer(id)
+          timersCleared++
+        }
+      }
+      ownerTimers.clear()
+    }
+
+    let operationsAborted = 0
+    const ownerInvokes = this.activeInvokesByOwner.get(key)
+    if (ownerInvokes) {
+      for (const controllers of ownerInvokes.values()) {
+        for (const controller of controllers) {
+          // An already-aborted controller is a settled/torn-down operation; the
+          // abort below stays idempotent but must not inflate the report.
+          if (!controller.signal.aborted) operationsAborted++
+          controller.abort()
+        }
+      }
+      ownerInvokes.clear()
+    }
+    // W3b.2 — the abort listener retires each record, but a launch that was
+    // cancelled before its controller reached the map would otherwise linger and
+    // make `assertNoInFlightInvokes` believe a released owner is still busy.
+    this.inFlightInvokesByOwner.get(key)?.clear()
+
+    const queuedEventsDropped = this.dropQueuedEventsForOwner(key)
+
+    // The per-owner runtime GC would have reclaimed on its own; dropped here so
+    // a re-adopted object starts clean and an owner held alive by the caller
+    // stops costing memory the moment it is released.
+    this.historyByOwner.delete(key)
+    this.stateEntryTimesByOwner.delete(key)
+    this.invokeRestartCountByOwner.delete(key)
+    this.activeTimersByOwner.delete(key)
+    this.activeInvokesByOwner.delete(key)
+    this.inFlightInvokesByOwner.delete(key)
+    this.ownerAdapters.delete(key)
+
+    return { timersCleared, operationsAborted, queuedEventsDropped }
+  }
+
+  /**
+   * B3 — drop every queued event destined for a detached owner, settling any
+   * caller awaiting one.
+   *
+   * A timer that fires raises its event and schedules the drain as a MICROTASK,
+   * so there is a window in which the event is queued and the owner has not been
+   * written yet. Cancelling the timer cannot help an event that already left it;
+   * without this the released row would still be advanced one last time.
+   *
+   * An external event carries the promise its caller is awaiting. Dropping it
+   * silently would hang that caller forever, so it is settled as `aborted` — the
+   * existing {@link FireResult} reason for a microstep that never ran — rather
+   * than rejected: releasing an owner is not an error.
+   */
+  private dropQueuedEventsForOwner(key: object): number {
+    let dropped = 0
+    const purge = (queue: QueuedEvent<TOwner>[]): void => {
+      const remaining: QueuedEvent<TOwner>[] = []
+      for (const evt of queue) {
+        if (this.ownerKey(evt.obj) !== key) {
+          remaining.push(evt)
+          continue
+        }
+        dropped++
+        if (evt.detailed) evt.resolveDetailed?.({ fired: false, reason: 'aborted' })
+        else evt.resolve?.(false)
+      }
+      // Rebuilt in place: the drain shifts off these same arrays, and a caller
+      // may reach here from inside an action while a drain is in progress.
+      queue.length = 0
+      for (const evt of remaining) queue.push(evt)
+    }
+    purge(this.internalQueue)
+    purge(this.externalQueue)
+    return dropped
+  }
+
   public getStateHistory(): Record<string, string> {
     return Object.fromEntries(this.historyFor(this.adaptee))
   }
@@ -3519,7 +3693,63 @@ export class StateMachine<
         )
       }
     }
-    return currentState
+    return this.completeConfiguration(currentState)
+  }
+
+  /**
+   * B2 — the state names that DECLARE regions, i.e. the names a WELL-FORMED
+   * active configuration may never contain bare. Built once on first use (the
+   * states map is fixed after construction) so {@link completeConfiguration}
+   * costs one `Set.has` on the overwhelmingly common already-well-formed read.
+   */
+  private compositeStateNames: Set<string> | undefined
+
+  private isBareComposite(part: string): boolean {
+    if (this.compositeStateNames === undefined) {
+      const names = new Set<string>()
+      for (const [name, state] of this.states) {
+        if (state.regions) names.add(String(name))
+      }
+      this.compositeStateNames = names
+    }
+    return this.compositeStateNames.has(part)
+  }
+
+  /**
+   * B2 — complete a raw state field into a WELL-FORMED active configuration by
+   * expanding any bare REGIONED composite name into that composite's `initial`
+   * leaves.
+   *
+   * Every path that writes the field THROUGH the machine already does this:
+   * `setInitialState` at construction, a transition whose `to` is the composite,
+   * `reset`, and `restoreState` all route through {@link computeInternalWrite},
+   * whose D1 branch exists precisely so "a bare-root composite that declares
+   * regions must NOT short-circuit as a simple root". Adopting a field a
+   * CONSUMER hydrated out-of-band — a row loaded from a table, an object seeded
+   * by hand — was the one path that skipped the rule: `getCurrentState`
+   * validated `work` as a legal state path and returned it verbatim, so the
+   * record was offered only `work`'s own transitions and one declared from
+   * `work.r.stepA` never matched. Accepted as valid, then silently inert.
+   *
+   * PURE, and deliberately so: it decides which transitions match, it does not
+   * re-enter the composite. That is the same contract `restoreState` already
+   * has — it expands a bare composite and fires no entry actions, because the
+   * position it is adopting was reached in some earlier process, not now.
+   *
+   * Delegating to {@link computeInternalWrite} rather than hand-rolling the
+   * expansion is what makes the completion IDENTICAL to the write paths': same
+   * region expansion, same nested-composite recursion, same `documentIndex`
+   * ordering. An already-well-formed configuration never reaches it.
+   */
+  private completeConfiguration(currentState: string): string {
+    if (currentState.indexOf('|') === -1) {
+      return this.isBareComposite(currentState)
+        ? this.computeInternalWrite('', currentState)
+        : currentState
+    }
+    const parts = currentState.split('|')
+    if (!parts.some((part) => this.isBareComposite(part))) return currentState
+    return this.computeInternalWrite('', currentState)
   }
 
   private setInitialState(

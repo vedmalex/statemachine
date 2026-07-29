@@ -223,61 +223,67 @@ Two things to get right about the column:
 - It holds the machine's **active configuration verbatim** — a dotted leaf path, and
   for parallel regions the `|`-joined set (`proc.a.run|proc.b.run`). Store back what
   the engine wrote; do not normalize or shorten it.
-- A row driven through the `*For` family is read **as it stands**. A composite parent
-  name is *not* expanded to its `initial` leaf: a row reading `proc` offers only the
-  transitions declared from `proc` itself, and one declared from `proc.a.run` will not
-  match it. Seed a new row with the configuration a fresh machine enters, not with the
-  parent name. (Only the *construction* owner is expanded — `new StateMachine(config, row)`
-  descends into `initial` and writes the leaf path back into `row`.)
+- A row whose column holds a bare composite parent name is **completed** to that
+  composite's `initial` configuration before it is read: `proc` is understood as
+  `proc.a.run|proc.b.run`, so transitions declared from the leaves match it and every
+  region is entered. This is the same completion the engine performs when it *writes*
+  the composite — seeding a new row with the parent name is therefore safe, and a
+  parallel composite will not lose its sibling regions. Completion decides which
+  transitions match; it does not run the leaves' `onEnter`, exactly as `restoreState`
+  adopts a persisted position without re-entering it.
 
 ### The per-record runtime that does not live in the record
 
-The `state` field is not the whole story. Five kinds of per-owner runtime are held on
-the machine in `WeakMap`s keyed by the owner object itself, and so live in process
-memory only: the history recorded for `history` states, state entry times, armed
-`invoke` timers, in-flight `invoke` operations, and invoke restart counts. None of it
-is in the record, and none of it is in a `toJSON` snapshot either — that snapshot
-covers the construction owner alone.
+The `state` field is not the whole story. Per owner the machine also keeps history for
+`history` states, state entry times, armed `invoke` timers, in-flight `invoke`
+operations and invoke restart counts — in `WeakMap`s keyed by the owner **object**, so
+in process memory only. A machine of plain states, guards and transitions has none of
+it and a row can be loaded, advanced and released freely. A machine that uses `history`
+or `invoke` has it, and `load → fire → save` then has two traps. Both are silent: you
+observe wrong behaviour, not an error.
 
-Which side of the line you are on is decided by the config:
+**Timers — release the owner explicitly.** An `invoke` timer armed on entry fires
+later, finds the leaf still active, and writes into the object that armed it, long
+after the loop saved that row. The database says one thing and the orphaned object
+says another. The timer firing late is not the bug — nothing told the machine the row
+was released. Say so:
 
-- A machine of plain states, guards and transitions has **no** such runtime. The record
-  is fully self-describing, one machine over any number of records is exact, and a row
-  can be loaded, advanced and released freely.
-- A machine that uses `history` states or `invoke` (either form — the delay/`event`
-  timer or the long-running `src` operation) does have it, keyed on **object identity**.
+```ts
+for (const row of page) {
+  const res = await sm.fireEventDetailedFor(row, 'submit')
+  if (res.fired) await save(row)
+  sm.detachOwner(row)   // released: cancels this row's timers, aborts its operations
+}
+```
 
-Both failure modes are silent. You observe wrong behaviour, not an error:
+`detachOwner(row)` returns what it released (`{ timersCleared, operationsAborted,
+queuedEventsDropped }`) and is idempotent. Without it, `load → fire → save` is the
+wrong shape for a timer-arming machine. Garbage collection is no substitute: it never
+cancels a scheduled timer, and while one is armed its callback holds a strong
+reference to the row, so the object is not collectable in the first place.
 
-- **History.** Load a row, advance it, release the object, then reload the row as a
-  fresh object, and the history keyed to the old object is gone. Re-entering a
-  `history` composite falls back to its `initial` — and any sibling regions the
-  composite remembered are gone with it, so the machine re-enters a *narrower*
-  configuration than it left. The workaround is real but narrow: keep the **same**
-  object for the whole batch rather than reloading it, and history is exact, per
-  record and independent between records.
-- **Timers.** An `invoke` timer armed on entry fires later, on its own schedule, and
-  writes into the object that armed it — after your loop has already saved that row.
-  Keeping the object alive does not fix this one: the write lands in memory and the row
-  is never persisted unless you drain the timers and save again. `load → fire → save`
-  is the wrong shape for a machine whose states arm timers; hold those owners resident
-  for as long as their timers can fire.
+**History — do not release the owner at all.** History is keyed on object identity, so
+reloading the row as a fresh object loses it: re-entering a `history` composite falls
+back to its `initial`, and any sibling regions it remembered go with it, leaving the
+machine in a *narrower* configuration than it left. `detachOwner` does not help here —
+it drops the history too, deliberately. Keep the **same** object resident for the whole
+batch instead, and history is exact, per record and independent between records.
 
 There is no snapshot-based escape from either: `toJSON`, `saveState`, and the timer
-resumption `fromJSON` performs all read and write the construction owner alone.
+resumption `fromJSON` performs all read and write the construction owner alone. The
+full treatment — all three persistence mechanisms, what each carries and what no
+restore recovers — is in [`docs/persistence.md`](./docs/persistence.md).
 
 ## Serialization (`toJSON` / `fromJSON`)
 
 `toJSON()` writes a machine to a string; `fromJSON(json, owner, options?)` reads one back. `toSecureJSON()` / `fromSecureJSON()` are the async forms and carry exactly the same thing.
 
 `toJSON` and `toSecureJSON` **throw while an `invoke` operation is in flight**, naming the
-state and the invocation. A pending promise has no serializable continuation, so a snapshot
-taken then would restore into a machine that looks busy and is running nothing: the
-completion event that would have moved it on never arrives. Wait for your operation and
-serialize after it, or leave the state — which aborts it — and serialize from there. A
-machine that merely *declares* an operation, or whose operation has already settled,
-serializes normally: the refusal is about the moment, not about the machine. See
-[docs/persistence.md](./docs/persistence.md).
+state and the invocation: a pending promise has no serializable continuation, so the
+snapshot would restore into a machine that looks busy and is running nothing. Wait for
+your operation, or leave the state — which aborts it — and serialize from there. The
+refusal is about the moment, not about the machine; the reasoning and the exact message
+are in [`docs/persistence.md`](./docs/persistence.md).
 
 **This moves or restores a machine; it does not carry a record's state.** The payload is
 a machine *description* plus one owner's position in it — `config` (every state and
@@ -316,13 +322,13 @@ const sm = StateMachine.fromJSON(json, owner, {
 
 `actions` is the one you cannot skip if your config has function-valued hooks: functions serialize as a **name** (never a body — see [Breaking changes](#breaking-changes-in-100-beta5)), and restoration resolves that name against this registry. `strictActions` is not persisted either — it governs how strictly *this* read resolves those names, and a document does not get to relax the rules it is read under.
 
-### Known issue: the per-action deadline is not restored
-
-**A `transitionTimeout` that was counting down when you called `toJSON` is not persisted, so after a restore every action budget starts fresh.** A 5 s budget that had already burned 4 s at save time restores as a full 5 s. This is deliberate: the deadline races a pending promise, and a pending promise cannot be resumed — there is nothing to continue counting against. Budget for it: a machine that is saved and restored repeatedly can let a single action run for longer than `transitionTimeout` in total wall-clock. The bound is per action *per run*, not across a restore.
-
-Invoke **delays** are unaffected and do resume correctly: `fromJSON` recomputes the remainder from the persisted `stateEntryTimes`, so a 1000 ms timer snapshotted 400 ms in fires 600 ms after the restore. See [Replaying serialized state](#replaying-serialized-state).
-
-A long-running `invoke` **operation** (the `src` / `onDone` / `onError` form) is not resumed either — its promise and `AbortSignal` cannot survive a document. It is skipped on restore, with a `logger.warn`, and a fresh entry into the state relaunches it.
+Two things a restore does **not** recover: a `transitionTimeout` that was counting down
+(every action budget starts fresh), and a long-running `invoke` **operation** (its
+promise and `AbortSignal` cannot survive a document). Invoke **delays** are unaffected
+and do resume correctly, recomputed from the persisted `stateEntryTimes` — see
+[Replaying serialized state](#replaying-serialized-state). What each of those costs you,
+and what an operation does on the next entry with and without an action registry, is in
+[`docs/persistence.md`](./docs/persistence.md).
 
 ## Documentation
 

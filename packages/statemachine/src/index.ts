@@ -44,6 +44,12 @@ export type { Transition } from './types'
 export type { FireResult } from './types'
 
 /**
+ * @stable — what `StateMachine.detachOwner` released for one owner (B3).
+ * @category Stable
+ */
+export type { OwnerDetachResult } from './types'
+
+/**
  * @stable — state node shape; consumed by States<T> map.
  * @category Stable
  */

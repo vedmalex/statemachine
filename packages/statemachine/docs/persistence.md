@@ -9,7 +9,7 @@ Pick by asking one question: **what has to survive?**
 
 | what has to survive | mechanism | what it carries |
 | --- | --- | --- |
-| one entity's current state, alongside the entity itself | the `stateAttribute` field + the `*For` family | nothing extra — the state IS a field on your record |
+| one entity's current state, alongside the entity itself | the `stateAttribute` field + the `*For` family | the state IS a field on your record — nothing extra, but see [the boundary](#the-boundary-what-the-record-does-not-carry) |
 | one machine's runtime across a process restart | `StatePersistenceAdapter` (`saveState` / `restoreState`) | `currentState`, `history`, `stateEntryTimes` |
 | the machine **definition** itself | `toJSON` / `fromJSON` | the full config, plus the primary owner's runtime |
 
@@ -35,21 +35,86 @@ for (const order of await db.orders.findDue()) {
 One machine instance, N records. There is no serialization in this loop, and
 nothing per-record to store beyond the state field.
 
-**The boundary.** Not everything about a record's position lives in the record. Per
-owner, the machine also keeps history for history states, state entry times, armed
-timers and in-flight `invoke` operations — held in memory, keyed by the record
-object. Release the record object and those are gone; they are not in the state
-field, and a `toJSON` snapshot will not contain them either unless that record
-happens to be the machine's primary owner.
+### The boundary: what the record does not carry
 
-So: a machine built from plain states, guards and transitions is fully described by
-its state field, and this pattern is clean. A machine that uses **`history` states or
-`invoke`** — either form, the delay/`event` timer or the long-running `src` operation —
-keeps per-record runtime that this pattern does not carry, and the loss is silent,
-visible only as wrong behaviour later. Keeping the *same* record object for the whole
-batch, rather than reloading it, preserves the history; it does not help with timers,
-which fire after the loop has already saved the row. See "Driving several objects with
-one machine" in the README for the full treatment.
+Not everything about a record's position lives in the record. Five kinds of per-owner
+runtime are held on the machine in `WeakMap`s keyed by the record **object** — the
+history recorded for `history` states, state entry times, armed `invoke` timers,
+in-flight `invoke` operations, and invoke restart counts. None of it is in the state
+field, and a `toJSON` snapshot does not contain it either unless that record happens to
+be the machine's primary owner.
+
+A machine built from plain states, guards and transitions has none of this runtime: it
+is fully described by its state field and the loop above is exact. A machine that uses
+**`history` states or `invoke`** — either form, the delay/`event` timer or the
+long-running `src` operation — keeps runtime the loop does not carry, and the loss is
+silent: you observe wrong behaviour, never an error. There are two distinct traps, and
+they pull in opposite directions.
+
+#### Trap 1 — timers write into rows you already released
+
+An `invoke` timer armed on entry fires on its own schedule, finds its leaf still active
+in the object it closed over, and writes a new state into a row the loop saved and moved
+past. The database says `working`, the orphaned object says `timedOut`, nothing is
+raised. A long-running `invoke.src` operation does the same when its completion event
+arrives.
+
+The timer firing late is not the defect — that is what a timer is. The defect is that
+nothing told the machine the row had been released. `detachOwner` is how you say it:
+
+```ts
+for (const row of page) {
+  const res = await sm.fireEventDetailedFor(row, 'submit')
+  if (res.fired) await save(row)
+  sm.detachOwner(row)   // released — no timer of this row's may fire now
+}
+```
+
+`detachOwner(owner)` cancels that owner's armed timers, aborts its in-flight operations,
+drops any event already queued for it, and drops its per-owner maps. The queue matters
+because a timer that fires raises its event and schedules the drain as a *microtask*:
+cancelling the timer cannot help an event that already left it. A dropped event is never
+left pending — `fireEventDetailedFor` resolves `{ fired: false, reason: 'aborted' }` and
+`fireEventFor` resolves `false`, rather than either hanging or throwing.
+
+It accepts a raw object or an `Adapter`, exactly as the `*For` family does; it is
+idempotent; and it returns an `OwnerDetachResult` — `{ timersCleared,
+operationsAborted, queuedEventsDropped }` — so a log line can say what was actually
+released.
+
+What it deliberately does not do: it never touches the `stateAttribute` field (the
+position you saved is the machine's last word on that row), it does not clear the
+construction owner from the machine, and it does not undo `attachToObject`'s listeners.
+
+**Garbage collection is not a substitute.** The per-owner maps are `WeakMap`s, so it is
+tempting to think dropping the object is enough. It is not, and the maps are the part
+that needs no help. GC never cancels a scheduled timer and never aborts an operation —
+and until both happen the owner is not even collectable, because the armed callback
+holds a strong reference to it. Dropping the history / entry-time / restart-count maps
+is the one thing GC would have done unaided; `detachOwner` merely does it immediately.
+
+**Without `detachOwner`, `load → fire → save` is unsupported for a timer-arming
+machine.** The alternative is to hold those owners resident for as long as their timers
+can fire, and save again after they have drained.
+
+#### Trap 2 — history does not survive a reload
+
+History is keyed on object identity. Load a row, advance it, release the object, then
+reload the row as a fresh object, and the history keyed to the old one is gone.
+Re-entering a `history` composite falls back to its `initial`, and any sibling regions
+the composite remembered go with it — so the machine re-enters a *narrower*
+configuration than it left.
+
+`detachOwner` does not rescue this one; it drops the history too, and on purpose. A
+released row is reloaded as a *new* object, so history kept against the old one is
+unreachable by the only party that would want it — retaining it would be a per-owner
+leak that is by construction unusable. Detach makes the loss immediate and honest
+instead of dependent on when the object happens to be collected.
+
+The real answer for history is the opposite of trap 1: keep the **same** object resident
+for the whole batch rather than reloading it, and history is exact, per record and
+independent between records. A machine that needs both history and timers wants resident
+owners, not a `load → fire → save` loop.
 
 ## 2. `StatePersistenceAdapter` — the machine's runtime, without its definition
 
@@ -60,6 +125,11 @@ This is the right tool when the machine is defined in code and you want its runt
 to survive a restart. The definition comes back from your source, the position comes
 back from storage. It is the smallest thing that works, and nothing in it can go
 stale against a code change except the state names themselves.
+
+`restoreState` adopts a position rather than re-entering it: a stored `currentState`
+naming a bare composite is completed to that composite's `initial` configuration, and no
+`onEnter` runs for what it completed into. Armed invoke *delays* are then resumed from
+the restored `stateEntryTimes` (see below).
 
 ## 3. `toJSON` / `fromJSON` — when the *definition* must travel
 
@@ -77,7 +147,10 @@ self-contained**. Whoever restores it must already have the functions.
 
 **The snapshot is primary-owner-only.** `currentState`, `history` and
 `stateEntryTimes` come from the construction owner. A machine driving many records
-through the `*For` family does not capture those records.
+through the `*For` family does not capture those records — and the reverse bites too:
+`fromJSON(json, row)` **writes** the payload's `currentState` onto whatever object you
+hand it, overwriting the state that row was actually in. The owner argument is where the
+snapshot is restored *to*, not a record whose own position is respected.
 
 Given both, the legitimate cases are narrower than "persist a machine":
 
@@ -104,7 +177,8 @@ And the cases it does *not* serve, each of which has a better answer above:
   promise cannot be resumed, so the elapsed portion is not persisted: a 5 s budget with
   4 s burned restores as a full 5 s. The bound is per action *per run*.
 - **A long-running `invoke.src` operation.** Its promise and `AbortSignal` do not
-  survive; a fresh entry into the state relaunches it.
+  survive. What happens on the next entry into the state depends entirely on whether you
+  supplied an action registry — see "Reading is unaffected" below.
 
 **Invoke delays are different and do resume correctly.** They are recomputed from the
 persisted `stateEntryTimes`: a 1000 ms timer snapshotted 400 ms in fires 600 ms after
@@ -140,10 +214,19 @@ declares an operation serializes fine, and so does a machine whose operation has
 settled — even while it is still sitting in the invoking state. Only the in-flight
 instant is refused.
 
-**Reading is unaffected.** A payload that already carries an operation marker still
-loads: without an action registry it loads with a warn, with one the `src` is re-linked
-silently. Either way the operation is not resumed — only a fresh entry into the state
-launches it. Existing stored data keeps working; the change is on the write side only.
+**Reading is unaffected, but the registry decides what the operation does next.** A
+payload that already carries an operation marker (`{ type: 'operation', slot, name }` —
+the `src` itself is dropped on write) always loads. Neither case *resumes* the operation:
+resumption recomputes a remaining delay, and an operation has none.
+
+- **With an action registry** that supplies the marker's `name`, the `src` is re-linked
+  silently — no warning — and the next entry into the state launches it normally.
+- **Without one**, the marker is not a runnable invocation and not a timer either: entry
+  logs `invoke operation not serializable; skipping non-resumable invoke on entry` and
+  launches nothing. A state whose only exit is that operation's `onDone` is then
+  terminal. This is the case to watch for; it is silent apart from the warn.
+
+Existing stored data keeps working; the write-side refusal above is the only change.
 
 ## Injection contracts are never persisted
 
