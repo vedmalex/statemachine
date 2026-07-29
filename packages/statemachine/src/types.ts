@@ -922,7 +922,16 @@ export type FireResult =
  * claim credit for work that is not detach's.
  */
 export interface OwnerDetachResult {
-  /** Armed `invoke` timers cancelled — the writes that would have landed late. */
+  /**
+   * Registered `invoke` timer handles this owner still held, all of them
+   * cancelled.
+   *
+   * Read it as "handles released", NOT as "late writes prevented". A handle stays
+   * registered after its timer FIRES — nothing removes it until the leaf is left
+   * or re-entered — so a timer that has already gone off is counted here even
+   * though cancelling it is a no-op. Whether anything was still LIVE is the
+   * separate question `continuationsCut` answers.
+   */
   timersCleared: number
   /**
    * In-flight `invoke` operations aborted. Counts only operations that were not
@@ -936,6 +945,19 @@ export interface OwnerDetachResult {
    * left pending.
    */
   queuedEventsDropped: number
+  /**
+   * B3/C1 — timer-form `invoke` continuations that were suspended mid-`await`
+   * inside their `invoke.action` at the moment of the detach, and have now been
+   * cut: each one returns without raising its event, instead of advancing the
+   * released row.
+   *
+   * This is the only field that reports work which was genuinely STILL RUNNING.
+   * The other three describe registrations and queue entries, and a fired timer
+   * inflates `timersCleared` while cancelling nothing — so a non-zero
+   * `continuationsCut` is the signal that the detach landed on a live
+   * continuation rather than on an already-quiet owner.
+   */
+  continuationsCut: number
 }
 
 ///Record<StateName, Omit<State<T>, 'name'>>

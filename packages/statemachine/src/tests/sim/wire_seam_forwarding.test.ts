@@ -261,3 +261,79 @@ describe('probe hygiene', () => {
     expect(existsSync(PROBE_DIR)).toBe(false)
   })
 })
+
+// ────────────────────────────────────────────────────────────────────────────
+// The gate on the gate. UNGATED on purpose — it runs on every leg.
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The `SM_SIM=1` probes above, and the ones in `dist_byte_guard.test.ts` and
+ * `tsconfig_isolation.test.ts`, executed on NO CI leg. `SM_SIM=1` appeared in
+ * `ci.yml` only on the `sim:pr` line, and `package.json`'s `sim:pr` scopes
+ * vitest to `src/tests/sim/sim-pr.run.test.ts` — one unrelated file. Every
+ * full-suite leg runs without `SM_SIM`, so `describe.skipIf(!GATED)` skipped
+ * them everywhere.
+ *
+ * The guards themselves still bit (the project-wide `tsc --noEmit` in
+ * `npm run check` catches an unclassified engine option regardless); what was
+ * dormant was the DEMONSTRATION that they bite, which is the whole point of a
+ * probe. `npm run sim:guards` + a `ci.yml` step fixed that, and this test is
+ * what stops the step from being deleted back into dormancy.
+ *
+ * NOT widened globally: setting `SM_SIM=1` on `npm test` would also switch on
+ * `sim-pr.run.test.ts` (the 64-seed PR sweep, already run as its own step),
+ * `sim-sweep.run.test.ts` (the nightly shard runner) and `metrics.perf.test.ts`
+ * (a perf REGRESSION with a recorded baseline that needs `--expose-gc` and is
+ * deliberately kept off the PR leg — `ci-gating.test.ts` asserts `sim:perf` is
+ * NOT in ci.yml). A named script keeps the compile guards and the heavy sweeps
+ * on separate switches.
+ */
+describe('the SM_SIM-gated compile guards actually run on a CI leg', () => {
+  const REPO_ROOT = resolve(ROOT, '..', '..')
+  const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8')) as {
+    scripts: Record<string, string>
+  }
+  const ci = readFileSync(resolve(REPO_ROOT, '.github', 'workflows', 'ci.yml'), 'utf8')
+
+  it('a `sim:guards` script sets SM_SIM=1 and names every gated compile-probe file', () => {
+    const script = pkg.scripts['sim:guards']
+    expect(script, 'package.json must define sim:guards').toBeDefined()
+    expect(script).toContain('SM_SIM=1')
+    for (const file of [
+      'src/tests/sim/wire_seam_forwarding.test.ts',
+      'src/tests/sim/dist_byte_guard.test.ts',
+      'src/tests/sim/tsconfig_isolation.test.ts',
+    ]) {
+      expect(script, `sim:guards must run ${file} — otherwise its probes stay dormant`).toContain(file)
+    }
+  })
+
+  it('ci.yml runs `sim:guards` on tier-a-node, exactly once, AFTER the build', () => {
+    expect(ci.split('npm run sim:guards').length - 1, 'exactly one sim:guards step').toBe(1)
+
+    const tierANode = ci.indexOf('tier-a-node:')
+    const tierBDeno = ci.indexOf('tier-b-deno:')
+    expect(tierANode).toBeGreaterThan(0)
+    const leg = ci.slice(tierANode, tierBDeno)
+    expect(leg, 'sim:guards belongs on the tier-a-node leg').toContain('npm run sim:guards')
+
+    // dist_byte_guard now FAILS on an unbuilt tree instead of skipping, so the
+    // step is only sound after `npm run build`.
+    expect(leg.indexOf('npm run build'), 'tier-a-node must build first').toBeGreaterThan(-1)
+    expect(leg.indexOf('npm run build')).toBeLessThan(leg.indexOf('npm run sim:guards'))
+  })
+
+  it('SM_SIM is NOT set on the full-suite legs (the heavy sweeps stay on their own steps)', () => {
+    // If someone "fixes" dormancy by exporting SM_SIM job-wide, the 64-seed PR
+    // sweep, the nightly shard runner and the perf regression all switch on
+    // silently. Keep the widening explicit and scoped.
+    for (const line of ci.split('\n')) {
+      if (!line.includes('SM_SIM')) continue
+      if (line.trim().startsWith('#')) continue // YAML comment, not a step
+      expect(
+        /npm run sim:(pr|guards|sweep|perf|coverage)/.test(line),
+        `SM_SIM appears on a line that is not a scoped sim script: ${line.trim()}`,
+      ).toBe(true)
+    }
+  })
+})

@@ -121,11 +121,84 @@ export interface RtcStallObservation {
    * Longest run of MICROTASK-ADJACENT samples for which the stall predicate
    * `queueTotal > 0 && !processing && inFlight === 0` held. `>= 2` is the I-13
    * witness; `1` is a reading a CORRECT machine legitimately produces.
+   *
+   * FORCED TO 0 unless {@link RtcStallObservation.hostMicrotaskPlane} is
+   * `'verified'` — see {@link makeRtcStallRecorder}.
    */
   readonly maxRun: number
   /** `queueTotal` observed at the sample that set {@link maxRun} (0 when none). */
   readonly witnessQueueTotal: number
+  /**
+   * Whether this host's `queueMicrotask` was OBSERVED to share the promise-
+   * continuation FIFO, which is the premise the I-13 one-turn bound rests on.
+   *
+   * - `'verified'` — a self-probe confirmed it; `maxRun` is a real reading.
+   * - `'foreign'` — the probe FAILED (a faked/deferring/synchronous
+   *   `queueMicrotask`); the observation is VACUOUS.
+   * - `'pending'` — the probe has not settled yet; vacuous until it does.
+   */
+  readonly hostMicrotaskPlane: 'verified' | 'foreign' | 'pending'
 }
+
+/** Mutable probe result slot; `verified === undefined` means "not settled yet". */
+interface HostPlaneProbe {
+  verified: boolean | undefined
+}
+
+/**
+ * One probe per DISTINCT `queueMicrotask` implementation, so the normal case
+ * costs nothing: the module-load probe below claims the native function, and
+ * every later {@link makeRtcStallRecorder} is a lookup hit that queues no
+ * microtasks and therefore cannot perturb the sample stream it observes.
+ */
+const HOST_PLANE_PROBES = new WeakMap<object, HostPlaneProbe>()
+
+/**
+ * Establish, by OBSERVATION rather than by assertion, that `qmt` behaves like
+ * the native `queueMicrotask`: a callback handed to it must run
+ *
+ *  - NOT synchronously (it is a microtask, not a direct call), and
+ *  - BEFORE a promise continuation queued AFTER it (one shared FIFO queue).
+ *
+ * That second half is exactly the step the I-13 one-turn bound is built on —
+ * "any microtask already queued at sample n runs before sample n+1". A
+ * `Function.prototype.toString` native-code sniff would be weaker: a wrapper
+ * that defers is trivially able to defeat it, and a legitimate polyfill would
+ * fail it. A behavioural probe judges the behaviour.
+ */
+function probeHostPlane(qmt: typeof queueMicrotask): HostPlaneProbe {
+  const key = qmt as unknown as object
+  const hit = HOST_PLANE_PROBES.get(key)
+  if (hit !== undefined) {
+    return hit
+  }
+  const slot: HostPlaneProbe = { verified: undefined }
+  HOST_PLANE_PROBES.set(key, slot)
+  void (async (): Promise<void> => {
+    let ran = false
+    try {
+      qmt(() => {
+        ran = true
+      })
+    } catch {
+      slot.verified = false // not callable as a microtask sink at all
+      return
+    }
+    if (ran) {
+      slot.verified = false // ran SYNCHRONOUSLY — not a microtask
+      return
+    }
+    // The continuation of this await is queued STRICTLY AFTER the callback
+    // above. Under one shared FIFO plane the callback has already run.
+    await Promise.resolve()
+    slot.verified = ran
+  })()
+  return slot
+}
+
+// Claim the load-time `queueMicrotask` eagerly, at import, so no recorder
+// constructed during a run ever pays for a probe on the normal path.
+probeHostPlane(globalThis.queueMicrotask)
 
 /**
  * A live, run-scoped accumulator over {@link SettleSample}s implementing the I-13
@@ -145,6 +218,35 @@ export interface RtcStallObservation {
  * !processing` once. One positive is therefore NOT a finding; two consecutive
  * ones are.
  *
+ * THE HOST IS PART OF THE PREMISE, AND IT IS CHECKED. Every step of the
+ * one-turn bound above is about the ENGINE except one: "a pending
+ * `queueMicrotask(processQueues)` runs between two samples". That is a property
+ * of the HOST — it holds because `queueMicrotask` callbacks and promise
+ * continuations share one FIFO microtask queue. Under a harness that FAKES
+ * `queueMicrotask` (sinon fake-timers supports it; `vi.useFakeTimers({ toFake:
+ * [...] })` can reach it) `scheduleProcessing`'s continuation is deferred
+ * arbitrarily and the predicate holds for the whole budget on a PERFECTLY
+ * CORRECT machine.
+ *
+ * That is not hypothetical. MEASURED on `a -(invoke delay:0, async action)-> b`
+ * — the fixture whose native reading is `maxRun: 1` — with `queueMicrotask`
+ * replaced by a deferring stub: `maxRun: 44` in a 64-turn budget, which is the
+ * SAME number `invariants.ts` records for the deliberately MUTATED engine. The
+ * deciding variable was the observer, not the machine: exactly the failure
+ * family that withdrew four earlier RTC oracles.
+ *
+ * So the recorder ESTABLISHES the premise instead of asserting it in a comment
+ * (`header.runtime` pins a STRING, not the fact). {@link probeHostPlane} runs a
+ * one-shot behavioural self-probe and `observation()` reports
+ * `hostMicrotaskPlane` with `maxRun` FORCED TO 0 whenever it is not
+ * `'verified'` — a missing premise makes the oracle vacuous, never a conviction
+ * (the I-4 convention).
+ *
+ * LIMIT, stated: the plane is re-resolved from `globalThis` at `observation()`
+ * time, so a fake installed at any point before the observation is read is
+ * caught. A fake installed and REMOVED entirely within one run is not
+ * observable by this design.
+ *
  * The returned `onSample` is an ARROW closure with no `this`, so it can be
  * detached and handed straight to {@link SettleArgs.onSample}.
  */
@@ -152,6 +254,7 @@ export function makeRtcStallRecorder(): {
   readonly onSample: (sample: SettleSample) => void
   observation(): RtcStallObservation
 } {
+  probeHostPlane(globalThis.queueMicrotask)
   let samples = 0
   let run = 0
   let maxRun = 0
@@ -179,7 +282,19 @@ export function makeRtcStallRecorder(): {
       }
     },
     observation(): RtcStallObservation {
-      return { samples, maxRun, witnessQueueTotal }
+      const { verified } = probeHostPlane(globalThis.queueMicrotask)
+      if (verified !== true) {
+        // VACUOUS. `samples` stays honest so a caller can see the plane was
+        // wired and still produced no reading, rather than mistaking this for
+        // "never sampled".
+        return {
+          samples,
+          maxRun: 0,
+          witnessQueueTotal: 0,
+          hostMicrotaskPlane: verified === false ? 'foreign' : 'pending',
+        }
+      }
+      return { samples, maxRun, witnessQueueTotal, hostMicrotaskPlane: 'verified' }
     },
   }
 }

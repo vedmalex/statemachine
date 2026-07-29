@@ -155,6 +155,41 @@ type DispatchHook =
 const ENGINE_OWNED_DISPATCH: DispatchHook = 'error.default'
 
 /**
+ * A1/C2 — is this value something the ENGINE WILL WAIT ON?
+ *
+ * The funnel's whole job is to hold a slot open for exactly as long as the
+ * engine is inside consumer code, so its liveness test must be the same question
+ * the engine's own `await` asks — and `await` asks "is it a THENABLE", not "is it
+ * a native `Promise`".
+ *
+ * `x instanceof Promise` answers a NARROWER question: it is false for a Bluebird
+ * or Q promise, for a mocking library's thenable, and for a native promise from
+ * another realm (`vm`, an `iframe`, a second bundled copy of a polyfill). Every
+ * such value is still adopted — by the bare `await`s in `saveState` /
+ * `restoreState`, by `Promise.resolve(result).then(...)` around `invoke.src`, and
+ * (less obviously but just as really) by the `async` `callAction` itself, whose
+ * returned promise adopts a thenable an action arm handed back. So on the
+ * `instanceof` branch the engine waited and the funnel did not: the in-flight
+ * scalar fell to zero and the span's `end` was emitted WHILE the consumer body
+ * was still running. That is the timeout-zombie shape A1 exists to remove,
+ * reached through a different door, and it is worse than a silent gap because
+ * `describeProgress()` then prints "no consumer callable is open" AND reports the
+ * lifecycle trace as agreeing with it — two sources concurring on a false
+ * statement.
+ *
+ * `src/sim/env.ts` `bracketAsync` asks the same question for the harness-side
+ * counter and MUST stay consistent with this one; the two are checked against
+ * each other in `src/tests/thenable_liveness.test.ts`.
+ */
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof (value as PromiseLike<unknown>).then === 'function'
+  )
+}
+
+/**
  * A1 — ONE open dispatch: a consumer callable that has been entered and whose own
  * promise has not settled. Held in {@link StateMachine.openDispatches} for the
  * lifetime of the call and dropped on settle, so the set size is bounded by REAL
@@ -589,6 +624,43 @@ export class StateMachine<
   // aborted operation's completion event is dropped, so the machine no longer
   // waits on it).
   private inFlightInvokesByOwner: WeakMap<object, Set<InFlightInvoke>> =
+    new WeakMap()
+  /**
+   * B3/C1 — per-owner set of TIMER-FORM invoke continuations currently suspended
+   * inside `await invoke.action`, i.e. the one live thing `detachOwner` could not
+   * previously see or cut.
+   *
+   * ## Why a third map and not one of the two above
+   * The timer form has no `AbortController` (only `invoke.src` does) and its
+   * handle is no longer cancellable (the timer already FIRED), so at the moment
+   * of the await neither existing map describes it:
+   *
+   * - `activeTimersByOwner` still lists the handle, but `clearTimer` on a fired
+   *   timer is a no-op — it cancels nothing and the continuation runs anyway;
+   * - `activeInvokesByOwner` is empty, because the timer form allocates no
+   *   controller;
+   * - `inFlightInvokesByOwner` is `invoke.src`-only by construction.
+   *
+   * So `detachOwner` found nothing to cut, reported a cancellation it had not
+   * performed (`timersCleared: 1` for a timer that had already fired), and the
+   * suspended callback went on to `raiseEvent` + drain and advance a row the
+   * caller had released — the module's opening defect, reached through the
+   * `invoke.action` + `event` shape instead of the bare timer.
+   *
+   * ## Why a token SET and not a detached-owner FLAG
+   * A "this owner is detached" marker has to be UNSET again when the owner is
+   * re-adopted (a later `fireEventFor` on the same object is documented to
+   * re-adopt it), and there is no single re-adoption chokepoint to unset it in —
+   * a flag left set silently breaks every future timer of a re-adopted row.
+   *
+   * A per-continuation token has no such state to maintain. The callback adds one
+   * before awaiting and TEST-AND-REMOVES it after (`Set.delete` returns whether
+   * it was still there), so "released" is read from the ABSENCE the detach
+   * itself caused, one atomic operation, and the set empties itself on every
+   * normal completion. Re-adoption needs no handling at all: the new residency
+   * mints new tokens and the old ones are already gone.
+   */
+  private suspendedInvokeContinuationsByOwner: WeakMap<object, Set<object>> =
     new WeakMap()
   // W3b.1 livelock bound: consecutive invoke-operation restarts after an
   // aborted-without-commit microstep, per source leaf. Reset on a committed
@@ -1334,7 +1406,10 @@ export class StateMachine<
       throw error
     }
     if (engineOwned) return raw
-    if (raw instanceof Promise) {
+    // C2 — THENABLE, not `instanceof Promise`: the slot must stay open for as
+    // long as the ENGINE waits, and the engine `await`s anything with a `then`.
+    // See {@link isThenable}.
+    if (isThenable(raw)) {
       // The SPAN's identity wins when there is one: `callAction` only knows the
       // configuration it was called from, while the span knows the SLOT — and
       // "`onEnter@work.r1` has been open for M ticks" is the whole deliverable.
@@ -1345,18 +1420,31 @@ export class StateMachine<
         openedAtTick: this.engineTick,
       }
       this.openDispatches.add(record)
-      raw.then(
-        (value) => {
-          this.userDispatchInFlight--
-          this.openDispatches.delete(record)
-          if (span) this.closeSpan(span, false, Boolean(value))
-        },
-        () => {
-          this.userDispatchInFlight--
-          this.openDispatches.delete(record)
-          if (span) this.closeSpan(span, true, false)
-        },
-      )
+      // C2 — a FOREIGN thenable is consumer code too: it may call both handlers,
+      // call one twice, or throw out of `then`. A native promise can do none of
+      // these, so this guard costs the hot path one closure variable and buys the
+      // counter the only property that makes it readable — it can never go
+      // negative, which would be a worse lie than the one this branch fixes.
+      let settled = false
+      const close = (failed: boolean, outcome: boolean): void => {
+        if (settled) return
+        settled = true
+        this.userDispatchInFlight--
+        this.openDispatches.delete(record)
+        if (span) this.closeSpan(span, failed, outcome)
+      }
+      try {
+        raw.then(
+          (value) => close(false, Boolean(value)),
+          () => close(true, false),
+        )
+      } catch (error) {
+        // `then` itself threw: nothing will ever settle this slot, so close it
+        // now rather than leak an open dispatch that never resolves. The error is
+        // the CALLER's to route — it is the same one their own `await` will see.
+        close(true, false)
+        throw error
+      }
       return raw
     }
     this.userDispatchInFlight--
@@ -1515,6 +1603,22 @@ export class StateMachine<
       this.activeInvokesByOwner.set(key, m)
     }
     return m
+  }
+
+  /**
+   * B3/C1 — the current owner's set of suspended invoke-timer continuation
+   * tokens (created on first access). See
+   * `suspendedInvokeContinuationsByOwner` for why the liveness of a fired
+   * timer's continuation needs its own map.
+   */
+  private suspendedInvokeContinuationsFor(obj?: Adapter<any>): Set<object> {
+    const key = this.ownerKey(obj)
+    let s = this.suspendedInvokeContinuationsByOwner.get(key)
+    if (!s) {
+      s = new Set()
+      this.suspendedInvokeContinuationsByOwner.set(key, s)
+    }
+    return s
   }
 
   /**
@@ -2865,6 +2969,22 @@ export class StateMachine<
    *   re-adopted owner.
    * - It does not undo {@link attachToObject}. Those listeners live on the
    *   caller's object and are removed by the caller.
+   * - **It does not abort a microstep that is ALREADY EXECUTING for this owner.**
+   *   Detaching from inside one of that microstep's own actions is too late by
+   *   construction, not by omission: `processQueues` `shift()`s the event off the
+   *   queue BEFORE awaiting `executeQueuedTransition`, so at the moment your
+   *   action runs the event is in neither queue and the queue purge
+   *   (`dropQueuedEventsForOwner`) cannot see it. The microstep therefore
+   *   RUNS TO COMPLETION and writes its target state into the row. That is also
+   *   the safe answer — a half-applied microstep is a worse artefact than one
+   *   extra committed transition — but it means a `detachOwner` called from
+   *   inside an action releases the owner from the NEXT event onward, not from
+   *   this one. Detach from the batch loop (between events), which is where the
+   *   `load → fire → save` shape puts it anyway.
+   *
+   *   The continuation of an `invoke.action` is the OPPOSITE case and IS cut: it
+   *   is suspended between microsteps with its event not yet raised, so there is
+   *   still something to prevent — see {@link OwnerDetachResult.continuationsCut}.
    *
    * Idempotent: detaching an owner twice releases nothing the second time and
    * returns all zeros.
@@ -2917,6 +3037,17 @@ export class StateMachine<
     // make `assertNoInFlightInvokes` believe a released owner is still busy.
     this.inFlightInvokesByOwner.get(key)?.clear()
 
+    // B3/C1 — CUT the live continuations `clearTimer` cannot reach: a timer-form
+    // invoke whose timer already FIRED and which is suspended inside `await
+    // invoke.action`. Emptying the set is what the callback's post-await
+    // test-and-remove reads as "released", so the raise never happens and the
+    // released row is not advanced. This is the ONLY number here that can be
+    // non-zero over work that was genuinely still running at the moment of
+    // detach — see {@link OwnerDetachResult.continuationsCut}.
+    const suspended = this.suspendedInvokeContinuationsByOwner.get(key)
+    const continuationsCut = suspended ? suspended.size : 0
+    suspended?.clear()
+
     const queuedEventsDropped = this.dropQueuedEventsForOwner(key)
 
     // The per-owner runtime GC would have reclaimed on its own; dropped here so
@@ -2928,9 +3059,15 @@ export class StateMachine<
     this.activeTimersByOwner.delete(key)
     this.activeInvokesByOwner.delete(key)
     this.inFlightInvokesByOwner.delete(key)
+    this.suspendedInvokeContinuationsByOwner.delete(key)
     this.ownerAdapters.delete(key)
 
-    return { timersCleared, operationsAborted, queuedEventsDropped }
+    return {
+      timersCleared,
+      operationsAborted,
+      queuedEventsDropped,
+      continuationsCut,
+    }
   }
 
   /**
@@ -4319,6 +4456,45 @@ export class StateMachine<
    * expansion is what makes the completion IDENTICAL to the write paths': same
    * region expansion, same nested-composite recursion, same `documentIndex`
    * ordering. An already-well-formed configuration never reaches it.
+   *
+   * ## B2/C4 — the two things delegation gets WRONG on a MIXED field
+   * `computeInternalWrite` is a WRITE primitive: its parts are applied in order,
+   * each overwriting whatever occupied its region, and a final pass drops every
+   * surviving non-dotted entry (that pass is what strips the `idle` root a
+   * transition into `work` replaces — load-bearing, and correct, for a write).
+   * Handing it a consumer-hydrated field VERBATIM inherits both behaviours in a
+   * context where neither is wanted, and both failures were SILENT:
+   *
+   * 1. **The composite rewound its own descendant.** `'work.r.stepB|work'` came
+   *    back as `'work.r.stepA'`: the bare parent was applied last, and expanding
+   *    it to its `initial` overwrote the very position the field recorded. On a
+   *    parallel composite the loss is plainer still — `'proc.a.done|proc'`
+   *    returned `'proc.a.run|proc.b.run'`, silently reverting a finished region
+   *    to its start. Fixed by ORDER, not by a special case: bare composites are
+   *    applied first (outermost first), explicit parts last, so a descendant
+   *    always wins over the ancestor whose regions it refines, and the result no
+   *    longer depends on the order the consumer happened to serialise. The
+   *    composite's OTHER regions are still completed, which is the whole point —
+   *    dropping the redundant `proc` instead would leave region `b` unentered.
+   *
+   * 2. **A contradictory field lost a part in silence.** `'idle|work'` — two
+   *    roots active at once, which no configuration can mean — returned plain
+   *    `'work.r.stepA'`: the drop-pass deleted `idle` and nothing said so. There
+   *    is no completion of that field, so it is now REFUSED. The post-condition
+   *    below is the general form of the check, not a test for `idle` in
+   *    particular: every input part must survive as itself or be refined into a
+   *    descendant. Throwing is the established contract of this read — a field
+   *    naming a state that does not exist has always thrown the sibling
+   *    `Invalid state path in current state` error from a few lines up — and it
+   *    keeps a corrupted row loud rather than quietly half-adopted. The
+   *    invoke-timer callback that reads `getCurrentState` from a scheduler
+   *    microtask catches it (see `armStateInvoke`) so it cannot become a
+   *    floating rejection.
+   *
+   * A well-formed field still never reaches any of this: both early returns
+   * above fire first, and a field with no bare composite is returned verbatim —
+   * including `'work.r.stepA|work.r.stepB'`, two leaves of one region, which this
+   * path has never claimed to police.
    */
   private completeConfiguration(currentState: string): string {
     if (currentState.indexOf('|') === -1) {
@@ -4328,7 +4504,38 @@ export class StateMachine<
     }
     const parts = currentState.split('|')
     if (!parts.some((part) => this.isBareComposite(part))) return currentState
-    return this.computeInternalWrite('', currentState)
+
+    // (1) Bare composites first — outermost first, so a nested composite refines
+    // the expansion of its parent rather than being clobbered by it — then the
+    // explicit parts, each keeping its relative order. `sort` is stable, so this
+    // is a pure partition by `rank`.
+    const ordered = parts
+      .map((part, index) => ({
+        part,
+        index,
+        rank: this.isBareComposite(part) ? countDots(part) : Number.MAX_SAFE_INTEGER,
+      }))
+      .sort((a, b) => a.rank - b.rank || a.index - b.index)
+      .map((entry) => entry.part)
+
+    const completed = this.computeInternalWrite('', ordered.join('|'))
+
+    // (2) The post-condition: completion REFINES, it never discards. Any input
+    // part with no representative in the result was contradicted by another part
+    // rather than expanded, and the field has no meaning to adopt.
+    const completedParts = completed.split('|')
+    for (const part of parts) {
+      const kept = completedParts.some(
+        (leaf) => leaf === part || leaf.startsWith(`${part}.`),
+      )
+      if (!kept) {
+        throw new StateMachineError(
+          `Contradictory state field: ${part} in ${currentState} is not part of any configuration this machine can be in (completed to ${completed})`,
+          { state: currentState },
+        )
+      }
+    }
+    return completed
   }
 
   private setInitialState(
@@ -6304,10 +6511,31 @@ export class StateMachine<
       // Timer form (PRESERVED): raise `event` after `delay` ms.
       const timer = invocation
       const callback = async () => {
-        const currentState = this.getCurrentState(obj as any)
-        if (currentState?.split('|').includes(toStateName)) {
-          try {
-            if (timer.action) {
+        // B3/C1 + B2 — the leaf-residency read is INSIDE the try.
+        //
+        // `getCurrentState` throws on a corrupted state field ('Invalid state
+        // path in current state: …'), and this is a TIMER microtask with no
+        // caller to catch it: outside the try that throw left the callback as a
+        // floating rejection — a real process `unhandledRejection`, which is
+        // precisely the failure mode `safeGetCurrentState` was introduced to
+        // keep out of the drain. Inside, it routes through the same observable
+        // channel as any other invoke failure ({@link reportInvokeTimerFailure}
+        // → monitor / onError), and the timer simply does not fire.
+        //
+        // NOT `safeGetCurrentState`: that would swallow a corrupted row in
+        // silence. A released/broken owner must be VISIBLE, just not fatal.
+        try {
+          const currentState = this.getCurrentState(obj as any)
+          if (!currentState?.split('|').includes(toStateName)) return
+          if (timer.action) {
+            // B3/C1 — mint this continuation's liveness token BEFORE suspending.
+            // `detachOwner` clears the set, so the `delete` below reports whether
+            // the owner was still attached across the whole await.
+            const live = this.suspendedInvokeContinuationsFor(obj)
+            const continuation: object = {}
+            live.add(continuation)
+            let released = false
+            try {
               await this.runTracedInvokeAction(
                 obj,
                 timer.action,
@@ -6315,23 +6543,37 @@ export class StateMachine<
                 microstep,
                 timer.event !== undefined ? String(timer.event) : undefined,
               )
-              this.tick('invoke.action')
+            } finally {
+              // In a `finally` so a THROWING action retires its token too —
+              // otherwise a failed action would leave a phantom in the set and
+              // `detachOwner` would report cutting a continuation that had
+              // already ended.
+              released = !live.delete(continuation)
             }
-            this.raiseEvent(timer.event as string, obj as any, {
-              hook: 'raise.invoke.timer',
-              state: toStateName,
-              // The ARMING microstep from the enclosing closure (INVOKE ASYMMETRY).
-              microstep,
-            })
-            this.scheduleProcessing()
-          } catch (err) {
-            this.logger.error(
-              'Invocation error',
-              { state: toStateName, event: timer.event },
-              err as Error,
-            )
-            this.reportInvokeTimerFailure(err, toStateName, timer.event, obj)
+            // B3/C1 — THE RE-CHECK. `detachOwner` ran while this callback was
+            // suspended: the row has been released and saved, and raising its
+            // event now would drain and write a state nobody will persist. The
+            // pre-await residency check cannot cover this window, and neither
+            // half of the existing teardown can: `clearTimer` is a no-op on a
+            // timer that already fired, and `dropQueuedEventsForOwner` finds
+            // nothing because the raise has not happened yet.
+            if (released) return
+            this.tick('invoke.action')
           }
+          this.raiseEvent(timer.event as string, obj as any, {
+            hook: 'raise.invoke.timer',
+            state: toStateName,
+            // The ARMING microstep from the enclosing closure (INVOKE ASYMMETRY).
+            microstep,
+          })
+          this.scheduleProcessing()
+        } catch (err) {
+          this.logger.error(
+            'Invocation error',
+            { state: toStateName, event: timer.event },
+            err as Error,
+          )
+          this.reportInvokeTimerFailure(err, toStateName, timer.event, obj)
         }
       }
 
@@ -6381,7 +6623,22 @@ export class StateMachine<
     const startOp = () => {
       // Still in the leaf, and not already aborted by an exit that raced the
       // scheduled start.
-      const currentState = this.getCurrentState(obj as any)
+      //
+      // B2/C3 — the read is GUARDED for the same reason the timer form's is:
+      // `getCurrentState` throws on a corrupted state field, and this callback
+      // runs from the SCHEDULER with nobody to catch it. Unguarded, a corrupted
+      // row turned a launch into an uncaught exception out of a timer callback
+      // (worse than the timer form's floating rejection — this arrow is
+      // synchronous). The launch slot is retired and the failure is reported
+      // through the observable channel instead.
+      let currentState: string | undefined
+      try {
+        currentState = this.getCurrentState(obj as any)
+      } catch (err) {
+        retire()
+        this.reportInvokeTimerFailure(err, toStateName, op.onDone, obj)
+        return
+      }
       if (!currentState?.split('|').includes(toStateName)) {
         retire()
         return

@@ -612,6 +612,7 @@ export interface OpenDispatch {
 
 // @public
 export interface OwnerDetachResult {
+    continuationsCut: number;
     operationsAborted: number;
     queuedEventsDropped: number;
     timersCleared: number;

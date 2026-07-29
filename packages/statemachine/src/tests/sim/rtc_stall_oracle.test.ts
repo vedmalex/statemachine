@@ -50,12 +50,14 @@ import {
 import { runSafety } from '../../sim/invariants.runner'
 import { runSimulation } from '../../sim/public'
 import {
+  type RtcStallObservation,
   type SettleScheduler,
   type SettleSample,
   makeRtcStallRecorder,
   settleMacrostep,
 } from '../../sim/settle'
 import type { CanonicalHeader, CanonicalTrace } from '../../sim/trace'
+import { type Adjacency, analyzeAdjacency, stripCommentsAndStrings } from '../source-scan'
 
 // ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -459,48 +461,63 @@ describe('I-13 premise 2: the run-away break clears BOTH queues before breaking'
 
 // ── 6. property 3: every enqueue is paired with a schedule ───────────────────
 
-/** Lines from `at` (exclusive) up to the first `this.scheduleProcessing()`, or null. */
-function pairing(at: number, window = 30): { schedAt: number; awaits: string[] } | null {
-  const seg = engineSrc.slice(at, at + window)
-  const k = seg.findIndex((l, i) => i > 0 && l.includes('this.scheduleProcessing()'))
-  if (k < 0) {
-    return null
-  }
-  return {
-    schedAt: at + k,
-    awaits: seg.slice(1, k).filter((l) => /\bawait\b/.test(l)).map((l) => l.trim()),
-  }
+/**
+ * The engine, COMMENT- AND STRING-STRIPPED. Brace depth is what makes the
+ * pairing check below control-flow aware, and a brace inside a comment or a
+ * string literal would desynchronise it — the same class of defect A0 removed
+ * from the source-scan stripper.
+ */
+const engineCode = stripCommentsAndStrings(engineSrc.join('\n')).split('\n')
+
+const SCHEDULE = 'this.scheduleProcessing()'
+
+/**
+ * Is the site at `line` UNCONDITIONALLY followed by `this.scheduleProcessing()`
+ * with no suspension in between?
+ *
+ * This USED to be a textual proximity scan: "some `this.scheduleProcessing()`
+ * within the next 30 lines, with no `await`-bearing line between". That is blind
+ * to control flow, and it accepted `if (a) { raise } if (b) { schedule }`, a
+ * conditionally-guarded schedule, and a `return`/`continue` between the two —
+ * none of which pairs the enqueue with a drain. All five live sites are
+ * genuinely atomic, so this was guard STRENGTH rather than a live defect, but
+ * the check asserted less than the comment below claimed for it.
+ *
+ * {@link analyzeAdjacency} replaces the window with a brace-depth walk; the
+ * synthetic accept/reject cases it must satisfy are pinned in the
+ * `pairing analyzer` describe below.
+ */
+function pairing(line: number, marker: string): Adjacency {
+  const col = (engineCode[line] as string).indexOf(marker)
+  return analyzeAdjacency(engineCode, line, col < 0 ? 0 : col + marker.length, SCHEDULE)
+}
+
+/** Line indices at which `marker` occurs in the STRIPPED engine source. */
+function sitesOf(marker: string | RegExp): number[] {
+  const test = typeof marker === 'string' ? (l: string): boolean => l.includes(marker) : (l: string): boolean => marker.test(l)
+  return engineCode.map((l, i) => ({ l, i })).filter(({ l }) => test(l)).map(({ i }) => i)
 }
 
 describe('I-13 premise 3: every enqueue is paired with a schedule', () => {
-  it('every `this.raiseEvent(` call site schedules processing with NO await in between', () => {
-    const sites = engineSrc
-      .map((l, i) => ({ l, i }))
-      .filter(({ l }) => /this\.raiseEvent\(/.test(l))
-      .map(({ i }) => i)
+  it('every `this.raiseEvent(` call site schedules processing UNCONDITIONALLY and with NO await', () => {
+    const sites = sitesOf(/this\.raiseEvent\(/)
     expect(sites.length, 'no raiseEvent call sites found — the check has rotted').toBeGreaterThan(0)
     for (const at of sites) {
-      const p = pairing(at)
-      expect(p, `raiseEvent at line ${at + 1} has NO scheduleProcessing within 30 lines — ` +
-        'the internal queue can grow with nothing scheduled to drain it (the I-13 witness)').not.toBeNull()
+      const p = pairing(at, 'this.raiseEvent(')
       expect(
-        p?.awaits,
-        `raiseEvent at line ${at + 1} is separated from its scheduleProcessing by an await: ` +
-          'a sample can land in the gap and the pairing is no longer atomic',
-      ).toEqual([])
+        p.ok,
+        `raiseEvent at line ${at + 1}: ${p.ok ? '' : p.why}. The internal queue can grow with ` +
+          'nothing guaranteed to drain it (the I-13 witness).',
+      ).toBe(true)
     }
   })
 
-  it('every `externalQueue.push(` schedules processing with NO await in between', () => {
-    const sites = engineSrc
-      .map((l, i) => ({ l, i }))
-      .filter(({ l }) => l.includes('externalQueue.push('))
-      .map(({ i }) => i)
+  it('every `externalQueue.push(` schedules processing UNCONDITIONALLY and with NO await', () => {
+    const sites = sitesOf('externalQueue.push(')
     expect(sites.length).toBeGreaterThan(0)
     for (const at of sites) {
-      const p = pairing(at)
-      expect(p, `externalQueue.push at line ${at + 1} has no scheduleProcessing`).not.toBeNull()
-      expect(p?.awaits, `externalQueue.push at line ${at + 1} is separated by an await`).toEqual([])
+      const p = pairing(at, 'externalQueue.push(')
+      expect(p.ok, `externalQueue.push at line ${at + 1}: ${p.ok ? '' : p.why}`).toBe(true)
     }
   })
 
@@ -511,16 +528,109 @@ describe('I-13 premise 3: every enqueue is paired with a schedule', () => {
     //   - the one inside `raiseEvent` (covered by the call-site check above);
     //   - the `type === 'internal'` branch of `enqueueEvent`, which is DEAD (see
     //     the next assertion) and is the ONLY unpaired push in the engine.
-    // Folding `scheduleProcessing` into `raiseEvent` would turn this five-site
-    // convention into a compile-shape guarantee. Until that happens, this test is
-    // the only thing standing between a dropped call and a silently wedged queue.
-    const pushes = engineSrc
-      .map((l, i) => ({ l, i }))
-      .filter(({ l }) => l.includes('internalQueue.push('))
+    //
+    // WHAT THIS GUARD ACTUALLY PROVES, stated exactly: for each of the five call
+    // sites, a `this.scheduleProcessing()` is reached from the enqueue with no
+    // intervening `await`, no early exit, and no branch — i.e. the enqueue and
+    // the schedule are in ONE straight-line block. It is a source-text check, so
+    // it cannot see a schedule reached through a helper call, and it does not
+    // prove the scheduled drain is CORRECT — only that one is unconditionally
+    // requested. Folding `scheduleProcessing` into `raiseEvent` would replace the
+    // whole convention with a compile-shape guarantee and make this test
+    // redundant; that refactor is core-owned and still the right end state.
+    const pushes = sitesOf('internalQueue.push(')
     expect(pushes.length).toBe(2)
-    for (const { i } of pushes) {
-      expect(pairing(i), `internalQueue.push at line ${i + 1} now self-pairs — if raiseEvent was ` +
-        'given its own scheduleProcessing, relax this expectation (the guarantee got STRONGER)').toBeNull()
+    for (const i of pushes) {
+      const p = pairing(i, 'internalQueue.push(')
+      expect(
+        p.ok,
+        `internalQueue.push at line ${i + 1} now self-pairs — if raiseEvent was given its own ` +
+          'scheduleProcessing, relax this expectation (the guarantee got STRONGER)',
+      ).toBe(false)
+    }
+  })
+
+  it('the analyzer REJECTS the control-flow shapes the old proximity window accepted', () => {
+    // Each case is a shape the 30-line/no-await window passed. If any of these
+    // start returning ok, the guard has silently reverted to proximity.
+    const cases: ReadonlyArray<{ readonly name: string; readonly src: string; readonly ok: boolean }> = [
+      {
+        name: 'ATOMIC (control): straight-line raise then schedule',
+        src: ['fn() {', '  this.raiseEvent(e)', '  this.scheduleProcessing()', '}'].join('\n'),
+        ok: true,
+      },
+      {
+        name: 'different branches: if (a) { raise } if (b) { schedule }',
+        src: [
+          'fn() {',
+          '  if (a) {',
+          '    this.raiseEvent(e)',
+          '  }',
+          '  if (b) {',
+          '    this.scheduleProcessing()',
+          '  }',
+          '}',
+        ].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'conditionally scheduled: raise; if (b) { schedule }',
+        src: ['fn() {', '  this.raiseEvent(e)', '  if (b) {', '    this.scheduleProcessing()', '  }', '}'].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'unreachable: raise; return; schedule',
+        src: ['fn() {', '  this.raiseEvent(e)', '  return', '  this.scheduleProcessing()', '}'].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'loop-skipped: raise; continue; schedule',
+        src: [
+          'fn() {',
+          '  for (;;) {',
+          '    this.raiseEvent(e)',
+          '    continue',
+          '    this.scheduleProcessing()',
+          '  }',
+          '}',
+        ].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'non-atomic: raise; await x; schedule',
+        src: ['fn() {', '  this.raiseEvent(e)', '  await x()', '  this.scheduleProcessing()', '}'].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'same line, conditional: raise; if (b) { schedule } on one line',
+        src: ['fn() {', '  this.raiseEvent(e); if (b) { this.scheduleProcessing() }', '}'].join('\n'),
+        ok: false,
+      },
+      {
+        name: 'brace inside a STRING must not be read as a block',
+        src: ['fn() {', '  this.raiseEvent(e)', "  log('{')", '  this.scheduleProcessing()', '}'].join('\n'),
+        ok: true,
+      },
+      {
+        name: 'schedule only in a NESTED helper block after the site block closed',
+        src: [
+          'fn() {',
+          '  if (a) {',
+          '    this.raiseEvent(e)',
+          '  }',
+          '  this.scheduleProcessing()',
+          '}',
+        ].join('\n'),
+        ok: false,
+      },
+    ]
+
+    for (const c of cases) {
+      const lines = stripCommentsAndStrings(c.src).split('\n')
+      const at = lines.findIndex((l) => l.includes('this.raiseEvent('))
+      const col = (lines[at] as string).indexOf('this.raiseEvent(') + 'this.raiseEvent('.length
+      const got = analyzeAdjacency(lines, at, col, SCHEDULE)
+      expect(got.ok, `${c.name} — analyzer said ${got.ok ? 'PAIRED' : `NOT paired (${got.why})`}`).toBe(c.ok)
     }
   })
 
@@ -565,6 +675,88 @@ const baseCtx = (): CheckerContext => ({
 describe('I-13 vacuity + opt-in-ness', () => {
   it('is VACUOUS when no sample plane is wired', () => {
     expect(runSafety(INVARIANTS, traceOf(), baseCtx())).toBeNull()
+  })
+
+  it('is VACUOUS on a host with a FAKED queueMicrotask (the premise, established not asserted)', async () => {
+    // The load-bearing step of the one-turn bound — "any microtask already
+    // queued at sample n runs before sample n+1" — is a property of the HOST,
+    // not of the machine. `settle.ts` and `driver.ts` used to record it as a
+    // COMMENT ("vitest does NOT fake queueMicrotask") and `header.runtime` pins
+    // a string, not the fact.
+    //
+    // Under a deferring `queueMicrotask` this CORRECT machine reads maxRun 44 in
+    // a 64-turn budget — the SAME number `invariants.ts` records for the
+    // deliberately MUTATED engine. Without the recorder's self-probe, I-13
+    // convicts on the observer.
+    const native = globalThis.queueMicrotask
+    const deferred: Array<() => void> = []
+    globalThis.queueMicrotask = (cb: () => void): void => {
+      deferred.push(cb)
+    }
+    let obs: RtcStallObservation
+    try {
+      const clock = makeSimClock(0)
+      const { scheduler, view } = makeObservableScheduler(clock)
+      const env = makeEnv(makeAsyncCounter(), view)
+      const owner = new MemoryAdapter<Box>({ state: 'a' })
+      const sm = new StateMachine<Box, StateMachineConfig<Box>>(invokeChainConfig(), owner, {
+        scheduler,
+        clock: clock.now,
+      })
+      const recorder = makeRtcStallRecorder()
+      await settleMacrostep({
+        sm, scheduler: asSettleScheduler(scheduler), clock, env,
+        policy: 'safety', maxTurns: 64, onSample: recorder.onSample,
+      })
+      obs = recorder.observation()
+    } finally {
+      globalThis.queueMicrotask = native
+      deferred.length = 0
+    }
+
+    // The plane was WIRED (samples were taken) and the run was long enough to
+    // produce a conviction — so this is vacuity by the probe, not by inactivity.
+    expect(obs.samples, 'the sample plane must actually have been wired').toBeGreaterThan(1)
+    expect(obs.hostMicrotaskPlane, 'the self-probe must classify a faked queueMicrotask as foreign').toBe('foreign')
+    expect(obs.maxRun, 'a faked host must NOT be allowed to produce an I-13 witness').toBe(0)
+    // …and the oracle therefore returns no violation on it.
+    expect(runSafety(INVARIANTS, traceOf(), { ...baseCtx(), rtcStall: obs })).toBeNull()
+  })
+
+  it('the SAME run on the native host is verified and DOES read a value', async () => {
+    // The control: without it, "vacuous under a fake" is satisfiable by a
+    // recorder that is vacuous always.
+    const d = await drive(invokeChainConfig())
+    expect(d.maxRun).toBe(1)
+    const clock = makeSimClock(0)
+    const { scheduler, view } = makeObservableScheduler(clock)
+    const env = makeEnv(makeAsyncCounter(), view)
+    const owner = new MemoryAdapter<Box>({ state: 'a' })
+    const sm = new StateMachine<Box, StateMachineConfig<Box>>(invokeChainConfig(), owner, {
+      scheduler,
+      clock: clock.now,
+    })
+    const recorder = makeRtcStallRecorder()
+    await settleMacrostep({
+      sm, scheduler: asSettleScheduler(scheduler), clock, env,
+      policy: 'safety', maxTurns: 64, onSample: recorder.onSample,
+    })
+    expect(recorder.observation().hostMicrotaskPlane).toBe('verified')
+  })
+
+  it('a queueMicrotask that runs SYNCHRONOUSLY is also rejected (not just a deferring one)', async () => {
+    const native = globalThis.queueMicrotask
+    globalThis.queueMicrotask = (cb: () => void): void => {
+      cb()
+    }
+    try {
+      const recorder = makeRtcStallRecorder()
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(recorder.observation().hostMicrotaskPlane).toBe('foreign')
+    } finally {
+      globalThis.queueMicrotask = native
+    }
   })
 
   it('does NOT fire on a single positive sample (the correct-machine reading)', () => {

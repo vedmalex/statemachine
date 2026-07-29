@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url'
 
 import { describe, expect, it } from 'vitest'
 
+import { legacyStripChain, stripCommentsAndStrings } from './source-scan'
+
 /**
  * A1 / A2 — SOURCE-SCAN GUARDS.
  *
@@ -39,26 +41,6 @@ import { describe, expect, it } from 'vitest'
 
 const SM_PATH = fileURLToPath(new URL('../state_machine.ts', import.meta.url))
 const RAW = readFileSync(SM_PATH, 'utf8')
-
-/**
- * Strip comments and string/template literals, leaving only CODE, and PRESERVE
- * the line count so a reported index is the real one.
- *
- * ORDER MATTERS and is not the obvious one: string literals are removed BEFORE
- * line comments. Removing `//…` first truncates a URL inside a string literal
- * (`'https://…'`) into an unbalanced quote, and the quote regex then runs away
- * across hundreds of lines and silently deletes real declarations. The
- * single-line character classes are the second half of that guard.
- */
-function stripCommentsAndStrings(src: string): string {
-  const keepLines = (m: string): string => '\n'.repeat((m.match(/\n/g) ?? []).length)
-  return src
-    .replace(/\/\*[\s\S]*?\*\//g, keepLines)
-    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
-    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""')
-    .replace(/`(?:[^`\\]|\\.)*`/g, (m) => `\`\`${keepLines(m)}`)
-    .replace(/\/\/.*$/gm, '')
-}
 
 const CODE = stripCommentsAndStrings(RAW)
 const CODE_LINES = CODE.split('\n')
@@ -97,6 +79,145 @@ function memberAt(i: number): string {
   }
   return found
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A0 — the SCANNER's own integrity
+//
+// A1 and A2 are absence claims ("no such shape occurs"). An absence claim over a
+// mangled string is vacuously true, so the stripper is a load-bearing part of
+// both, and a defect in it produces the SILENT direction of failure: green.
+// These tests are the only thing that makes the two sweeps below mean anything.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RAW_LINES = RAW.split('\n')
+
+/**
+ * A line index of a REAL `//` line comment inside a method body, late in the
+ * file. "Late" matters: an EARLY blanking also wipes the class declarations and
+ * the sanity test below catches it by accident. A late one leaves all 14 named
+ * members and a 120+ member count intact — the case that passes for the wrong
+ * reason.
+ */
+const LATE_LINE_COMMENT = ((): number => {
+  const from = Math.floor(RAW_LINES.length * 0.9)
+  const at = RAW_LINES.findIndex((l, i) => i >= from && /^\s{4,}\/\/ /.test(l))
+  if (at < 0) throw new Error('no late `//` comment found in the engine — fixture assumption broken')
+  return at
+})()
+
+/** `RAW` with `inserted` spliced in immediately after line index `at`. */
+function withLinesAfter(at: number, ...inserted: string[]): string {
+  const lines = [...RAW_LINES]
+  lines.splice(at + 1, 0, ...inserted)
+  return lines.join('\n')
+}
+
+describe('A0 — the stripper cannot be desynchronised by comment content', () => {
+  it('a lone backtick in a `//` comment does NOT blank the code after it', () => {
+    // The exact defeat: an unbalanced inline-code span in a comment, followed by
+    // a raw dispatch site of the shape A1 exists to forbid.
+    const PLANT = '    await handler(evt)'
+    const mutated = withLinesAfter(
+      LATE_LINE_COMMENT,
+      '    // NOTE: a lone ` (an inline-code span opened and never closed)',
+      PLANT,
+    )
+    const plantedAt = LATE_LINE_COMMENT + 2
+
+    const tokenised = stripCommentsAndStrings(mutated).split('\n')
+    expect(tokenised.length, 'the line map must survive the injection').toBe(mutated.split('\n').length)
+    expect(
+      tokenised[plantedAt],
+      'the planted raw dispatch site was BLANKED — every A1/A2 absence claim below is vacuous',
+    ).toContain('handler(evt)')
+
+    // And it is visible to the sweep, not merely present in the text.
+    const seen = tokenised.filter((l) => /(?<![\w.$])handler\s*\(/.test(l))
+    expect(seen.length, 'the identifier sweep must SEE the planted site').toBe(1)
+
+    // FALSIFICATION: the pre-wave chain is defeated by this very input. Without
+    // this half, "the tokeniser handles it" is an untested claim about an input
+    // nothing was ever shown to break.
+    const legacy = legacyStripChain(mutated).split('\n')
+    expect(
+      legacy[plantedAt],
+      'the legacy chain is expected to blank the planted site — if it no longer does, ' +
+        'this fixture stopped reproducing the defect and proves nothing',
+    ).not.toContain('handler(evt)')
+    expect(legacy.filter((l) => /(?<![\w.$])handler\s*\(/.test(l))).toEqual([])
+  })
+
+  it('the legacy chain ALSO kept the sanity test green while blanked (why A0 is needed)', () => {
+    // The blanking is invisible to the structural sanity check: it is late
+    // enough that all 14 required members and the >120 count still hold.
+    const mutated = withLinesAfter(
+      LATE_LINE_COMMENT,
+      '    // NOTE: a lone ` (an inline-code span opened and never closed)',
+      '    await handler(evt)',
+    )
+    const legacyLines = legacyStripChain(mutated).split('\n')
+    const names = new Set<string>()
+    for (const l of legacyLines) {
+      const m = MEMBER_DECL.exec(l)
+      if (m?.[1]) names.add(m[1])
+    }
+    expect(names.has('dispatchUser')).toBe(true)
+    expect(legacyLines.filter((l) => MEMBER_DECL.test(l)).length).toBeGreaterThan(120)
+    // …and yet a whole region of the file was erased. Measured against the
+    // TOKENISED strip of the same input, so the delta is the chain's defect and
+    // nothing else.
+    const baseLines = stripCommentsAndStrings(mutated).split('\n')
+    const blanked = legacyLines.filter(
+      (l, i) => (baseLines[i] ?? '').trim() !== '' && l.trim() === '',
+    ).length
+    expect(blanked, 'the legacy chain must be shown to blank a real region').toBeGreaterThan(100)
+  })
+
+  it('stripping is STABLE: an unbalanced delimiter in a comment is line-local', () => {
+    // The general form of the property. For every delimiter that could open a
+    // multi-line span, injecting a LONE one inside a `//` comment must leave the
+    // stripped output byte-identical outside the injected line itself.
+    for (const [name, delim] of [
+      ['backtick', '`'],
+      ['single quote', "'"],
+      ['double quote', '"'],
+      ['block-comment opener', '/*'],
+      ['block-comment closer', '*/'],
+    ] as const) {
+      const mutated = withLinesAfter(LATE_LINE_COMMENT, `    // a lone ${delim} inside a line comment`)
+      const got = stripCommentsAndStrings(mutated).split('\n')
+      got.splice(LATE_LINE_COMMENT + 1, 1) // remove the injected line itself
+      expect(got.join('\n'), `a lone ${name} in a comment changed the stripped code elsewhere`).toBe(CODE)
+    }
+  })
+
+  it('the engine contains no REGEX LITERAL — the one shape the tokeniser does not model', () => {
+    // A regex literal may contain a quote or a backtick, and the tokeniser reads
+    // `/` as division. There are none today; if one appears, the tokeniser must
+    // learn regex literals BEFORE the sweeps below can be trusted again. This is
+    // the honest form of that limit: an assertion, not a comment.
+    const REGEX_START = /(?:^|[([{,;:!&|?+\-*%~^<>=]|\b(?:return|case|typeof|in|of|do|else|yield|await))\s*$/
+    const suspects: string[] = []
+    CODE.split('\n').forEach((line, i) => {
+      for (let k = 0; k < line.length; k += 1) {
+        if (line[k] !== '/') continue
+        if (REGEX_START.test(line.slice(0, k))) suspects.push(`line ${i + 1}: ${line.trim().slice(0, 80)}`)
+      }
+    })
+    expect(suspects, 'a regex literal appeared in the engine — teach the tokeniser about it').toEqual([])
+  })
+
+  it('the tokeniser reads `${…}` interpolations as CODE (strictly stronger than the chain)', () => {
+    const src = ['const s = `pre ${ handler(evt) } post`', 'const t = `plain`'].join('\n')
+    const got = stripCommentsAndStrings(src).split('\n')
+    expect(got[0], 'an interpolated call must survive stripping').toContain('handler(evt)')
+    expect(got[1], 'template TEXT must still be blanked').toBe('const t = ``')
+    // Nested template inside an interpolation must not close the outer one early.
+    const nested = stripCommentsAndStrings('const u = `a ${ x ? `b ${ f(1) }` : y } c`')
+    expect(nested).toContain('f(1)')
+    expect(nested).not.toContain('post')
+  })
+})
 
 // ═══════════════════════════════════════════════════════════════════════════
 // A1 — the dispatch funnel is the SOLE consumer-callable invocation site
