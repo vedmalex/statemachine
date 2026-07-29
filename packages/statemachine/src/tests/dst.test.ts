@@ -144,6 +144,8 @@ describe('DST: deterministic virtual-clock replay (TASK-013)', () => {
     const sm2 = StateMachine.fromJSON<Box, typeof config>(json, adapter2, {
       clock,
       scheduler: scheduler2,
+      // W0: `next.onEnter` restores by NAME from the registry, never a body.
+      actions: { onEnter: (owner: Box) => { owner.count++ } },
     })
     await flush()
     expect(sm2.currentState).toBe('start')
@@ -275,7 +277,12 @@ describe('DST: deterministic virtual-clock replay (TASK-013)', () => {
     const sm2 = StateMachine.fromJSON<Box, typeof config>(
       json,
       new MemoryAdapter<Box>({ state: '', count: 0 }),
-      { clock, scheduler: scheduler2 },
+      {
+        clock,
+        scheduler: scheduler2,
+        // W0: `next.onEnter` restores by NAME from the registry, never a body.
+        actions: { onEnter: (owner: Box) => { owner.count++ } },
+      },
     )
     await flush()
 

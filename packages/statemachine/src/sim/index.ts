@@ -45,10 +45,17 @@ export { StateMachine, createVirtualScheduler, isAdapter } from '../index'
 export type {
   Adapter,
   Clock,
+  // A1/A2: the return shape of `StateMachine#getProgress()`. Re-exported here for
+  // the same reason as every other engine type on this barrel — the `./sim` entry
+  // is a CLOSED surface, and a public method whose return type is not nameable
+  // from it is an `ae-forgotten-export` hole in the sim api report.
+  EngineProgress,
+  IContextTracker,
   IErrorHandler,
   ILogger,
   IMonitor,
   ITimerScheduler,
+  OpenDispatch,
   StateMachineConfig,
   StateMachineOptions,
 } from '../index'
@@ -57,11 +64,16 @@ export type {
 export { Simulator, runSimulation, wire } from './public'
 export type {
   SimEnv,
+  SimEventPayload,
   SimOptions,
+  SimPayloadRng,
+  SimPayloadSnapshot,
   SimResult,
   SimSetup,
   SimSnapshot,
   SimTarget,
+  SimViolation,
+  SimWarning,
   StepOutcome,
 } from './public'
 
@@ -75,12 +87,20 @@ export type { CapturedWrite, CaptureSink } from './capture'
 // --- Step-3 driver + settle primitive + harness env (VALUE symbols) ---
 export { SimDriver } from './driver'
 export type { DriverConfig, DriverOp, DriverStepResult } from './driver'
-export { DEFAULT_MAX_TURNS, settleMacrostep } from './settle'
+export {
+  DEFAULT_MAX_TURNS,
+  PROGRESS_RECENCY_WINDOW,
+  progressRecencyWindow,
+  settleMacrostep,
+} from './settle'
 export type {
   SettleArgs,
   SettlePolicy,
   SettleReason,
   SettleResult,
+  // The per-pump-turn observation `SettleArgs.onSample` receives — a consumer
+  // wiring that sink needs to be able to name its parameter.
+  SettleSample,
   SettleScheduler,
   SettleTarget,
 } from './settle'
@@ -99,6 +119,20 @@ export type {
 } from './env'
 
 // --- Step-4 scenario generator (VALUE symbols) ---
+// ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26, W7 U2 учёт/закалка):
+// `toEngineConfig` and `runScenario` COMPILE each callback `source` string via
+// `new Function` (define.ts `recreateLiteral`). `recreateLiteral` now runs a
+// fail-fast RUNTIME GUARD (FUNCTION_LITERAL_PATTERN) that throws on an
+// empty/non-string/non-function-shaped `source` before it ever reaches
+// `new Function` — this is hygiene/fail-fast, NOT a sandbox: a crafted,
+// syntactically-valid-looking malicious literal still compiles. Pass ONLY
+// author-side trusted specs; NEVER a ScenarioSpec/TopologySpec reconstructed
+// from untrusted JSON. Untrusted input belongs on the non-compiling
+// `StateMachine.fromJSON`/`fromSecureJSON` path, which resolves callbacks BY
+// NAME from a caller-supplied `FunctionRegistry` (`state_machine.ts`
+// `deserializeAction`) and never reaches `recreateLiteral`/`new Function` — a
+// contract fixed by `src/tests/sim/define_trusted_boundary.test.ts`
+// (trusted `define` compiles; untrusted `fromJSON` does not).
 export { genConfig } from './topology'
 export type { GeneratedTopology } from './topology'
 export { genOps } from './ops'
@@ -185,6 +219,12 @@ export type {
   FinalState,
   Invariant,
   InvariantScope,
+  // W8/V3a: the lifecycle observation a custom invariant reads from
+  // `CheckerContext.lifecycle` (I-4 keys its ordering predicate on it).
+  LifecycleObservation,
+  // The RTC-stall observation a custom invariant reads from
+  // `CheckerContext.rtcStall` (I-13 keys its stall predicate on it).
+  RtcStallObservation,
   Violation,
 } from './invariants'
 export { runSafety, runSafetyWithDeterminism } from './invariants.runner'
@@ -228,6 +268,9 @@ export type {
   ShrinkResult,
   ViolationFingerprint,
 } from './shrinker'
+// --- W9/Г3 op-stream delta-debugging (the live-config minimizer) ---
+export { shrinkOps, DEFAULT_OP_SHRINK_BUDGET } from './op-shrink'
+export type { ShrinkableOp, OpShrinkPredicate, OpShrinkBudget, OpShrinkResult } from './op-shrink'
 export {
   buildMinimalRepro,
   emitReproTest,
@@ -315,3 +358,22 @@ export type {
   ErrorClass,
   FaultKind,
 } from './trace'
+
+// --- checkMachine: the consumer-facing dynamic config check (W6 / #17) ---
+export { checkMachine } from './check-machine'
+export type {
+  CheckReport,
+  CheckOptions,
+  CheckViolation,
+  CheckWarning,
+  CheckScriptOp,
+  CheckMinimalOp,
+  CheckMinimalRepro,
+  CheckEventSpec,
+  MachineInvariant,
+  MachineSnapshot,
+  OwnerSource,
+  FailCause,
+  WarningKind,
+  Rng as CheckRng,
+} from './check-machine'

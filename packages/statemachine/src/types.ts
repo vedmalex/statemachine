@@ -23,6 +23,11 @@ export type ErrorContext = {
   action?: string
   transition?: string
   phase?: 'guard' | 'action' | 'transition' | 'enter' | 'exit'
+  /**
+   * Composite per-slot function-registry path (`<stateName>.<hook>`) implicated
+   * in a restore failure (W0.2 C1). Present only on registry-resolution errors.
+   */
+  slot?: string
 }
 
 export class StateMachineError extends Error {
@@ -75,6 +80,57 @@ export interface ITimerScheduler {
   process?(now?: number): void
 }
 
+/**
+ * @unstable — async-context tracking injection contract; consumed by StateMachine
+ * to power PRECISE reentrancy detection.
+ *
+ * ## What it is for
+ * The drain tags every action/guard it runs with a numeric EPOCH. A `fireEvent`
+ * whose async context carries the CURRENTLY-active epoch was issued from WITHIN
+ * that drain's logical stack — a TRUE reentrant call that can never be drained,
+ * so it is rejected with a clear error instead of parking forever. A `fireEvent`
+ * from an INDEPENDENT async callback (timer/IO continuation, an `onError`
+ * recovery, a caller woken by `resolve()`) carries NO epoch and queues normally.
+ * This is exactly the shape of Node's `AsyncLocalStorage<number>`, which is the
+ * default implementation where the runtime provides it.
+ *
+ * ## Why it is injectable
+ * `AsyncLocalStorage` does not exist in browsers and other non-Node runtimes.
+ * Rather than hard-import it (which makes the whole bundle unloadable outside
+ * Node), the engine resolves a tracker at construction and DEGRADES to a no-op
+ * where none is available. Inject your own to restore precise detection on a
+ * host that has an equivalent primitive.
+ *
+ * ## Degradation contract of a no-op implementation
+ * A tracker whose `getStore()` always returns `undefined` is SAFE IN THE
+ * FALSE-ACCUSATION DIRECTION: the reject condition is
+ * `activeDrainEpoch !== null && getStore() === activeDrainEpoch`, and `undefined`
+ * never equals a number, so NO legitimate `fireEvent` is ever wrongly rejected.
+ * The loss is strictly MISSED DETECTION of true reentrancy, which then PARKS
+ * that drain (the reentrant event sits behind the action awaiting it, forever)
+ * unless {@link StateMachineOptions.transitionTimeout} bounds the action.
+ *
+ * @see StateMachineOptions.contextTracker
+ * @see StateMachine#contextTrackerKind
+ */
+export interface IContextTracker {
+  /**
+   * Run `fn` with `store` bound as the current async-context value, and return
+   * whatever `fn` returns. The binding must survive `await` inside `fn`.
+   */
+  run<R>(store: number, fn: () => R): R
+  /**
+   * Run `fn` OUTSIDE any bound store — `getStore()` must observe `undefined`
+   * for the duration — and return whatever `fn` returns. Used so an `onError`
+   * recovery handler can issue a fresh `fireEvent` without inheriting (and being
+   * falsely rejected under) the drain's epoch. It must NOT catch: a throw from
+   * `fn` propagates unchanged.
+   */
+  exit<R>(fn: () => R): R
+  /** The store bound by the innermost enclosing `run`, or `undefined`. */
+  getStore(): number | undefined
+}
+
 /** @unstable — transition observability context (additive on IMonitor). */
 export interface TransitionContext {
   fromState: string
@@ -88,6 +144,319 @@ export interface MonitorMetricsSnapshot {
   successCount: number
   errorCount: number
   averageDuration: number
+  /**
+   * W4.1 #1 — штатные ОТКАЗЫ перехода (guard-rejected / abort / errorState),
+   * counted SEPARATELY from `errorCount` (genuine errors). Optional (additive).
+   */
+  failedTransitions?: number
+}
+
+/**
+ * @unstable — W8/V1 public LIFECYCLE OBSERVABILITY record: one `begin` or `end`
+ * edge of ONE engine-invoked callback (state enter/exit hook, invoke action /
+ * operation, transition guard).
+ *
+ * ## Why it exists
+ * The ORDER and the FACT of enter/exit callback invocation were not observable
+ * from outside the machine at all: a consumer could not answer "why was my
+ * `onExit` never called?", "in which order did the regions enter?", or "which
+ * callback is hung?". This channel makes the drain's callback timeline a
+ * first-class, subscribable stream.
+ *
+ * ## Delivery contract
+ * Delivery is SYNCHRONOUS, inside the drain, on {@link IMonitor.recordLifecycle}.
+ * There is deliberately NO `ts` / `durationMs` field: the subscriber stamps its
+ * own clock (and a simulation plane, where `Date.now` is forbidden, stamps a
+ * virtual one), so the record itself stays fully deterministic.
+ *
+ * Every dispatch is wrapped in a SINK GUARD: a `recordLifecycle` implementation
+ * that throws can NEVER break the drain. The guard swallows sink failures only —
+ * it never swallows the callback's own error, which continues to route through
+ * `onError` / `monitor.recordError` byte-for-byte unchanged.
+ *
+ * ## Pairing
+ * A callback that STARTS emits `edge:'begin'`; when that same callback SETTLES it
+ * emits `edge:'end'`. A `begin` with no matching `end` therefore means the
+ * callback never settled — a HUNG callback (that is the intended diagnosis, not a
+ * bug in the channel). `failed:true` on an `end` means the callback THREW.
+ *
+ * The `end` edge is emitted at the settle of the CALLBACK ITSELF — strictly
+ * BEFORE the error is routed into `processError` / `onError`. Emitting after
+ * error routing would let a hung `onError` masquerade as a hung `onEnter`.
+ *
+ * `invoke.abort` is the one exception to "begin starts something": an abort is an
+ * instantaneous POINT, so it is emitted as an ADJACENT `begin`+`end` pair with no
+ * work in between (`edge` has no `'point'` member and the union is kept narrow).
+ * `kind:'raise'` follows that SAME precedent for the same reason: an internal
+ * event RAISE is instantaneous (the event is pushed onto the internal queue; the
+ * transition it later drives is a separate, already-observable fact), so it too is
+ * an ADJACENT `begin`+`end` pair. `edge` is deliberately NOT widened — the
+ * "a `begin` with no `end` means HUNG" contract must stay unambiguous.
+ *
+ * A1 — `transitionTimeout` follows the SAME precedent. The `end` edge of a
+ * callback is emitted at the settle of the callback's OWN promise, NEVER at the
+ * settle of the `Promise.race` the timeout runs. A deadline that wins the race
+ * therefore leaves the callback's `begin` OPEN — which is the honest reading, the
+ * body really is still running — and is itself reported as an adjacent
+ * `begin`+`end` POINT pair on a `'<hook>.timeout'` slot carrying the same `state`,
+ * `owner` and `microstep`. Before A1 the timeout closed the callback's span while
+ * the body ran on: an invisible continuation, and a false "settled" reading on the
+ * one slot (`invoke.action`) a settledness signal is derived from.
+ *
+ * ## What this channel does NOT see
+ * - an EXTERNAL `fireEvent`: `kind:'raise'` covers the ENGINE-INTERNAL raise path
+ *   only (the five sites that push onto the internal queue). A caller-issued event
+ *   is already visible to the caller.
+ * - the ENGINE's own default rethrow handler, which runs when no `onError` was
+ *   configured. `kind:'error'` reports CONSUMER handlers only; instrumenting the
+ *   engine's synchronous rethrow would make in-flight readings lie.
+ * - the `errorState` fallback path emits NO `enter` events: that recovery commits
+ *   the error configuration DIRECTLY, bypassing the enter-hook executor. This is
+ *   EXPECTED, not an anomaly — a consumer or oracle must NOT read the missing
+ *   `enter` records as "the error state was never entered".
+ *
+ * ## What A1 ADDED to the channel
+ * Three families that used to be listed above as unseen. Each of them can hand
+ * control to an ASYNCHRONOUS consumer callable, so leaving them out did not merely
+ * lose detail — it lost whole continuations:
+ * - `kind:'transition'` — the event-level `onBefore` / `onAfter` and the
+ *   transition's `onTransition`;
+ * - `kind:'error'` — a consumer `onError` handler (both the awaited routing path
+ *   and the fire-and-forget config-level one);
+ * - `kind:'invoke'`, `hook:'invoke.cond'` — the `invoke[].cond` predicate. Its
+ *   result is TRUTHINESS-COERCED by the engine, so an `async cond` is always
+ *   truthy and its continuation was entirely untracked;
+ * - `kind:'persist'` — the persistence adapter's `save` / `restore`.
+ *
+ * ## Relationship to the error channel
+ * ONE throwing callback produces BOTH a `failed:true` `end` record here AND a
+ * separate `monitor.recordError`. They are two views of the SAME failure — a
+ * consumer that adds them up will double-count.
+ *
+ * ## Hierarchy
+ * For `kind:'enter'|'exit'|'invoke'`, `state` is the FULL dot-path of the state.
+ * Ancestry is recovered by dot-parsing it (`'parent.r1.child'`); `regionKey` /
+ * `depth` are deliberately NOT duplicated into the record.
+ *
+ * EXCEPTION — for `kind:'guard'`, `state` is the transition's `from` SELECTOR,
+ * which may be a wildcard (`'*'`, `'p.*'`) or a multi-source list (`'a|b'`) and
+ * is therefore NOT always a dot-path. Key guard records by {@link
+ * LifecycleEvent.transition}, and dot-parse `state` only after checking `kind`.
+ *
+ * ## Stability
+ * `kind` and `hook` form an EXTENSIBLE union — new members will be added without
+ * a major bump. Do NOT write an exhaustive `switch` over them; always keep a
+ * default branch.
+ */
+export interface LifecycleEvent {
+  /**
+   * Coarse family of the instrumented callback. EXTENSIBLE — never switch
+   * exhaustively.
+   */
+  readonly kind:
+    | 'enter'
+    | 'exit'
+    | 'invoke'
+    | 'guard'
+    | 'raise'
+    // A1 — the three families the channel could not see before the dispatch
+    // funnel existed. Each names a slot through which the engine hands control to
+    // CONSUMER code, so leaving them uninstrumented left real continuations
+    // invisible (an async `onError` or an async `cond` most of all).
+    /** The TRANSITION's own callbacks: `onBefore`, `onTransition`, `onAfter`. */
+    | 'transition'
+    /** A consumer `onError` handler. */
+    | 'error'
+    /** The `StatePersistenceAdapter` `save` / `restore` round trip. */
+    | 'persist'
+  /**
+   * Precise callback slot. EXTENSIBLE. Currently one of `'onBeforeEnter'`,
+   * `'onEnter'`, `'onAfterEnter'`, `'onBeforeExit'`, `'onExit'`, `'onAfterExit'`,
+   * `'invoke.action'`, `'invoke.operation'`, `'invoke.abort'`, `'invoke.cond'`,
+   * `'guard'`, the A1 slots `'onBefore'`, `'onTransition'`, `'onAfter'`,
+   * `'onError'`, `'persist.save'`, `'persist.restore'`, and the five
+   * `kind:'raise'` origins: `'raise.done'`, `'raise.invoke.timer'`,
+   * `'raise.invoke.onDone'`, `'raise.invoke.onError'`, `'raise.invoke.resume'`.
+   *
+   * A1 also adds the DEADLINE point slots `'<hook>.timeout'` — see the
+   * `transitionTimeout` note under "Pairing".
+   */
+  readonly hook: string
+  /**
+   * Full dot-path of the state the callback belongs to (for `kind:'guard'`, the
+   * transition's `from` selector). Hierarchy = dot-parsing of this string.
+   *
+   * For `kind:'raise'` it is the ORIGIN of the raise, which is a real dot-path:
+   * the COMPOSITE whose completion produced `done.state.<C>` for `'raise.done'`,
+   * and the invoke-OWNING leaf for the four `raise.invoke.*` hooks.
+   */
+  readonly state: string
+  /**
+   * The OWNER object this callback ran for, by REFERENCE identity (never
+   * serialize it). One machine can drive MANY objects (`attachToObject`), and
+   * without this discriminator the traces of two owners interleave into one
+   * unreadable stream. For an owner-less internal path this is the machine
+   * instance itself, used as a stable sentinel.
+   */
+  readonly owner: object
+  /**
+   * Monotonic per-machine id of the microstep this callback belongs to.
+   *
+   * The boundary MATTERS: enter hooks run BEFORE the point of no return, so an
+   * ABORTED microstep (a throw under `abortOnExitError`, a contradictory target,
+   * a `transitionTimeout`) has already emitted `enter` records for a state that
+   * was never committed. Grouping by `microstep` lets a consumer discard exactly
+   * those records.
+   *
+   * The counter is incremented once per event-driven selection attempt (at the
+   * start of the OTS computation, so a guard and the enter/exit hooks it selects
+   * share ONE id). Paths that have no microstep at all — initial construction,
+   * `reset`, `resumeTimers` — report `0`, a reserved id the counter never
+   * produces (it starts at 1).
+   *
+   * IDs are NOT DENSE: a selection attempt that enables nothing consumes an id
+   * and emits no hook records, so gaps in the id sequence are normal. Do not
+   * infer "records are missing" from a gap.
+   *
+   * INVOKE ASYMMETRY: an `invoke` record carries the microstep of the step that
+   * ARMED the operation, while its `invoke.abort` carries the microstep of the
+   * EXIT step that cancelled it — so an operation's begin and its abort
+   * legitimately report DIFFERENT ids. Pair them by `owner` + `state` +
+   * adjacency, not by `microstep`.
+   *
+   * RAISE ASYMMETRY (same family, stated explicitly because the three raise
+   * origins differ from each other):
+   * - `'raise.done'` carries the CURRENT microstep — the completion scan runs
+   *   INSIDE the microstep whose state write produced the done configuration, so
+   *   this id is the one that caused the raise;
+   * - `'raise.invoke.timer'` / `'raise.invoke.onDone'` / `'raise.invoke.onError'`
+   *   carry the ARMING microstep (carried in the launch closure), exactly like the
+   *   `invoke` records they belong to — NOT the step at which the timer/promise
+   *   actually fired, which has no microstep of its own;
+   * - `'raise.invoke.resume'` carries the reserved `0`: a timer resumed from a
+   *   deserialized snapshot fires outside any event-driven microstep.
+   *
+   * A consumer must therefore NOT read a raise record's `microstep` as "the step
+   * in which the raised event was PROCESSED" — the raised event is drained later,
+   * in its own microstep(s).
+   */
+  readonly microstep: number
+  /** Per-machine monotonic record counter; the total order of this stream. */
+  readonly seq: number
+  /**
+   * Which edge of the callback this record is. Named `edge` (NOT `phase`) to
+   * avoid colliding with the unrelated {@link ErrorContext.phase}.
+   */
+  readonly edge: 'begin' | 'end'
+  /**
+   * Name of the event that drove this microstep, when there is one.
+   *
+   * For `kind:'raise'` this is the RAISED event name — the primary payload of the
+   * record (`'done.state.<C>'` for `'raise.done'`, the invoke `event`/`onDone`/
+   * `onError` name otherwise). It is ALWAYS present on a raise record. The raise
+   * ARGUMENTS are deliberately NOT carried: they are arbitrary objects with no
+   * deterministic serialization, and this channel must stay allocation-light and
+   * replay-stable.
+   */
+  readonly event?: string
+  /** Present on `edge:'end'`: `true` when the callback THREW / rejected. */
+  readonly failed?: boolean
+  /**
+   * Present on `kind:'guard'`, `edge:'end'`: the predicate's boolean result. A
+   * guard that THREW reports `failed:true` and `outcome:false` (the transition
+   * stays disabled).
+   */
+  readonly outcome?: boolean
+  /**
+   * Present on `kind:'guard'`: the `"<from> -> <to>"` transition label — the SAME
+   * vocabulary as {@link ErrorContext.transition}. Required to key guard COVERAGE:
+   * two transitions leaving the same source are otherwise indistinguishable by
+   * `state` alone.
+   */
+  readonly transition?: string
+}
+
+/**
+ * @unstable — A1/A2 debugging surface: ONE consumer callable the engine has
+ * entered and whose own promise has not settled yet.
+ *
+ * This is the half of the progress snapshot that answers "stuck ON WHAT". It is
+ * maintained by the dispatch funnel on entry/settle as a LIVE structure — it is
+ * NEVER derived by scanning a lifecycle buffer, because that buffer stops growing
+ * at its cap rather than rotating, so a retained `begin` whose `end` was dropped
+ * would jam any derived reading non-zero for the rest of the run.
+ */
+export interface OpenDispatch {
+  /** The dispatch slot — e.g. `'action.inline'`, `'invoke.src'`, `'invoke.cond'`. */
+  readonly hook: string
+  /**
+   * The state the dispatch belongs to, or `''` where the slot has no state (the
+   * persistence adapter, a config-level `onError` reached outside a microstep).
+   */
+  readonly state: string
+  /** The OWNER object this callable ran for, by REFERENCE (never serialize it). */
+  readonly owner: object
+  /** {@link EngineProgress.tick} at the moment the callable was entered. */
+  readonly openedAtTick: number
+  /**
+   * `tick - openedAtTick` — how many engine phase advances have happened since
+   * this callable was entered. THE diagnostic number: a span open across many
+   * ticks is slow but alive; a span open while the tick has not moved at all is
+   * the thing actually holding the drain.
+   */
+  readonly openTicks: number
+}
+
+/**
+ * @unstable — A2 public progress snapshot: the engine's monotonic phase-advance
+ * heartbeat plus the currently-open consumer callables.
+ *
+ * ## What problem it solves
+ * A harness observing a machine from outside cannot see whether the engine has a
+ * pending continuation. Every proxy for it that has been tried — an unchanged
+ * `queueDepth|isProcessing|inFlightAsync` fingerprint over an N-turn window —
+ * measures the WRONG thing: the engine `await`s once per hook slot per state even
+ * where no hook is defined, so a LEGITIMATE microstep's frozen fingerprint runs
+ * O(machine width) turns and any fixed window is refuted by a correct machine one
+ * turn wider than it.
+ *
+ * {@link tick} replaces that proxy with a DIRECT observation. It advances on every
+ * engine phase advance, so the number of microtask turns between two ticks is a
+ * property of the ENGINE'S CODE, not of the machine's shape.
+ *
+ * ## How to read it
+ * The snapshot is a reading, not a verdict. "The engine has not ticked since turn
+ * N, and `onEnter@work.r1` has been open for M ticks" is a DESCRIPTION of where
+ * the drain is; deciding whether that is a defect needs knowledge this channel
+ * does not have (a consumer hook is allowed to take as long as it likes). Nothing
+ * in the engine reads these fields.
+ */
+export interface EngineProgress {
+  /**
+   * Monotonic count of engine phase advances since construction. Never reset,
+   * never decremented; `0` means the engine has not advanced a phase yet.
+   */
+  readonly tick: number
+  /**
+   * Label of the site that produced the most recent tick (e.g. `'drain.internal'`,
+   * `'exit.slot'`). EXTENSIBLE — never switch exhaustively over it.
+   */
+  readonly lastTickSite: string
+  /**
+   * {@link LifecycleEvent.seq} at the moment of the most recent tick. Lets a
+   * consumer align the heartbeat with the lifecycle record stream without the
+   * engine having to emit the heartbeat INTO that stream — which it deliberately
+   * does not: at ~10+ ticks per microstep, buffered tick records would exhaust a
+   * non-rotating observation buffer and blind every OTHER reader of it.
+   */
+  readonly lastTickSeq: number
+  /**
+   * Live count of consumer callables entered and not yet settled. A rolling
+   * scalar maintained on entry/settle — never derived.
+   */
+  readonly inFlightUserCallables: number
+  /** The open callables, in entry order. Empty when the engine holds none. */
+  readonly openDispatches: readonly OpenDispatch[]
 }
 
 /**
@@ -101,6 +470,29 @@ export interface IMonitor {
   recordError(error: Error, context?: ErrorContext): void
   recordEvent?(eventName: string, duration: number): void
   getMetrics?(): MonitorMetricsSnapshot
+  /**
+   * @unstable — W8/V1 lifecycle observability sink (OPTIONAL, additive: a monitor
+   * that omits it keeps the exact previous contract, and the engine then does NO
+   * lifecycle work at all — the channel is near-zero-cost when unsubscribed).
+   *
+   * Called SYNCHRONOUSLY from inside the drain for each `begin` / `end` edge of an
+   * engine-invoked callback. See {@link LifecycleEvent} for the full contract:
+   * pairing, the hung-callback signature, `microstep` grouping, multi-owner
+   * discrimination, and what the channel deliberately does NOT observe.
+   *
+   * An implementation that THROWS cannot break the machine — every dispatch is
+   * wrapped in a sink guard and the failure is swallowed. Keep it cheap and
+   * side-effect-free anyway: it runs on the hot path, inside the run-to-completion
+   * drain, and any work done here delays the callbacks it is observing.
+   *
+   * PRESENCE IS SAMPLED ONCE, at machine construction: the monitor you pass to
+   * `StateMachineOptions.monitor` must ALREADY define this method. Attaching it
+   * later (e.g. `sm.getMonitor().recordLifecycle = fn`) is a silent no-op — the
+   * engine cached "unsubscribed" and skips the channel entirely. Removing it
+   * later is safe (the dispatch is optional-chained), it merely wastes the event
+   * construction.
+   */
+  recordLifecycle?(event: LifecycleEvent): void
 }
 
 /** @unstable — error-handler injection contract; surfaces methods consumed by host integrations. */
@@ -120,6 +512,24 @@ export interface StateMachineOptions {
   scheduler?: ITimerScheduler   // NEW per TD-T4-2a
   errorHandler?: IErrorHandler  // NEW per TD-T4-2b
   /**
+   * Async-context tracker backing PRECISE reentrancy detection.
+   *
+   * Default: resolved from the runtime WITHOUT any import — Node/Deno-style
+   * `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage` first, then
+   * a global `AsyncContext.Variable`, then a NO-OP tracker. Inject one to
+   * restore precise detection on a host that has an equivalent primitive but
+   * exposes it under neither name.
+   *
+   * A no-op tracker never causes a FALSE rejection; it only stops TRUE
+   * reentrancy from being detected, which parks that drain unless
+   * {@link StateMachineOptions.transitionTimeout} is set. Read
+   * {@link StateMachine#contextTrackerKind} to see which mode is active.
+   *
+   * Each machine needs its OWN tracker instance — the store is a per-machine
+   * drain epoch, and sharing one instance across machines can collide.
+   */
+  contextTracker?: IContextTracker
+  /**
    * Clock function returning the current time in milliseconds.
    * Default: `Date.now`. Inject a virtual clock together with a
    * `scheduler` (see `createVirtualScheduler`) for deterministic replay / DST.
@@ -127,8 +537,40 @@ export interface StateMachineOptions {
    */
   clock?: () => number
   /**
-   * Maximum time (ms) to wait for async entry/exit actions.
-   * If exceeded, the transition aborts with an error.
+   * Deadline (ms) applied to EACH INDIVIDUAL action call: guards, `onBefore` /
+   * `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and
+   * `invoke` actions. Every call races its own timer.
+   *
+   * It is a PER-ACTION budget — NOT per transition and NOT per microstep (SPEC
+   * §11). Since one event fires one transition per region, a microstep of N
+   * transitions running K hooks each gets N×K independent deadlines, so this
+   * value does NOT bound how long the microstep takes in total. Read it as "no
+   * single callback may hang longer than this", not "an event settles within
+   * this".
+   *
+   * On expiry the call rejects with `StateMachineError('Transition timeout')`
+   * carrying `phase: 'action'`. The action is NOT cancelled — it keeps running
+   * and its side effects still land, after the machine has already unwound.
+   * What the consumer observes depends on which hook expired:
+   *  - a GUARD → the transition is merely disabled; `fireEvent` resolves
+   *    `false` and nothing is thrown;
+   *  - `onEnter` with {@link StateMachineOptions.errorState} → the machine
+   *    commits the error state;
+   *  - `onExit` with {@link StateMachineOptions.abortOnExitError} → the
+   *    microstep aborts back to the source state;
+   *  - an `invoke` action → the invoke's `event` is NOT raised and the machine
+   *    stays put, but the expiry is reported on `monitor.recordError` and the
+   *    config-level `onError` (nothing is thrown — the timer callback has no
+   *    caller to catch it). An `invoke` action that THROWS reports identically,
+   *    so an expiry is simply one more way that action failed;
+   *  - otherwise the error propagates out of `fireEvent` and the machine stays
+   *    in the source state.
+   *
+   * The deadline timer is cancelled as soon as the race settles — on the
+   * default scheduler as well as an injected one — so a fast action leaves no
+   * pending timer behind it.
+   *
+   * See the README "Action timeouts" section for the worked example.
    */
   transitionTimeout?: number
   /**
@@ -144,7 +586,58 @@ export interface StateMachineOptions {
    * Default: 1000
    */
   maxQueueDepth?: number
+  /**
+   * Maximum number of INTERNAL (raised) transitions a single continuous drain
+   * may process before the run-away guard trips (`StateMachineError`, reported
+   * through the observable monitor/onError channel). Guards against a
+   * self-sustaining internal loop (e.g. `done.state` ping-pong) starving the
+   * macrotask queue. Raise it to admit a legitimate FINITE cascade longer than
+   * the default (e.g. a long auto-advance gated-pipeline). Default: 100.
+   *
+   * Note: this bounds STARVATION (internal self-loops within one drain), NOT
+   * every conceivable non-termination — a timer-driven ping-pong (`invoke`
+   * with `delay:0`) yields to the macrotask queue each hop, so it is outside
+   * this bound by construction (and does not starve).
+   */
+  maxTransitionDepth?: number
+  /**
+   * Named-function registry consulted by `fromJSON` / `fromSecureJSON` to
+   * restore serialized function references (guards / actions / onError / …).
+   *
+   * Security invariant (W0 / defect П1): NO deserialization path turns an
+   * attacker-controlled STRING into executable code. Serialized machines store
+   * a function's NAME only — never its body — and restoration resolves that
+   * name against THIS registry. A serialized function reference whose name is
+   * not present here throws {@link StateMachineError}; a body is never compiled.
+   *
+   * Keys are function identities: either a composite per-slot path
+   * (`<stateName>.<hook>` — e.g. `'green.onEnter'`, `'parent.r1.child.onEnter'`,
+   * or its `states.`-prefixed form), which is the STABLE identity restoration
+   * prefers, OR a bare function `.name` (a slot LABEL shared across slots) used
+   * only as a last-resort fallback. Values are the actual functions supplied by
+   * the consumer.
+   */
+  actions?: FunctionRegistry
+  /**
+   * Strict function-registry resolution (W0.2 C1). When `true`, restoration
+   * refuses the ambiguous fallbacks that can silently substitute the wrong
+   * function:
+   *  - a serialized slot that resolves only by its shared bare `.name` (no
+   *    per-slot registry key) THROWS instead of risking a same-named sibling's
+   *    function;
+   *  - a nameless serialized function reference THROWS instead of restoring to
+   *    `undefined` (symmetry with the named unknown-name throw).
+   * Default: `false` (fallback with a `warn`).
+   */
+  strictActions?: boolean
 }
+
+/**
+ * Consumer-supplied map of function identity name → function, used by
+ * `StateMachine.fromJSON` / `fromSecureJSON` to restore serialized function
+ * references. See {@link StateMachineOptions.actions}.
+ */
+export type FunctionRegistry = Record<string, (...args: any[]) => any>
 
 // Simplified and composable StatePaths types for better TypeScript performance
 type StringKey = string & {}
@@ -174,34 +667,42 @@ export type NestedStateName<S> = {
   : never
 }[keyof S & string]
 
-// Type for deeply nested state names (parent.region.child.subregion)
-export type DeepNestedStateName<S> = {
-  [K in keyof S & string]: S[K] extends { regions?: infer R }
-  ? R extends Record<string, any>
-  ? {
-    [RegKey in keyof R & string]: R[RegKey] extends Record<string, any>
+// H-1 — Recursively enumerate every ADDRESSABLE state path in a states-map `S`.
+//
+// A path is addressable iff it terminates at a STATE (a leaf OR a composite),
+// NEVER at a region container. From a states-map, the addressable paths are:
+//   - each state key `K` itself (`p`, `p.r.child`, …); and
+//   - when `K` is a composite, `K.<region>.<addressable-within-that-region>`
+//     for every region and every path addressable inside its states-map.
+// The alternation is state → region → state → region → …, so the LAST segment
+// is always a state. Region-container paths (`p.r`, `p.r.child.sub`) — which
+// throw INVALID_STATE_PATH at runtime — are excluded at EVERY depth, and the
+// recursion admits leaves of ARBITRARY depth (the depth ≥ 4 leaves the previous
+// fixed-arity `DeepNestedStateName` wrongly rejected).
+export type StatePathsOf<S> = {
+  [K in keyof S & string]:
+  | K
+  | (S[K] extends { regions?: infer R }
+    ? R extends Record<string, any>
     ? {
-      [ChildKey in keyof R[RegKey] &
-      string]: R[RegKey][ChildKey] extends {
-        regions?: infer CR
-      }
-      ? CR extends Record<string, any>
-      ? `${K}.${RegKey}.${ChildKey}.${StringKey & keyof CR}`
+      [RegKey in keyof R & string]: R[RegKey] extends Record<string, any>
+      ? `${K}.${RegKey}.${StatePathsOf<R[RegKey]>}`
       : never
-      : never
-    }[keyof R[RegKey] & string]
+    }[keyof R & string]
     : never
-  }[keyof R & string]
-  : never
-  : never
+    : never)
 }[keyof S & string]
 
-// Composable StatePaths type - union of all possible path types
-export type StatePaths<S> =
-  | SimpleStateName<S>
-  | RegionStateName<S>
-  | NestedStateName<S>
-  | DeepNestedStateName<S>
+// Retained for backward-compatible export (index.ts re-exports it). Now an alias
+// of the recursive form so "deeply nested state name" honestly denotes an
+// addressable deep LEAF/composite path rather than a region-container path.
+export type DeepNestedStateName<S> = StatePathsOf<S>
+
+// Composable StatePaths type — the complete set of addressable state paths.
+// Built from the recursive `StatePathsOf` so leaves of any depth are accepted
+// and region-container paths are rejected (H-1). `SimpleStateName`/
+// `RegionStateName`/`NestedStateName` remain exported for API stability.
+export type StatePaths<S> = StatePathsOf<S>
 
 // Config callbacks and setContext-resolved string callbacks run against the
 // underlying owner object, not the adapter wrapper.
@@ -247,7 +748,13 @@ export type State<T extends object> = {
   invoke?: StateInvocation<T>[] // Поручения (выполняются при входе в состояние)
 }
 
-export interface StateInvocation<T extends object> {
+/**
+ * SPEC §6а — the ORIGINAL timer form of an invocation: after `delay` ms (armed
+ * on leaf entry, torn down on leaf exit) the engine raises `event` internally.
+ * PRESERVED verbatim so existing configs keep working; it is one arm of the
+ * {@link StateInvocation} union.
+ */
+export interface InvokeTimer<T extends object> {
   /** Время задержки в миллисекундах */
   delay: number
   /** Событие, которое будет вызвано после задержки */
@@ -258,10 +765,86 @@ export interface StateInvocation<T extends object> {
   action?: ActionOrString<T>
 }
 
+/**
+ * SPEC §6а (decision «а») — a LONG-RUNNING invoked operation with cancellation.
+ * `src` is started on leaf entry (after `onEnter`) and receives an
+ * {@link AbortSignal} that is `abort()`-ed when the leaf is exited (BEFORE its
+ * `onExit`, so the exit handler observes `signal.aborted`).
+ *
+ * - `onDone` — internal event raised on fulfilment; the resolved value is the
+ *   event payload.
+ * - `onError` — internal event raised on rejection; the error is the payload.
+ *   With NO `onError`, a rejection is routed to `monitor.recordError` (the same
+ *   observable policy as a throwing guard, F7).
+ * - An event produced by an operation that was already cancelled
+ *   (`signal.aborted` at settle time) is DROPPED — the leaf has been left.
+ */
+export interface InvokeOperation<T extends object> {
+  /** The operation. Started on entry; receives an AbortSignal cancelled on exit. */
+  src: (adaptee: T, signal: AbortSignal, ...args: any[]) => Promise<unknown>
+  /** Internal event raised on success; the resolved value is the payload. */
+  onDone?: EventName
+  /** Internal event raised on failure; the error is the payload. */
+  onError?: EventName
+  /** Условие запуска операции (checked on entry). */
+  cond?: (adaptee: T) => boolean
+  /** Optional stable identity for diagnostics / recordError context. */
+  id?: string
+}
+
+/**
+ * SPEC §6а — a state invocation is EITHER the timer form ({@link InvokeTimer})
+ * or the long-running operation form ({@link InvokeOperation}). The union is
+ * discriminated at runtime by the presence of a `src` function.
+ */
+export type StateInvocation<T extends object> =
+  | InvokeTimer<T>
+  | InvokeOperation<T>
+
+/**
+ * SPEC §6а (decision «б») — supplemental context passed as the LAST argument to
+ * a leaf's `onExit` (in addition to, never replacing, the event payload):
+ * `onExit(adaptee, ...eventPayload, exitContext)`. Lets a region/lane tell
+ * "I was swept" from "I reached final".
+ */
+export interface ExitContext {
+  /** Name of the event that drove this exit. */
+  event: string
+  /**
+   * `true` — the node was swept from OUTSIDE before its region completed
+   * (parallel-exit / abort); `false` — the region reached its final
+   * configuration (natural completion).
+   *
+   * CONVENTION (W3b.1 LOW): `preempted` is judged on COMPLETION, not on WHO
+   * fired the transition. A flat, non-`final` leaf that fires its OWN outgoing
+   * transition (it is the transition's `source`) is a self-initiated exit yet
+   * still reports `preempted: true`, because the leaf had not reached a final
+   * configuration — "preempted" here means "left before completing", and a
+   * self-initiated exit of a non-final leaf is exactly that. A caller that must
+   * distinguish a self-initiated flat exit from an outside sweep should compare
+   * the exiting leaf against the fired transition's source itself, rather than
+   * read that distinction into `preempted`.
+   */
+  preempted: boolean
+  /** Whether the node being exited was itself `final` at the moment of exit. */
+  wasFinal: boolean
+  /** The target configuration being entered. */
+  target: string
+}
+
+// Wildcard `from` forms are a documented (README) and validator-supported (V2)
+// feature: `from: '*'` (any state) and `from: 'prefix.*'` (any state under a
+// prefix / a parallel region). With a literal `S`, `StatePaths<S>` is a finite
+// union that excludes these, so authoring a legit wildcard would be a FALSE type
+// error (W2c regression from the V8 literal-key narrowing). Allow them on `from`
+// only. `to` additionally permits '*' (the runtime self-transition target), but
+// NOT a `prefix.*` set — a transition target must be a concrete state.
+export type WildcardFrom = '*' | `${string}.*`
+
 // Использовать для полей from, to в Transition
 export type Transition<T extends object, S extends States<T>> = {
-  from: StatePaths<S>
-  to: StatePaths<S>
+  from: StatePaths<S> | WildcardFrom
+  to: StatePaths<S> | '*'
   priority?: number
   guard?: ActionOrString<T, boolean>
   /**
@@ -281,6 +864,100 @@ export type Event<T extends object, S extends States<T>> = {
   onAfter?: ActionOrString<T>
   onSuccess?: ActionOrString<T>
   onError?: ErrorHandlerOrString<T>
+}
+
+/**
+ * SPEC §7 — result of {@link StateMachine.fireEventDetailed}. A discriminated
+ * union that, unlike `fireEvent`'s bare `boolean`, NEVER throws and distinguishes
+ * the three no-fire causes:
+ *  - `no-transition` — no candidate matched the active configuration;
+ *  - `guard-rejected` — the ordered candidates' guards all returned falsy;
+ *  - `guard-error` — a candidate's guard THREW (now observably distinct from an
+ *    honest refusal — closes F4).
+ *  - `aborted` — a candidate WAS selected and the microstep BEGAN, but was
+ *    cancelled before it committed (onExit threw under `abortOnExitError`, or the
+ *    target configuration was contradictory). Observably distinct from
+ *    `no-transition` (no candidate at all) so the W5 sim oracle can tell "nothing
+ *    to do" from "a started microstep was rolled back".
+ *  - `error-state` (W4.1 #3) — the requested transition FAILED (onEnter threw) and
+ *    the machine recovered into the configured `errorState`. The target transition
+ *    did NOT fire, so `fired` is `false` — consistent with the monitor, which
+ *    records this as a failed transition, and with the observable state now sitting
+ *    in `errorState`. (The old code returned `fired:true` with the requested
+ *    `a→b`, contradicting both other public channels.)
+ *
+ * `fireEvent` deliberately keeps returning `boolean`: `{ fired: false }` is a
+ * truthy object, so any `if (await sm.fireEvent(e))` would silently invert.
+ */
+export type FireResult =
+  | {
+      fired: true
+      /** Every transition that fired this microstep (single-transition in W3-B). */
+      transitions: Array<{ event: string; from: string; to: string }>
+    }
+  | {
+      fired: false
+      reason: 'no-transition' | 'guard-rejected' | 'guard-error' | 'aborted' | 'error-state'
+      /** Per-candidate rejection detail, present for the guard-* reasons. */
+      rejected?: Array<{
+        /** `'from -> to'` label of the rejected transition. */
+        transition: string
+        reason: 'guard-rejected' | 'guard-error'
+        error?: Error
+      }>
+    }
+
+/**
+ * B3 — what `StateMachine.detachOwner` actually released.
+ *
+ * Every count is of work that would otherwise have reached an object the caller
+ * has already saved and let go, so the numbers are the useful ones for a log
+ * line ("released row 42, cancelled 3 timers") and for asserting that a detach
+ * had teeth. A detach of an owner with no live runtime returns all zeros, which
+ * is also what a second detach of the same owner returns.
+ *
+ * Deliberately NOT counted: the per-owner history / entry-time / restart-count
+ * maps that detach also drops. Dropping them frees memory the garbage collector
+ * would have freed anyway once the owner became unreachable; reporting it would
+ * claim credit for work that is not detach's.
+ */
+export interface OwnerDetachResult {
+  /**
+   * Registered `invoke` timer handles this owner still held, all of them
+   * cancelled.
+   *
+   * Read it as "handles released", NOT as "late writes prevented". A handle stays
+   * registered after its timer FIRES — nothing removes it until the leaf is left
+   * or re-entered — so a timer that has already gone off is counted here even
+   * though cancelling it is a no-op. Whether anything was still LIVE is the
+   * separate question `continuationsCut` answers.
+   */
+  timersCleared: number
+  /**
+   * In-flight `invoke` operations aborted. Counts only operations that were not
+   * already aborted, so a leaf whose operation had settled contributes nothing.
+   */
+  operationsAborted: number
+  /**
+   * Events already queued for this owner and dropped before the drain reached
+   * them — the window between a timer firing and the microtask that processes
+   * what it raised. A dropped event that a caller was awaiting is settled, never
+   * left pending.
+   */
+  queuedEventsDropped: number
+  /**
+   * B3/C1 — timer-form `invoke` continuations that were suspended mid-`await`
+   * inside their `invoke.action` at the moment of the detach, and have now been
+   * cut: each one returns without raising its event, instead of advancing the
+   * released row.
+   *
+   * This is the only field that reports work which was genuinely STILL RUNNING.
+   * The other three describe registrations and queue entries, and a fired timer
+   * inflates `timersCleared` while cancelling nothing — so a non-zero
+   * `continuationsCut` is the signal that the detach landed on a live
+   * continuation rather than on an already-quiet owner.
+   */
+  continuationsCut: number
 }
 
 ///Record<StateName, Omit<State<T>, 'name'>>
@@ -314,6 +991,34 @@ export interface StateMachineConfig<T extends object = object> {
   >
   states: States<T> // Корневые состояния машины
   // states: Record<StateName, Omit<State<T>, 'name'>>
+  onError?: ErrorHandlerOrString<T>
+}
+
+/**
+ * Author-facing config shape that PRESERVES the literal state keys so that
+ * `initialState`, and every transition `from` / `to`, are checked against the
+ * ACTUAL declared states rather than degrading to `string`.
+ *
+ * {@link StateMachineConfig} declares `states: States<T>` where
+ * `States<T> = Record<StateName /* = string *\/, …>` — that `Record<string, …>`
+ * collapses the state keys to `string`, so `initialState: keyof states` and
+ * `from`/`to: StatePaths<states>` become `string` and typos slip through the
+ * compiler. `TypedMachineConfig<T, S>` keeps `S` (the exact `states` object)
+ * as its own type parameter; the {@link createMachine} factory infers `S` with
+ * a `const` type parameter so `S` retains the literal keys, making
+ * `StatePaths<S>` a finite union and turning a typo into a compile error.
+ *
+ * A `TypedMachineConfig<T, S>` is structurally assignable to
+ * `StateMachineConfig<T>` (since `S extends States<T>` and
+ * `StatePaths<S> ⊆ string`), so it flows into the runtime constructor unchanged.
+ */
+export interface TypedMachineConfig<T extends object, S extends States<T>> {
+  name: string
+  description?: string
+  stateAttribute: KeysOf<PropertiesOf<T>, string>
+  initialState: StatePaths<S>
+  events: Record<EventName, Omit<Event<T, S>, 'name'>>
+  states: S
   onError?: ErrorHandlerOrString<T>
 }
 

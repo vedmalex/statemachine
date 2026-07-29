@@ -14,10 +14,11 @@
  *
  * Checkers are PURE functions of `(frame|state, ctx)` (ADR-6 c3): they make NO
  * live engine read. `getRegionKey` is REPLICATED in {@link ConfigGraph} (the
- * engine's is PRIVATE at state_machine.ts:2435, never called). Outcomes come from
- * the `fireEvent` Promise + the Step-2 Adapter-seam deltas captured in the trace,
- * NEVER from `IMonitor` (recordTransition is hardcoded `(time,true)` at :2059-2060
- * and cannot be a determinism signal).
+ * engine's is PRIVATE in state_machine.ts, never called). Outcomes come from the
+ * `fireEvent` Promise + the Step-2 Adapter-seam deltas captured in the trace,
+ * NEVER from `IMonitor`. Post-W4 `recordTransition` carries a `success` FLAG
+ * (`true` commit / `false` refusal), but it still runs AFTER the write and is not
+ * a determinism signal — the Adapter-seam deltas remain the sole outcome source.
  *
  * No `Math.random` / `Date.now` / `performance.now`; no local settle/drain/flush.
  */
@@ -59,6 +60,80 @@ export interface ConfigGraph {
   readonly declaredDoneEvents: ReadonlySet<string>
 }
 
+/**
+ * W8/V3a — ONE retained record of the engine's PUBLIC lifecycle observability
+ * channel (`IMonitor.recordLifecycle`, types.ts `LifecycleEvent`), as the harness
+ * projects it into the SAFETY plane.
+ *
+ * This is deliberately a LOCAL STRUCTURAL restatement, not an import of the
+ * engine's `LifecycleEvent`: the SAFETY plane owns its own closed observation
+ * vocabulary (the same reason {@link ConfigGraph} REPLICATES `getRegionKey` and
+ * `TraceFrame` restates `FaultKind`). Any `LifecycleEvent` is structurally
+ * assignable to it, so the projection cannot silently drift.
+ *
+ * Reading these records is NOT a live engine read (ADR-6 c3): they are CAPTURED
+ * observations recorded by the monitor seam during the drain, exactly like the
+ * `doneDelta` projection — the checker never calls the machine.
+ *
+ * ## Field caveats a checker MUST honor
+ * - `state` is a full dot-path ONLY for `kind:'enter'|'exit'|'invoke'`. For
+ *   `kind:'guard'` it is the transition's `from` SELECTOR, which may be `'*'`,
+ *   `'p.*'` or a multi-source `'a|b'` list — NEVER dot-parse it.
+ * - `microstep === 0` is the RESERVED "no microstep" id shared by construction,
+ *   `reset` and `resumeTimers`. Records from those three UNRELATED paths are
+ *   therefore indistinguishable, so a per-microstep window keyed on `0` would
+ *   conflate them.
+ * - `owner` is a REFERENCE-identity discriminator (one machine can drive many
+ *   objects). Never serialize it; never compare it structurally.
+ * - `kind:'raise'` is an INSTANTANEOUS point record (an adjacent `begin`+`end`
+ *   pair, the `invoke.abort` precedent), NOT a callback bracket. Its `event` is the
+ *   RAISED event name and is always present; its `state` is the raise ORIGIN (the
+ *   composite for `raise.done`, the invoke-owning leaf otherwise). Its `microstep`
+ *   is the arming id for the `raise.invoke.*` hooks and the CURRENT id for
+ *   `raise.done` (see types.ts RAISE ASYMMETRY) — never the step in which the
+ *   raised event is later PROCESSED.
+ */
+export interface LifecycleObservation {
+  readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
+  readonly hook: string
+  readonly state: string
+  readonly owner: object
+  readonly microstep: number
+  readonly seq: number
+  readonly edge: 'begin' | 'end'
+  readonly event?: string
+  readonly failed?: boolean
+  readonly transition?: string
+}
+
+/**
+ * The RTC-stall observation the I-13 oracle reads, as the SAFETY plane states it.
+ *
+ * This is a LOCAL STRUCTURAL restatement of what `settle.ts`'s sample recorder
+ * produces, NOT an import of it — the same discipline as {@link ConfigGraph}
+ * replicating the engine's `getRegionKey` and {@link LifecycleObservation}
+ * restating the engine's `LifecycleEvent`. It is also MECHANICALLY required: this
+ * module may not import from the settle plane at all (the checker-purity grep in
+ * `invariants.test.ts` forbids `from './settle'` here, so that no checker can
+ * acquire a settle/drain call by accident). The recorder's return type is
+ * structurally assignable to this, so the two cannot silently drift.
+ *
+ * Reading it is not a live engine read: the samples were CAPTURED by the settle
+ * pump during the drain, exactly like the `doneDelta` projection.
+ */
+export interface RtcStallObservation {
+  /** Total pump samples taken across the run. */
+  readonly samples: number
+  /**
+   * Longest run of MICROTASK-ADJACENT samples for which the stall predicate
+   * (`queue > 0`, not processing, no in-flight async) held. `>= 2` is the I-13
+   * witness; `1` is a reading a CORRECT machine legitimately produces.
+   */
+  readonly maxRun: number
+  /** Queue total observed at the sample that set {@link maxRun} (0 when none). */
+  readonly witnessQueueTotal: number
+}
+
 /** The pure context every checker receives (graph + header; NO live engine). */
 export interface CheckerContext {
   readonly graph: ConfigGraph
@@ -69,6 +144,67 @@ export interface CheckerContext {
    * a live engine read; the harness supplies it from the same options it wired.
    */
   readonly maxQueueDepth?: number
+  /**
+   * W8/V3a — the CAPTURED lifecycle observation stream of this run, in engine
+   * `seq` order (the harness monitor's live view). Absent when the run wired no
+   * lifecycle sink, which makes every lifecycle-keyed oracle VACUOUS rather than
+   * failing — a missing observation plane must never manufacture a violation.
+   *
+   * It lives on the CONTEXT, not on {@link TraceFrame}, for two reasons: the
+   * callback timeline is a per-MICROSTEP structure with no 1:1 frame mapping, and
+   * putting it on a frame would drag a non-deterministic `owner` object reference
+   * into the content hash.
+   *
+   * Carries the CALLBACK TIMELINE only — `kind:'raise'` records live on their own
+   * stream ({@link raises}) with their own cap and truncation flag.
+   */
+  readonly lifecycle?: readonly LifecycleObservation[]
+  /**
+   * W9/Г1 — the CAPTURED `kind:'raise'` stream of this run, in engine `seq` order
+   * (every record has `kind === 'raise'`). This is the ENGINE-side proof that an
+   * internal event was actually raised — the signal that lets the I-5 join oracle
+   * COUNT raises instead of re-implementing the engine's selection semantics.
+   *
+   * ABSENT when the run wired no lifecycle sink ⇒ every raise-keyed oracle is
+   * VACUOUS (the I-4 convention: a missing observation plane must never manufacture
+   * a violation).
+   */
+  readonly raises?: readonly LifecycleObservation[]
+  /**
+   * W9/Г1 — true iff the raise buffer hit its cap and STOPPED retaining records.
+   * A counting oracle MUST treat this as VACUOUS: a truncated stream under-counts
+   * raises, and an under-count in a `edges > raises` predicate is exactly a FALSE
+   * POSITIVE on a correct machine.
+   */
+  readonly raisesTruncated?: boolean
+  /**
+   * The trace frames the sweep is running over, supplied by the RUNNER (which
+   * already holds the trace) so a `checkFinal` predicate can be a function of the
+   * whole frame sequence and not just the terminal {@link FinalState}.
+   *
+   * This does NOT weaken checker purity: they are the SAME captured frames a
+   * `checkStep` checker already receives one at a time — no live engine read is
+   * added. It exists because some sound predicates are inherently SEQUENCE-shaped
+   * (I-5 counts `false → true` transitions of the `doneDelta` projection across
+   * ADJACENT boundary frames), and a per-frame hook cannot see its predecessor.
+   */
+  readonly frames?: readonly TraceFrame[]
+  /**
+   * The CAPTURED per-pump-turn RTC-stall observation of this run (settle.ts
+   * `makeRtcStallRecorder`), supplied by the harness as a LIVE VIEW — the
+   * sole input of the I-13 oracle.
+   *
+   * Like {@link lifecycle} and {@link raises} it lives on the CONTEXT, never on
+   * {@link TraceFrame}: the pump turn is a sub-frame structure with no 1:1 frame
+   * mapping, and adding a hashed frame field would move every corpus hash for an
+   * observation that is not part of the content plane. Nothing here is a live
+   * engine read — the samples were recorded by the settle pump during the drain,
+   * exactly like the `doneDelta` projection.
+   *
+   * ABSENT when the run wired no sample sink ⇒ I-13 is VACUOUS (the I-4
+   * convention: a missing observation plane must never manufacture a violation).
+   */
+  readonly rtcStall?: RtcStallObservation
 }
 
 /**
@@ -301,6 +437,12 @@ const I2: Invariant = {
  * is not still processing. A quiescent frame whose record says processing was
  * still in flight is a violation. We read the captured `quiescent` boolean (true
  * settle boundary ⇒ isProcessingEvents() was false at :509).
+ *
+ * OPT-IN, and currently WITHOUT a machine-reachable witness — see the exclusion
+ * ledger in `checkStep` and `DEFAULT_BUILTIN_INVARIANT_IDS` in public.ts. It is
+ * retained (rather than deleted) because it is the placeholder for the RTC
+ * question, and because a hand-built trace can still exercise it; what it needs to
+ * become decidable is stated in `docs/dynamic-check.md`.
  */
 const I3: Invariant = {
   id: 'I-3',
@@ -313,10 +455,87 @@ const I3: Invariant = {
     // a wedged in-flight transition is the I-3 witness only when the run claimed
     // settlement. Step-level I-3 here checks monotonic frame steps + that a
     // resolve-true settle boundary is quiescent.
+    // EVERY documented non-quiescence reason is now EXCLUDED (none is an RTC break
+    // the harness can establish), which is why I-3 is OPT-IN again:
+    //  - WAITING_ON_TIMER (C1): the fired region observably completed
+    //    (`hasPendingWork()===false`); only a sibling's future timer remains.
+    //  - WAITING_ON_TRANSITION_TIMEOUT (U1 precision): settle.ts now assigns this
+    //    ONLY when `inFlightAsyncCount() > 0` — a GENUINE awaited async action racing
+    //    a future deadline (liveness' jurisdiction), not a wedged flag. Before U1 it
+    //    fired on ANY pending work + a timer, so excluding it risked a false-negative;
+    //    now the inFlight>0 guarantee makes the exclusion SOUND.
+    //  - BOTH BUDGET REASONS — `budget-progressing` AND `microtask-budget`. A budget
+    //    exhaustion is a TRUNCATED observation, and a truncated observation cannot
+    //    convict. The frozen `maxTurns`-turn prefix left by an `onEnter` hook that
+    //    finishes at turn 2000 is byte-identical to the prefix left by a hook that
+    //    never finishes: enter/exit hooks are deliberately NOT counted in
+    //    `inFlightAsyncCount` (driver.ts), so while one runs all three fingerprint
+    //    components are frozen with no timer armed. `microtask-budget` used to be an
+    //    I-3 witness and convicted exactly such a CORRECT machine — reproduced with
+    //    `s0 -E-> h1 -(invoke delay:0)-> slow`, `slow.onEnter = async () => { for
+    //    (let i=0;i<1000;i++) await Promise.resolve() }`, which reaches `slow`
+    //    every time yet failed I-3 at N>=1000 and passed at N<=100. The deciding
+    //    variable was `DEFAULT_MAX_TURNS`, an internal harness constant — never the
+    //    machine. Both reasons are now surfaced as WARNINGS (public.ts) instead.
+    //  - WAITING_ON_INTERNAL — DEMOTED, and this is the change that left I-3 with no
+    //    reachable witness (see `DEFAULT_BUILTIN_INVARIANT_IDS` in public.ts, which
+    //    no longer lists it). It was justified as a POSITIVE observation on the
+    //    grounds that the pump reaches it at its EARLY break — exit (b) in settle.ts,
+    //    `pending && stuck >= QUIET_FLUSH && earliestExecuteAt() !== null` — "inside
+    //    budget, so it is something the harness observed rather than something it ran
+    //    out of time to disprove". That justification was FALSE. Exit (b)'s
+    //    observational content is *the fingerprint has not moved for 16 turns and
+    //    some timer somewhere is armed*: the same frozen-prefix object as a budget
+    //    exhaustion, over a window 64x smaller, and the armed timer may belong to an
+    //    unrelated parallel region.
+    //
+    //    MEASURED, through the public surface (`runSimulation`, seed '1', steps 2,
+    //    mode 'safety'). A parallel composite whose region `rt` merely holds
+    //    `invoke: [{event:'never', delay:100000}]` — an armed timer that never fires
+    //    under 'safety' — while region `r1` steps `h1 -(invoke delay:0)-> slow`:
+    //
+    //      slow with a SYNCHRONOUS onEnter  -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      slow.onEnter async, 1 microtask  -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      slow.onEnter async, 3 / 5 / 20   -> ok:false  I-3  WAITING_ON_INTERNAL
+    //      the SAME machine without `rt`    -> ok:true        (no violation)
+    //
+    //    Every one of those machines reaches `slow` in the same trace. The deciding
+    //    variable is an UNRELATED sibling region's deadline plus the internal
+    //    constant `QUIET_FLUSH = 16` — never the machine. Note the first row: the
+    //    hook is SYNCHRONOUS, so there is no async span to observe and no in-flight
+    //    count of any kind could have rescued it.
+    //
+    //    WHY NO PROXY FIXES THIS. `stuck` counts turns with a frozen
+    //    `queueDepth|isProcessingEvents|inFlightAsyncCount` fingerprint, but that
+    //    fingerprint is frozen across an ENTIRE ordinary microstep: the engine awaits
+    //    once per hook slot per state even when no hook is defined (the `if (!action)
+    //    return` sits INSIDE the awaited function, state_machine.ts:~4853-4855, enter
+    //    side ~:4971-4986). One LEGITIMATE microstep's frozen-turn count is therefore
+    //    O(#states + #hooks) — a function of the machine's own width, unbounded and
+    //    config-dependent. Any fixed k-turn window is refuted by a correct machine
+    //    whose legitimate frozen chain is k+1 turns long. `stuck` is a proxy for "the
+    //    engine has no scheduled continuation", and that is not observable from here.
+    //    It is surfaced as an advisory WARNING instead (`rtc-unobserved`, public.ts).
+    //  - a resolve-true boundary with NO settleReason at all. This branch is DEAD
+    //    from any real run: every `quiescent:false` return in `settleMacrostep` sets a
+    //    reason, and the driver stamps `result.reason ?? preFire.reason`, so a
+    //    non-quiescent boundary frame always carries one. It is kept only because a
+    //    HAND-BUILT trace (the oracle self-tests construct frames directly) can still
+    //    reach it — it is not a witness a machine can produce.
+    const legitimateWait =
+      frame.settleReason === 'WAITING_ON_TIMER' ||
+      frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT' ||
+      // Both budget exhaustions: the HARNESS stopped watching. Neither says
+      // anything about the machine — see the truncation note above.
+      frame.settleReason === 'budget-progressing' ||
+      frame.settleReason === 'microtask-budget' ||
+      // The 16-turn window is the same truncation over a smaller window.
+      frame.settleReason === 'WAITING_ON_INTERNAL'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&
-      frame.errorClass === undefined
+      frame.errorClass === undefined &&
+      !legitimateWait
     ) {
       return makeViolation({
         invariantId: 'I-3',
@@ -332,93 +551,329 @@ const I3: Invariant = {
 }
 
 /**
- * I-4 HIERARCHY-ORDER (step). Enter probes fire shallow→deep
- * (`a.depth-b.depth||a.index-b.index`), exit probes deep→shallow (state_machine.ts
- * :1596-1603). The Step-4 generator emits closure-free owner-marker probes; this
- * checker recomputes the expected order from the {@link ConfigGraph} and compares
- * the observed marker order. errorState-targeted topologies are EXCLUDED (:2020
- * bypasses executeEnterActions); the generator never places probes there.
+ * True iff `descendant` is a STRICT descendant of `ancestor` in the dotted state
+ * hierarchy (`'p'` is an ancestor of `'p.r.c'`; `'p'` is NOT an ancestor of
+ * `'px'`). The `'.'` in the prefix test is what makes it a segment boundary
+ * rather than a string prefix.
  *
- * The observed marker order is carried in the trace as the `to` deltas (the
- * Adapter-seam writes the entered state, deepest last). A from/to pair whose entry
- * order inverts the depth sort is the witness. We verify the entered composite's
- * region parts are depth-ordered in the rendered `to`.
+ * This is the ANCESTOR RELATION, deliberately NOT a depth NUMBER. A
+ * depth-comparison predicate would order two SIBLING branches against each other
+ * (`a.r1.leaf` vs `a.r2` differ in depth but neither contains the other), and the
+ * W3C order the engine implements only constrains ancestor/descendant pairs —
+ * sibling order is document order and is free to interleave. Comparing depths
+ * would therefore FALSE-POSITIVE on a legitimate parallel-region entry.
+ */
+function isStrictDescendant(descendant: string, ancestor: string): boolean {
+  return descendant.length > ancestor.length + 1 && descendant.startsWith(`${ancestor}.`)
+}
+
+/**
+ * I-4 HIERARCHY-ORDER (final, lifecycle-keyed). W8/V11 aligned the engine's
+ * callback order to W3C: entry runs in DOCUMENT ORDER (DFS preorder, ancestor
+ * before descendant) and exit in REVERSE document order (descendant before
+ * ancestor). W8/V1 made that order OBSERVABLE for the first time through the
+ * public `IMonitor.recordLifecycle` channel, so I-4 is no longer a no-op backstop:
+ * it now checks the real callback timeline the engine emitted.
+ *
+ * ## Predicate (per MICROSTEP window, per owner)
+ * - enter: there is NO pair `enter(s1)` before `enter(s2)` where s1 is a
+ *   DESCENDANT of s2 (a child must never be entered before its parent).
+ * - exit:  there is NO pair `exit(s1)` before `exit(s2)` where s1 is an ANCESTOR
+ *   of s2 (a parent must never exit before its child).
+ *
+ * Relation is the dot-prefix ANCESTOR relation, never a depth number — see
+ * {@link isStrictDescendant} for why depth comparison is unsound here.
+ *
+ * ## Why this is SOUND (no false positive is reachable)
+ * - Only `edge:'begin'` records define the order. The engine awaits each hook
+ *   sequentially (`executeEnterActions` / `executeExitActions` loop over states,
+ *   and over the three hook slots inside a state), so `begin` order IS invocation
+ *   order.
+ * - A state with NO hook emits NO record. The observed sequence is therefore a
+ *   SUBSEQUENCE of the real one — and a subsequence of a correctly-ordered
+ *   sequence still satisfies the predicate, so a hook-less state can never
+ *   manufacture an inversion.
+ * - `kind:'guard'` is EXCLUDED: its `state` is the transition's `from` SELECTOR
+ *   (`'*'` / `'p.*'` / `'a|b'`), not a path — dot-parsing it would compare
+ *   selectors against paths and invent ancestry.
+ * - `kind:'invoke'` is EXCLUDED: an invoke is not an entry/exit hook at all, and
+ *   its `microstep` is the ARMING step (types.ts INVOKE ASYMMETRY), so it would
+ *   land in the wrong window.
+ * - `microstep === 0` is EXCLUDED: it is the RESERVED id shared by construction,
+ *   `reset` and `resumeTimers`. Those are three UNRELATED entry passes; merging
+ *   them into one window would compare a construction entry against a later
+ *   `resumeTimers` entry and report a phantom inversion. Their ordering is covered
+ *   by the engine's own conformance tests, which observe each pass in isolation.
+ * - An ABORTED microstep (a throw before the point of no return) HAS emitted enter
+ *   records for a configuration that was never committed — but those records were
+ *   still emitted in hook order, so the predicate holds on them too. No exclusion
+ *   is needed and none is made.
+ * - Windows are split by (`microstep`, `owner`): a machine driving several owners
+ *   interleaves their timelines, and comparing across owners would compare two
+ *   independent hierarchies.
+ *
+ * A run that wired no lifecycle sink leaves `ctx.lifecycle` absent and I-4 is
+ * VACUOUS — a missing observation plane never fabricates a violation.
  */
 const I4: Invariant = {
   id: 'I-4',
-  scope: 'step',
+  scope: 'final',
   capabilityTags: ['hierarchy.enter-exit-order'],
-  checkStep(frame, ctx): Violation | null {
-    // The rendered `to` (normalized) is depth-sorted parts; the engine's SCXML
-    // total-order sort is depth-then-index. We verify each part is a registered
-    // state path (a non-registered part here would be an I-10 issue, not I-4) and
-    // that parts of a single composite share consistent region structure. The
-    // pure structural check: no two distinct parts in `to` collapse to the SAME
-    // region key (that would be a hierarchy/containment fault — see I-6) AND the
-    // depth ordering of the (already-sorted) parts is non-decreasing under the
-    // engine's depth metric.
-    const parts = frame.to.split('|').filter((p) => p.length > 0)
-    if (parts.length <= 1) {
+  checkFinal(_state, ctx): Violation | null {
+    const stream = ctx.lifecycle
+    if (stream === undefined || stream.length === 0) {
       return null
     }
-    // The frame.to is '|'-sorted lexicographically (compensating :1202 insertion
-    // order). I-4's structural witness is a depth inversion across region siblings
-    // that the depth-then-index sort would never produce: we recompute the depth
-    // of each part and assert the multiset of region keys is unique (no region
-    // appears twice — its own invariant is I-6, but a duplicate also breaks the
-    // hierarchy enter order assumption).
-    const regionKeys = parts.map((p) => ctx.graph.getRegionKey(p))
-    const seen = new Set<string>()
-    for (let i = 0; i < regionKeys.length; i++) {
-      const rk = regionKeys[i]
-      if (rk !== undefined && seen.has(rk)) {
-        // Two parts share a region key — handled by I-6; I-4 stays clean (it is
-        // the ORDER invariant, not the containment one).
-        return null
+    // ONE linear pass over the seq-ordered stream, carrying the current
+    // (microstep, owner) window. Enter/exit hooks run INSIDE their microstep and
+    // microsteps are run-to-completion serialized, so the relevant records arrive
+    // window-contiguous. If they ever did not, the window would merely SPLIT — a
+    // conservative outcome that can drop a comparison but never invent one.
+    let windowKind: 'enter' | 'exit' | null = null
+    let windowStep = -1
+    let windowOwner: object | null = null
+    /** `state` paths seen so far in the current window, in begin order. */
+    let seen: string[] = []
+
+    const inversionIn = (kind: 'enter' | 'exit', earlier: string, later: string): boolean =>
+      kind === 'enter'
+        ? // a DESCENDANT was entered before its ANCESTOR
+          isStrictDescendant(earlier, later)
+        : // an ANCESTOR exited before its DESCENDANT
+          isStrictDescendant(later, earlier)
+
+    for (const rec of stream) {
+      if (rec.edge !== 'begin') {
+        continue
       }
-      if (rk !== undefined) {
-        seen.add(rk)
+      if (rec.kind !== 'enter' && rec.kind !== 'exit') {
+        continue // guard selectors + invoke arming steps are not orderable here
       }
+      if (rec.microstep === 0) {
+        continue // reserved construction / reset / resumeTimers id
+      }
+      if (rec.kind !== windowKind || rec.microstep !== windowStep || rec.owner !== windowOwner) {
+        windowKind = rec.kind
+        windowStep = rec.microstep
+        windowOwner = rec.owner
+        seen = []
+      }
+      for (const earlier of seen) {
+        if (inversionIn(rec.kind, earlier, rec.state)) {
+          const order = rec.kind === 'enter' ? 'ancestor before descendant' : 'descendant before ancestor'
+          return makeViolation({
+            invariantId: 'I-4',
+            // A lifecycle window has no TRACE step (the callback timeline is a
+            // per-microstep structure with no 1:1 frame mapping), so the final-scope
+            // sentinel is used and the microstep is carried in the witness/message.
+            step: Number.MAX_SAFE_INTEGER,
+            witness: `${rec.kind}@${rec.microstep}:${earlier}>${rec.state}`,
+            message: `${rec.kind} hooks ran out of hierarchy order in microstep ${rec.microstep}: '${earlier}' before '${rec.state}'`,
+            observed: `${rec.kind}('${earlier}') preceded ${rec.kind}('${rec.state}')`,
+            expected: `${rec.kind} runs ${order}`,
+          })
+        }
+      }
+      seen.push(rec.state)
     }
     return null
   },
 }
 
 /**
- * I-5 PARALLEL-JOIN (step). When all regions of a declared composite reach final,
- * the engine raises `done.state.<C>`. The harness samples `isDone(C)` per declared
- * composite at each settle boundary and stores the boolean as `frame.doneDelta`
- * (the PUBLIC isDone(C) :1433; isCompositeDone :1366 is private). The checker reads
- * THIS captured projection — NEVER a live `sm.isDone()` (ADR-6 c3 purity).
+ * I-5 PARALLEL-JOIN (final, COUNTING). When all regions of a declared composite
+ * reach final, the engine MUST raise `done.state.<C>` — otherwise a consumer's
+ * completion handler silently never runs.
  *
- * Violation: a frame whose `doneDelta` marks a composite done BUT the trace never
- * recorded the corresponding `done.state.<C>` raise the config declares.
+ * ## The two halves of the observation
+ * - "it SHOULD have been raised": the harness samples `isDone(C)` per declared
+ *   composite at each settle boundary and stores the boolean as `frame.doneDelta`
+ *   (the PUBLIC isDone(C); `isCompositeDone` is private). ENTERING the done
+ *   configuration is a `false → true` EDGE of that projection.
+ * - "it WAS raised": the engine's `kind:'raise'` lifecycle records
+ *   ({@link CheckerContext.raises}) — W9/Г1 made the internal raise OBSERVABLE.
+ *
+ * Both halves are CAPTURED projections read from the context; the checker makes no
+ * live engine read (ADR-6 c3 purity).
+ *
+ * ## Predicate (per declared composite C)
+ * ```
+ * edges(C)  = # of ADJACENT boundary-frame pairs (prev,cur) with
+ *             prev.doneDelta[C] === false && cur.doneDelta[C] === true
+ * raises(C) = # of raise records with edge:'begin' and event === 'done.state.'+C
+ * VIOLATION ⇔ edges(C) > raises(C)
+ * ```
+ *
+ * ## Why `>` and not a per-edge match — the ONLY sound direction
+ * The two sides are counted at DIFFERENT GRANULARITIES, deliberately. The engine
+ * checks the done edge per MICROSTEP; the harness samples `doneDelta` per settle
+ * BOUNDARY (macrostep). Inside one macrostep a composite's configuration may blink
+ * done → undone → done: the engine correctly raises TWICE, while the boundary diff
+ * sees ONE edge. Every granularity mismatch therefore pushes in the SAME direction,
+ * `raises >= edges`, so it can only make the predicate MORE permissive. A DEFICIT
+ * (`edges > raises`) has no such explanation: it means the run entered a declared
+ * composite's done configuration more times than the engine raised its event.
+ *
+ * Note what this does NOT do: it never asks "was a transition for `done.state.<C>`
+ * ENABLED here?". That question is the fabricated-oracle trap this invariant
+ * already fell into once (the shipped W5b false positive) — answering it means
+ * REPLICATING selection semantics (wildcard/ancestor `from` selectors, `'a|b'`
+ * lists, LCA conflict resolution, documentIndex priority), and every divergence
+ * from the engine would be a false positive on a CORRECT machine. Counting needs
+ * none of it: a raise that matched no candidate transition is still a RAISE, and it
+ * is now recorded as one.
+ *
+ * ## The false-positive surfaces this predicate must (and does) avoid
+ * - EDGE-TRIGGERED join: a composite that STAYS all-final is not re-raised. Only
+ *   `false → true` counts, so a plateau creates no expectation.
+ * - `restoreState` deliberately does NOT re-fire the join (persistence.test.ts), so
+ *   any step carrying a `synthetic:'post-restore'` frame is excluded wholesale.
+ * - A composite already all-final AT START: boundary index 0 has no predecessor, so
+ *   the init edge is never counted (an initial done configuration DOES raise, which
+ *   would only add to `raises` — the exclusion stays on the safe side either way).
+ * - The corrupt-state probe writes an all-final configuration DIRECTLY through the
+ *   adapter seam, bypassing `checkCompletion` entirely — `synthetic:'corrupt-state'`
+ *   steps are excluded on the same rule.
+ * - An UNDECLARED `done.state.<C>` is never raised by the engine (it gates on
+ *   `events.has`), so the predicate keys ONLY on `graph.declaredDoneEvents`.
+ * - A TRUNCATED raise buffer under-counts raises ⇒ VACUOUS.
+ * - No lifecycle plane at all (`ctx.raises === undefined`) ⇒ VACUOUS (the I-4
+ *   convention: a missing observation plane never manufactures a violation).
+ *
+ * ## CLOSED RESIDUAL — the errorState fallback (fixed in the ENGINE, W9)
+ * This block used to document an OPEN residual: the `errorState` zombie-state
+ * recovery committed its error configuration directly (state_machine.ts, the
+ * `kind:'error-state'` branch) WITHOUT running `checkCompletion`, so an all-final
+ * recovery configuration would show a boundary edge the engine never signalled and
+ * this predicate could fire on a machine behaving as the engine specified.
+ *
+ * That is no longer true. The recovery path now calls
+ * `this.checkCompletion(obj, currentState, errorConfig)`
+ * from the `kind:'error-state'` branch of `state_machine.ts` (~:4651), pinned by
+ * `src/tests/error_state_join.test.ts`.
+ * Completion is a property of the COMMITTED configuration, not of how it was
+ * reached; `checkCompletion` is edge-triggered, so a configuration that was already
+ * done is not re-raised, and the recovery is still reported as a recovery
+ * (`fired:false`, `recordTransition(false)`). The engine question this note left
+ * open — harness tag vs. engine signal — was answered in favour of the ENGINE
+ * signalling completion, which is also why the oracle needed no broad exclusion
+ * that would have blunted it.
+ *
+ * The `'errorState-fallback'` synthetic tag remains in the exclusion set below and
+ * still has no producer; it is now HISTORICAL — reserved rather than load-bearing.
+ * Its exclusion is harmless (a tag nothing emits excludes nothing) and is kept so
+ * the exclusion exists before any future harness that does emit it.
+ *
+ * `doneDelta` is deliberately KEPT rather than replaced by the raise stream: the
+ * predicate is a CONJUNCTION of two independent halves (the raise proves "it
+ * happened", `doneDelta` proves "it had to happen"), and `doneDelta` also feeds the
+ * liveness `terminal` derivation.
+ *
+ * The CONVERSE direction ("a done event fired that was not declared / fell through
+ * a wildcard") is enforced separately, with its own teeth, by I-12.
  */
 const I5: Invariant = {
   id: 'I-5',
-  scope: 'step',
+  scope: 'final',
   capabilityTags: ['composite.parallel-join', 'composite.join.done-state'],
-  checkFinal(state, ctx): Violation | null {
-    // Final-scope sibling: if a composite is declared-done-eventful but the final
-    // config shows all-final regions with no done.state raise, that is a join miss.
-    // (Step-level done-tracking is carried by I-12; I-5 backstops at final.)
-    void state
-    void ctx
-    return null
-  },
-  checkStep(frame, ctx): Violation | null {
-    if (frame.doneDelta === undefined) {
+  checkFinal(_state, ctx): Violation | null {
+    const raises = ctx.raises
+    // VACUITY, in the two shapes that both mean "the raise plane cannot be
+    // counted": no plane wired at all, and a plane that stopped retaining records.
+    if (raises === undefined || ctx.raisesTruncated === true) {
       return null
     }
-    for (const d of frame.doneDelta) {
-      const doneEvent = `done.state.${d.composite}`
-      if (d.done && ctx.graph.declaredDoneEvents.has(doneEvent)) {
-        // The composite is done and the config declares its done.state event. The
-        // join is observable; this is the clean path. A violation would be a
-        // declared-done composite that is done but whose done.state never appears
-        // anywhere in the trace — that cross-frame absence is checked by I-12's
-        // gating. I-5 stays clean for an observed done composite.
-        return null
+    const frames = ctx.frames
+    if (frames === undefined || frames.length === 0) {
+      return null
+    }
+    const declared = ctx.graph.declaredDoneEvents
+    if (declared.size === 0) {
+      return null
+    }
+
+    // Steps carrying ANY harness-synthetic frame are excluded WHOLESALE:
+    // 'post-restore' (the engine deliberately does not re-fire the join),
+    // 'corrupt-state' (the probe writes the configuration past checkCompletion)
+    // and 'errorState-fallback' — HISTORICAL: the recovery path DOES run
+    // checkCompletion now (the `kind:'error-state'` branch of state_machine.ts,
+    // ~:4651, W9), so this tag no longer names
+    // a real gap; it has no producer and is kept only so the exclusion exists
+    // before any future harness that emits it (see the CLOSED RESIDUAL note above).
+    // The first two produce a done configuration the engine was never asked to signal.
+    const syntheticSteps = new Set<number>()
+    for (const f of frames) {
+      if (f.synthetic !== undefined) {
+        syntheticSteps.add(f.step)
+      }
+    }
+
+    // BOUNDARY frames are exactly the ones carrying the doneDelta projection (the
+    // driver stamps it at the settle boundary of each step).
+    const boundaries = frames.filter(
+      (f) => f.doneDelta !== undefined && f.doneDelta.length > 0,
+    )
+    if (boundaries.length < 2) {
+      return null // no adjacent pair ⇒ no edge is observable
+    }
+
+    const edges = new Map<string, number>()
+    for (let i = 1; i < boundaries.length; i++) {
+      const prev = boundaries[i - 1]
+      const cur = boundaries[i]
+      if (prev === undefined || cur === undefined) {
+        continue
+      }
+      if (syntheticSteps.has(cur.step)) {
+        continue
+      }
+      const prevDone = new Map<string, boolean>()
+      for (const d of prev.doneDelta ?? []) {
+        prevDone.set(d.composite, d.done)
+      }
+      for (const d of cur.doneDelta ?? []) {
+        // Strict `false → true`: an ABSENT predecessor entry is NOT an edge (the
+        // composite was not sampled, so "it was not done" is not established).
+        if (d.done && prevDone.get(d.composite) === false) {
+          edges.set(d.composite, (edges.get(d.composite) ?? 0) + 1)
+        }
+      }
+    }
+    if (edges.size === 0) {
+      return null
+    }
+
+    // One `begin` per raise (the pair is adjacent begin+end); counting `end` too
+    // would double every raise and make the predicate unfirable.
+    const raised = new Map<string, number>()
+    for (const r of raises) {
+      if (r.kind !== 'raise' || r.edge !== 'begin' || r.event === undefined) {
+        continue
+      }
+      raised.set(r.event, (raised.get(r.event) ?? 0) + 1)
+    }
+
+    // Sorted so the reported witness is a deterministic function of the run and not
+    // of Map insertion order (the fingerprint is the shrinker's equality key).
+    for (const composite of Array.from(edges.keys()).sort()) {
+      const doneEvent = `done.state.${composite}`
+      if (!declared.has(doneEvent)) {
+        continue
+      }
+      const expectedCount = edges.get(composite) ?? 0
+      const actualCount = raised.get(doneEvent) ?? 0
+      if (expectedCount > actualCount) {
+        return makeViolation({
+          invariantId: 'I-5',
+          // A counting predicate spans the whole trace and has no single guilty
+          // frame, so it uses the final-scope sentinel (the I-4 convention) and
+          // carries the composite in the witness.
+          step: Number.MAX_SAFE_INTEGER,
+          witness: composite,
+          message: `composite '${composite}' entered its all-final configuration ${expectedCount} time(s) but '${doneEvent}' was raised only ${actualCount} time(s) — a declared completion event was NOT raised, so a consumer's completion handler silently never runs`,
+          observed: `${actualCount} raise(s) of '${doneEvent}'`,
+          expected: `at least ${expectedCount} raise(s) of '${doneEvent}'`,
+        })
       }
     }
     return null
@@ -576,6 +1031,18 @@ const I9: Invariant = {
     if (bound === undefined) {
       return null
     }
+    // A3 SOUNDNESS: the engine gates `maxQueueDepth` at EXTERNAL enqueue only
+    // (state_machine.ts:611/:684) — an internal `raiseEvent` is NOT gated, so the
+    // internal queue may TRANSIENTLY exceed the bound MID-drain and legitimately
+    // drain back below it. The combined bound is a REST invariant: only a
+    // QUIESCENT boundary that still shows depth > bound is a real breach (the
+    // engine came to rest over its own limit). Checking non-quiescent frames would
+    // FALSE-POSITIVE on ordinary internal backpressure. (Transient over-bound is
+    // therefore NOT observable here — the enforcement oracle for that is the
+    // `errorClass:'queue-overflow'` reject classification, not I-9.)
+    if (frame.quiescent !== true) {
+      return null
+    }
     const depth = frame.queue.internal + frame.queue.external
     if (depth > bound) {
       return makeViolation({
@@ -716,7 +1183,115 @@ const I12: Invariant = {
 }
 
 /**
- * The FROZEN I-1..I-12 registry. `runSafety` (in invariants.runner.ts) iterates
+ * I-13 ENQUEUE-SCHEDULED (final, OPT-IN). The machine never sits on queued work
+ * with no drain scheduled to consume it.
+ *
+ * ## The predicate
+ * At a MICROTASK CHECKPOINT inside the settle pump (settle.ts `SettleSample` —
+ * the observation taken immediately after `await Promise.resolve()`, exactly one
+ * per turn):
+ *
+ *     queueTotal > 0 && isProcessingEvents() === false && inFlightAsyncCount() === 0
+ *
+ * The witness is that predicate holding across **>= 2 MICROTASK-ADJACENT samples**
+ * (`b.turn === a.turn + 1` within ONE settle). One positive sample is NOT a
+ * finding.
+ *
+ * ## Why this is not a fifth truncation
+ * Four RTC oracles have now been withdrawn from this file, all with the same
+ * defect: a proxy for "the engine has no scheduled continuation" (`stuck >=
+ * QUIET_FLUSH`, `microtask-budget`, `budget-progressing`, `WAITING_ON_INTERNAL`)
+ * was read as a POSITIVE observation, when its real content was "a fixed window
+ * elapsed and we stopped looking". Each was refuted by a CORRECT machine whose
+ * legitimate frozen chain was one turn longer than the window, and in every case
+ * the deciding variable was a HARNESS CONSTANT (`DEFAULT_MAX_TURNS`, `QUIET_FLUSH`)
+ * rather than anything about the machine.
+ *
+ * This predicate is not a window at all. It has exactly two possible causes, and
+ * the second is the bug by definition:
+ *
+ *  (a) A `queueMicrotask(processQueues)` is PENDING. `scheduleProcessing`
+ *      (state_machine.ts) queues exactly that, and the microtask queue is FIFO.
+ *  (b) Nothing is scheduled while the queue is non-empty — nothing will drain it.
+ *
+ * ## Why the threshold is 2, and why 2 is enough
+ * Case (a) is self-clearing WITHIN ONE TURN, and the reason it is bounded is
+ * structural: `processQueues` sets `isProcessing = true` SYNCHRONOUSLY, before its
+ * first `await`. Concretely, let sample n be positive:
+ *
+ *  - The pump's continuation for sample n+1 is queued at the `await
+ *    Promise.resolve()` that follows sample n — i.e. STRICTLY AFTER n.
+ *  - So any microtask already queued at sample n, including a pending
+ *    `processQueues`, runs BEFORE sample n+1.
+ *  - When it runs it sets `isProcessing = true` and then suspends at its first
+ *    `await` (the drain's `executeQueuedTransition`), which cannot complete ahead
+ *    of a continuation that is already queued in front of it.
+ *  - Therefore sample n+1 observes `processing === true` and the run ends at 1.
+ *
+ * A correct machine really does produce that single positive: whenever the
+ * enqueue happens in a floating microtask that was queued AHEAD of the pump's own
+ * continuation, the continuation runs before the freshly-queued `processQueues`
+ * and sees `queue > 0 && !processing` once. MEASURED at HEAD on
+ * `a -(invoke delay:0, async action)-> b`: the sample stream is
+ * `... 20:0|false|0  21:1|false|0  22:0|true|0 ...` — one positive at turn 21,
+ * `processing` true at 22. maxRun = 1. Deleting ONLY the `scheduleProcessing()`
+ * that follows that `raiseEvent` in a copy of the engine leaves turns 1..21
+ * byte-identical and turns 22+ pinned at `1|false|0` — maxRun 44 within a 64-turn
+ * budget. The threshold separates the two by a structural argument, not by a
+ * measured constant, and the measurement merely confirms it.
+ *
+ * ## What the bound rests on (each pinned by a test)
+ *  1. `processQueues` writes `isProcessing = true` synchronously before any
+ *     `await`. Moving that write past an await converts this one-turn window into
+ *     an unbounded one and makes the oracle unsound.
+ *  2. The run-away (`maxTransitionDepth`) break clears BOTH queues before
+ *     breaking, so it leaves no persistent `queue > 0 && !processing` state.
+ *  3. Every enqueue is paired with a schedule. Two external pushes pair inside
+ *     `enqueueEvent` / `enqueueDetailedEvent`; the internal push lives in
+ *     `raiseEvent`, which does NOT schedule — its five call sites do, by
+ *     CONVENTION rather than by construction. That convention is what this oracle
+ *     guards.
+ *
+ * ## Honest framing
+ * At HEAD no reachable violating state exists — this is a REGRESSION witness, not
+ * a bug detector for today's engine. It is OPT-IN and deliberately NOT in
+ * `DEFAULT_BUILTIN_INVARIANT_IDS`: an oracle that cannot fire on any current
+ * machine must not inflate `oraclesRun` on a default run. Its value is realized in
+ * the test suite, where a mutated engine proves it has teeth.
+ *
+ * VACUOUS when `ctx.rtcStall` is absent (no sample plane wired) — a missing
+ * observation plane never manufactures a violation (the I-4 convention).
+ */
+const I13: Invariant = {
+  id: 'I-13',
+  scope: 'final',
+  capabilityTags: ['rtc.enqueue-scheduled'],
+  checkFinal(state, ctx): Violation | null {
+    const obs = ctx.rtcStall
+    if (obs === undefined) {
+      return null // no sample plane wired ⇒ vacuous, never a violation
+    }
+    // A single positive sample is a reading a CORRECT machine produces (see the
+    // one-turn argument above); only an ADJACENT PAIR is the witness.
+    if (obs.maxRun < 2) {
+      return null
+    }
+    return makeViolation({
+      invariantId: 'I-13',
+      step: Number.MAX_SAFE_INTEGER,
+      witness: state.config,
+      message:
+        `queued work with no drain scheduled: the settle predicate ` +
+        `(queue>0, not processing, no in-flight async) held across ` +
+        `${obs.maxRun} consecutive microtask checkpoints`,
+      observed: `maxRun:${obs.maxRun} over ${obs.samples} samples, queue:${obs.witnessQueueTotal}`,
+      expected: 'at most 1 consecutive sample (a pending processQueues clears it next turn)',
+    })
+  },
+}
+
+/**
+ * The FROZEN I-1..I-13 registry. `runSafety` (in invariants.runner.ts) iterates
  * this `readonly Invariant[]` BLIND — it never references an id literally. This
  * array is the ONLY place the id literals legitimately appear in source.
  */
@@ -733,4 +1308,5 @@ export const INVARIANTS: readonly Invariant[] = [
   I10,
   I11,
   I12,
+  I13,
 ] as const

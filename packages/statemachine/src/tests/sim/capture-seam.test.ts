@@ -168,10 +168,12 @@ describe('capture seam — history restore (:1116 / :1126)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// DoD#8 — errorState fallback witness (:2020 bypasses :2060)
+// DoD#8 — errorState fallback witness: the errorState commit is captured by the
+// Adapter.set seam even though it records recordTransition(0, false) (a REFUSAL),
+// NOT a success. getTransitionCount() (success-only) therefore sees delta 0.
 // ---------------------------------------------------------------------------
-describe('capture seam — errorState fallback bypass (:2020)', () => {
-  it('throwing onEnter falls back to errorState: recordTransition delta 0 while errorState write IS captured', async () => {
+describe('capture seam — errorState fallback bypass', () => {
+  it('throwing onEnter falls back to errorState: success-count delta 0 while errorState write IS captured', async () => {
     const owner = new MemoryAdapter<Box>({ state: '', count: 0 })
     const { writes, sink } = makeSink()
     const wrapped = wrapAdapterForCapture(owner, 'state', sink)
@@ -198,8 +200,10 @@ describe('capture seam — errorState fallback bypass (:2020)', () => {
       // the throwing enter rejects the fire; the errorState fallback still ran
     }
     await Promise.resolve()
-    // DELTA is 0 — the :2020 write bypasses :2060 recordTransition. (We compare
-    // a DELTA, never lifetime totals, because the construction-time
+    // DELTA is 0 — the errorState recovery records recordTransition(0, FALSE), a
+    // refusal, so the SUCCESS counter (getTransitionCount) does not advance even
+    // though the errorState configuration WAS written (and captured below). (We
+    // compare a DELTA, never lifetime totals, because the construction-time
     // setInitialState write makes captured-writes exceed recordTransition for
     // ANY run.)
     expect(monitor.getTransitionCount() - rtBefore).toBe(0)

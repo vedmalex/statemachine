@@ -119,11 +119,24 @@ describe('Concurrency Tests', () => {
     )
 
     const json = await sm.toSecureJSON()
-    expect(json).toContain('"hash":')
+    // W0: functions are serialized as body-free NAME references — no compilable
+    // body and no keyless hash survive serialization. `green.onEnter` serializes
+    // under its inferred name 'onEnter'.
+    expect(json).not.toContain('"hash":')
+    expect(json).not.toContain('"body":')
+    expect(json).toContain('"type":"function"')
+    expect(json).toContain('"name":"onEnter"')
 
     const sm2 = await StateMachine.fromSecureJSON(
       json,
       new MemoryAdapter({ state: 'green', count: 0 }),
+      {
+        actions: {
+          onEnter: async (owner: TrafficLight) => {
+            owner.count += 10
+          },
+        },
+      },
     )
     expect(sm2).toBeDefined()
     expect(sm2.currentState).toBe('green')

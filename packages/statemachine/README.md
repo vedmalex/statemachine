@@ -8,14 +8,17 @@ Hierarchical state machine for TypeScript with orthogonal (parallel) regions, SC
 **Features:**
 
 - Hierarchical (nested) states addressed by dotted paths
-- Orthogonal **parallel regions** with SCXML ancestor-first entry / descendant-first exit
+- Orthogonal **parallel regions** with W3C SCXML §3.13 callback ordering — entry in document order, exit in reverse document order
 - **UML all-regions-final join** via `final` states, the engine-raised `done.state.<id>` event, and the `isDone()` guard
 - Parallel-exit (LCCA) — a transition from a composite parent preempts and exits all active regions
-- Guards, before/enter/after + exit/transition actions, and timed `invoke` transitions
-- Pluggable monitoring, validation, persistence, and timer scheduling (7 extension points)
+- Guards, before/enter/after + exit/transition actions, and `invoke` in both forms — a delayed timer that raises an event (`InvokeTimer`), and a long-running operation with an `AbortSignal` and `onDone` / `onError` events (`InvokeOperation`)
+- A lifecycle observability channel (`IMonitor.recordLifecycle`) and `createLifecycleTracer()` over it, which names hung and failed callbacks
+- Pluggable monitoring, validation, persistence, timer scheduling and async-context tracking
 - ESM + CJS dual bundle; DI-free lite surface
 
 The package ships only the DI-free lite surface. The legacy DI-aware factory from `@grainjs/statemachine` is intentionally not carried over.
+
+Upgrading from an earlier beta: [Breaking changes in 1.0.0-beta.5](#breaking-changes-in-100-beta5).
 
 ## Install
 
@@ -30,44 +33,64 @@ npm install @vedmalex/statemachine
 ```ts
 import { createMachine } from '@vedmalex/statemachine'
 
-const sm = createMachine({
-  name: 'door',
-  initialState: 'closed',
-  states: { closed: {}, open: {} },
-  events: { open: { transitions: [{ from: 'closed', to: 'open' }] } },
-})
+// The owner object holds the current state under `stateAttribute` ('state').
+const door = { state: 'closed' }
+
+const sm = createMachine(
+  {
+    name: 'door',
+    stateAttribute: 'state',
+    initialState: 'closed',
+    states: { closed: {}, open: {} },
+    events: { open: { transitions: [{ from: 'closed', to: 'open' }] } },
+  },
+  door,
+)
+
+await sm.fireEvent('open')
+console.log(sm.currentState) // 'open'
 ```
+
+`initialState` and every transition `from` / `to` are typed against the state
+keys you declare: a typo such as `initialState: 'closd'` or `to: 'opn'` is a
+compile-time error. See [`types/`](./types) for the emitted declarations.
 
 ## Hierarchical regions, parallel states & join
 
 A state may declare `regions` to run several orthogonal sub-machines at once. Entry/exit follow SCXML/UML ordering, and a region may complete via a `final` state that raises a `done.state.<id>` join event.
 
 ```ts
-const sm = createMachine({
-  name: 'proc',
-  initialState: 'proc',
-  states: {
-    proc: {
-      initial: 'a.run|b.run',          // both regions active in parallel
-      onEnter: () => {/* parent runs BEFORE region children (ancestor-first) */},
-      regions: {
-        a: { run: {}, done: { final: true } },
-        b: { run: {}, done: { final: true } },
+const proc = { state: 'proc' }
+
+const sm = createMachine(
+  {
+    name: 'proc',
+    stateAttribute: 'state',
+    initialState: 'proc',
+    states: {
+      proc: {
+        initial: 'a.run|b.run',          // both regions active in parallel
+        onEnter: () => {/* parent runs BEFORE region children (document order) */},
+        regions: {
+          a: { run: {}, done: { final: true } },
+          b: { run: {}, done: { final: true } },
+        },
       },
+      complete: {},
     },
-    complete: {},
+    events: {
+      finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
+      finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
+      // Join: raised automatically once EVERY region reached a `final` state.
+      'done.state.proc': { transitions: [{ from: 'proc', to: 'complete' }] },
+    },
   },
-  events: {
-    finishA: { transitions: [{ from: 'proc.a.run', to: 'proc.a.done' }] },
-    finishB: { transitions: [{ from: 'proc.b.run', to: 'proc.b.done' }] },
-    // Join: raised automatically once EVERY region reached a `final` state.
-    'done.state.proc': { transitions: [{ from: 'proc', to: 'complete' }] },
-  },
-})
+  proc,
+)
 ```
 
 - **Expansion** — entering `proc` (as initial state *or* via a transition) expands to the parallel configuration `proc.a.run|proc.b.run`.
-- **Ordering** — entry is ancestor-first (`proc` then region children); exit is descendant-first (region children then `proc`).
+- **Ordering** — **entry follows document order** (a DFS pre-order walk of the config: `proc`, then region `a` and everything under it, then region `b`); **exit follows the exact reverse of document order** (region `b`'s states, then region `a`'s, then `proc`). This is W3C SCXML §3.13 verbatim, and it implies both the ancestor-first/descendant-first layering and the sibling-region sequence. See [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
 - **Parallel-exit** — a plain transition `from: 'proc'` on a user event preempts and exits all active regions immediately (LCCA).
 - **Join** — when all regions are `final`, the engine raises `done.state.proc`; `sm.isDone('proc')` reflects the all-final configuration. (`done.state.*` is never matched by a `from: '*'` wildcard.)
 
@@ -86,13 +109,240 @@ Composites nest: a parent's `done.state` is raised only after every region — *
 
 See [`docs/regions-and-parallel.md`](./docs/regions-and-parallel.md) for the full model, ordering rules, nesting, and validation.
 
+## Action timeouts (`transitionTimeout`)
+
+`StateMachineOptions.transitionTimeout` is a **per-action** budget, not a per-transition or per-microstep one. Every individual action call races its own deadline: guards, `onBefore` / `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and `invoke` actions.
+
+**The consequence to budget for.** One event fires one transition **per region** in a single microstep (see [Hierarchical regions, parallel states & join](#hierarchical-regions-parallel-states--join)), and each of those transitions runs its own hook chain. A microstep of N transitions × K hooks therefore gets N×K *separate* deadlines, and `transitionTimeout` does **not** bound the microstep's total duration — three regions running three 40 ms hooks each complete in ~370 ms under a 100 ms `transitionTimeout`. Read the option as "no single callback may hang longer than this", never as "an event settles within this".
+
+On expiry the call rejects with `StateMachineError('Transition timeout')` (`context.phase === 'action'`). The timed-out action is **not** cancelled — it runs to completion and its side effects still land, after the machine has already unwound. What you observe depends on which hook expired:
+
+| expired hook | observable outcome |
+| --- | --- |
+| `guard` | transition disabled; `fireEvent` resolves `false`, nothing thrown |
+| `onEnter`, with `errorState` set | machine commits `errorState`; `fireEvent` resolves `false` |
+| `onExit`, with `abortOnExitError` set | microstep aborts back to the source state; `fireEvent` resolves `false` |
+| `invoke` action (the timer form's `action`) | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
+| anything else (`onBefore`, `onTransition`, `onEnter` / `onExit` without the options above) | the error propagates out of `fireEvent`; the machine stays in the source state |
+
+An `invoke` action that **throws** takes exactly that same route, on a freshly armed timer and on one resumed from a snapshot alike: an expiry is simply one more way the action failed, and the two are distinguishable only by the error you receive, never by where it arrives or by what the machine does next. (The `recordError` channel is gated by `IErrorHandler.isEnabled()`, which defaults to enabled. Long-running `invoke` **operations** — the `src` / `onDone` / `onError` form — keep their own routing instead: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
+
+The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
+
+## Driving several objects with one machine
+
+A machine is a *description*; the thing that has a state is the owner object, which
+holds it in the field named by `stateAttribute`. So one machine instance can drive any
+number of owners at once — a table of rows, a pool of sessions — and each owner's
+position is written back into that owner, through the `Adapter`. This is the mechanism
+to reach for when you have many records and one workflow; it is not what `toJSON`
+is for (see [Serialization](#serialization-tojson--fromjson)).
+
+`fireEvent` cannot express a second owner unambiguously: a non-`Adapter` second
+positional is an event **argument** — that is what makes `fireEvent('submit', payload)`
+work — so a raw object passed as an owner is read as a payload and the event resolves
+against the machine's primary owner instead. (When it is a *different* object carrying
+the machine's `stateAttribute` — the tell-tale shape of the mistake — the engine warns
+through its `logger`; passing the machine's own owner back in is the correct common
+pattern and stays quiet. The argument is forwarded verbatim either way, so a payload
+that happens to have the field keeps working.)
+
+The `*For` family resolves the ambiguity structurally rather than by sniffing:
+**slot 1 is always the owner**, everything after the event name is always an
+argument.
+
+```ts
+const a = { state: 'idle' }
+const b = { state: 'idle' }
+const sm = new StateMachine(config, a)
+
+await sm.fireEventFor(b, 'go')                     // moves b; a is untouched
+await sm.fireEventFor(b, 'submit', { ok: true })   // owner first, then the args
+await sm.fireEventDetailedFor(b, 'go')             // → FireResult
+sm.canFireEventFor(b, 'go')                        // → boolean, for b
+sm.getAvailableEventsFor(b)                        // → string[], for b
+```
+
+A **raw object is accepted** — no `MemoryAdapter` ceremony — and is wrapped
+internally, once per object. Because every per-owner structure keys on the adaptee,
+the object keeps its own state, timers, `invoke`s and history whether you hand over
+the object or an `Adapter` for it.
+
+One caveat worth knowing before you rely on that. Which *position* holds the owner
+is structural, but whether the value in it is already an `Adapter` is a duck test:
+`isAdapter` asks only for `get` and `set`. A domain object that happens to expose
+methods by those names is therefore taken *as* an adapter and driven through its own
+`get('state')` / `set('state', …)` rather than through a `MemoryAdapter` over its
+properties — the state lands somewhere you did not intend and nothing is thrown. If
+your owner type has its own `get`/`set`, wrap it explicitly:
+`sm.fireEventFor(new MemoryAdapter(owner), 'go')`.
+
+`fireEvent` itself is unchanged. `canFireEvent(event, obj)` now normalizes a raw
+object like the `*For` family does, instead of reading it as an adapter and
+returning an answer about a state it was never in.
+
+### A batch over a table
+
+Build the machine once, then walk the records: load, fire, save. The `state` column
+**is** the persisted machine state — there is nothing else to write back, and no
+snapshot is involved. A machine driven only through the `*For` family needs no
+construction owner at all.
+
+```ts
+type Order = { id: number; state: string }
+
+const sm = createMachine<Order>({
+  name: 'order',
+  stateAttribute: 'state',
+  initialState: 'draft',
+  states: { draft: {}, review: {}, published: {} },
+  events: {
+    submit: { transitions: [{ from: 'draft', to: 'review' }] },
+    approve: { transitions: [{ from: 'review', to: 'published' }] },
+  },
+})
+
+for (let offset = 0; ; offset += 500) {
+  const page = await loadPage(offset)   // → Order[]
+  if (page.length === 0) break
+  for (const row of page) {
+    // Over a table of mixed states, "this row has nothing to do" is the normal
+    // case, not an error — and `fireEventFor` THROWS when no transition matches.
+    // The detailed form reports it instead: { fired: false, reason: 'no-transition' }.
+    const res = await sm.fireEventDetailedFor(row, 'submit')
+    if (res.fired) await save(row)      // row.state now holds the new state
+  }
+}
+```
+
+`canFireEventFor(row, 'submit')` answers the same question without running the
+transition, and `getAvailableEventsFor(row)` lists what that row could do next.
+
+Two things to get right about the column:
+
+- It holds the machine's **active configuration verbatim** — a dotted leaf path, and
+  for parallel regions the `|`-joined set (`proc.a.run|proc.b.run`). Store back what
+  the engine wrote; do not normalize or shorten it.
+- A row whose column holds a bare composite parent name is **completed** to that
+  composite's `initial` configuration before it is read: `proc` is understood as
+  `proc.a.run|proc.b.run`, so transitions declared from the leaves match it and every
+  region is entered. This is the same completion the engine performs when it *writes*
+  the composite — seeding a new row with the parent name is therefore safe, and a
+  parallel composite will not lose its sibling regions. Completion decides which
+  transitions match; it does not run the leaves' `onEnter`, exactly as `restoreState`
+  adopts a persisted position without re-entering it.
+
+### The per-record runtime that does not live in the record
+
+The `state` field is not the whole story. Per owner the machine also keeps history for
+`history` states, state entry times, armed `invoke` timers, in-flight `invoke`
+operations and invoke restart counts — in `WeakMap`s keyed by the owner **object**, so
+in process memory only. A machine of plain states, guards and transitions has none of
+it and a row can be loaded, advanced and released freely. A machine that uses `history`
+or `invoke` has it, and `load → fire → save` then has two traps. Both are silent: you
+observe wrong behaviour, not an error.
+
+**Timers — release the owner explicitly.** An `invoke` timer armed on entry fires
+later, finds the leaf still active, and writes into the object that armed it, long
+after the loop saved that row. The database says one thing and the orphaned object
+says another. The timer firing late is not the bug — nothing told the machine the row
+was released. Say so:
+
+```ts
+for (const row of page) {
+  const res = await sm.fireEventDetailedFor(row, 'submit')
+  if (res.fired) await save(row)
+  sm.detachOwner(row)   // released: cancels this row's timers, aborts its operations
+}
+```
+
+`detachOwner(row)` returns what it released (`{ timersCleared, operationsAborted,
+queuedEventsDropped }`) and is idempotent. Without it, `load → fire → save` is the
+wrong shape for a timer-arming machine. Garbage collection is no substitute: it never
+cancels a scheduled timer, and while one is armed its callback holds a strong
+reference to the row, so the object is not collectable in the first place.
+
+**History — do not release the owner at all.** History is keyed on object identity, so
+reloading the row as a fresh object loses it: re-entering a `history` composite falls
+back to its `initial`, and any sibling regions it remembered go with it, leaving the
+machine in a *narrower* configuration than it left. `detachOwner` does not help here —
+it drops the history too, deliberately. Keep the **same** object resident for the whole
+batch instead, and history is exact, per record and independent between records.
+
+There is no snapshot-based escape from either: `toJSON`, `saveState`, and the timer
+resumption `fromJSON` performs all read and write the construction owner alone. The
+full treatment — all three persistence mechanisms, what each carries and what no
+restore recovers — is in [`docs/persistence.md`](./docs/persistence.md).
+
+## Serialization (`toJSON` / `fromJSON`)
+
+`toJSON()` writes a machine to a string; `fromJSON(json, owner, options?)` reads one back. `toSecureJSON()` / `fromSecureJSON()` are the async forms and carry exactly the same thing.
+
+`toJSON` and `toSecureJSON` **throw while an `invoke` operation is in flight**, naming the
+state and the invocation: a pending promise has no serializable continuation, so the
+snapshot would restore into a machine that looks busy and is running nothing. Wait for
+your operation, or leave the state — which aborts it — and serialize from there. The
+refusal is about the moment, not about the machine; the reasoning and the exact message
+are in [`docs/persistence.md`](./docs/persistence.md).
+
+**This moves or restores a machine; it does not carry a record's state.** The payload is
+a machine *description* plus one owner's position in it — `config` (every state and
+event, functions reduced to name references), the behavioural `options`, and then
+`currentState`, `historyMap` and `stateEntryTimes` **for the construction owner only**.
+Two consequences make it the wrong tool for a table of records. The config dominates the
+payload — already about three quarters of the bytes on a trivial three-state machine —
+and it is byte-identical for every record, so a snapshot per row stores one copy of the
+same machine description per row. And a row you drove through `fireEventFor` does not
+appear in the payload at all: what you get back is the *construction* owner's position.
+`fromJSON(json, row)` then **writes** that persisted `currentState` onto whatever row
+you hand it, overwriting the state that row was actually in.
+
+For many records use the multi-owner mode above — the record's own `state` field is the
+persisted state. Reach for `toJSON` when you want to move *one* machine across a process
+boundary, or bring it back after a restart. There is a third, lighter option for that
+last case — `StatePersistenceAdapter` (`saveState` / `restoreState`) moves the runtime
+without the config; the three are compared side by side in
+[`docs/persistence.md`](./docs/persistence.md).
+
+`StateMachineOptions` splits in two, and the split decides what the payload holds.
+
+**Behavioural scalars are persisted and restored.** `transitionTimeout`, `errorState`, `abortOnExitError`, `maxQueueDepth` and `maxTransitionDepth` are pure data that changes how the machine behaves, so they travel in the payload: `fromJSON(json, owner)` — no third argument — gives you a machine that behaves like the machine that was saved. Pass one of them to `fromJSON` anyway and **your value wins**; the persisted one is used only where you supplied nothing (`undefined` counts as "supplied nothing"). Only values you passed explicitly are written, so a machine built with no options serializes exactly as it did before this existed.
+
+**Injection contracts are not persisted and must be re-supplied on every restore.** `logger`, `monitor`, `scheduler`, `errorHandler`, `contextTracker`, `clock` and the `actions` registry hold functions and host objects; no document can carry them. If you restore without them the machine falls back to the defaults — the console logger, a fresh monitor, real `setTimeout`, `Date.now` — silently, because that is a legitimate configuration. Pass them every time:
+
+```ts
+const sm = StateMachine.fromJSON(json, owner, {
+  // Re-supplied on every restore — never in the payload:
+  actions: { 'busy.onEnter': enterBusy },  // resolves the config's function NAMES
+  monitor, logger, scheduler, clock,
+  // Optional: overrides whatever the payload persisted.
+  transitionTimeout: 2_000,
+})
+```
+
+`actions` is the one you cannot skip if your config has function-valued hooks: functions serialize as a **name** (never a body — see [Breaking changes](#breaking-changes-in-100-beta5)), and restoration resolves that name against this registry. `strictActions` is not persisted either — it governs how strictly *this* read resolves those names, and a document does not get to relax the rules it is read under.
+
+Two things a restore does **not** recover: a `transitionTimeout` that was counting down
+(every action budget starts fresh), and a long-running `invoke` **operation** (its
+promise and `AbortSignal` cannot survive a document). Invoke **delays** are unaffected
+and do resume correctly, recomputed from the persisted `stateEntryTimes` — see
+[Replaying serialized state](#replaying-serialized-state). What each of those costs you,
+and what an operation does on the next entry with and without an action registry, is in
+[`docs/persistence.md`](./docs/persistence.md).
+
 ## Documentation
 
 Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)
 
 ## Extension Points
 
-This package exposes 7 extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+This package exposes 7 catalogued extension points (`IMonitor`, `ITimerScheduler`, `IErrorHandler`, `Adapter<T>`, `ILogger`, `StatePersistenceAdapter`, `validateConfig`) for host integration. Callbacks resolved from config or `setContext()` receive the underlying owner object directly, so host code does not need to unwrap `Adapter<T>` inside each callback. See [`docs/extension-points.md`](./docs/extension-points.md) for the full catalog.
+
+`IContextTracker` (`StateMachineOptions.contextTracker`) is an eighth injection contract, added in `1.0.0-beta.5` and not yet folded into that catalog. It backs reentrancy detection and is documented under [Runtime support](#runtime-support).
+
+## Lifecycle tracing (debugging)
+
+`createLifecycleTracer()` plugs into `StateMachineOptions.monitor` and renders the machine's callback timeline — hook order, nesting, per-microstep grouping, hung callbacks, failures and guard coverage — answering "why was my `onExit` never called?" and "which callback is hung?". See [`docs/lifecycle-tracing.md`](./docs/lifecycle-tracing.md).
 
 ## Deterministic testing (DST)
 
@@ -145,7 +395,7 @@ scheduler2.process()               // the invoke fires here, not at t=1400
 
 ### transitionTimeout under virtual time
 
-The `transitionTimeout` deadline is also routed through the injected scheduler, so it triggers on a virtual-time advance rather than a real timer:
+Each per-action `transitionTimeout` deadline (see [Action timeouts](#action-timeouts-transitiontimeout) for the scope of the budget) is also routed through the injected scheduler, so it triggers on a virtual-time advance rather than a real timer:
 
 ```ts
 const sm = new StateMachine(config, adapter, { clock, scheduler, transitionTimeout: 500 })
@@ -178,7 +428,7 @@ const result = await runSimulation(
     seed: '0x1234',            // bigint | string — canonicalized to a bigint PRNG seed
     steps: 64,                 // number of macrosteps to drive
     invariants: myInvariants,  // readonly Invariant[] (Safety oracle registry)
-    mode: 'safety',            // 'safety' | 'liveness'
+    mode: 'safety',            // 'safety' | 'liveness' | 'both'
   },
 )
 
@@ -199,7 +449,7 @@ if (!result.ok) {
 
 - `await sim.init()` — mandatory post-construction settle plus a behavioral sentinel-scheduler probe (fails loudly if timers do not route through the injected virtual scheduler). Idempotent.
 - `await sim.step()` — drive exactly one macrostep; returns a `StepOutcome` (`step`, `t`, `frames`, `traceHash`, `quiescent`, `done`, optional `violation`).
-- `await sim.run()` — drive `opts.steps` macrosteps; returns the aggregate `SimResult` (`ok`, `seed`, `steps`, `traceHash`, `trace`, optional `violation`, `metrics`).
+- `await sim.run()` — drive `opts.steps` macrosteps; returns the aggregate `SimResult` (`ok`, `seed`, `steps`, `traceHash`, `trace`, `oraclesRun`, `metrics`, and optionally `violation`, `liveness` and `warnings`).
 - `sim.snapshot()` — a serializable mid-run checkpoint (`SimSnapshot`: `seed`, `machine`, `prngState`, `t`, `step`); never hashed.
 
 `wire(env, config, owner)` constructs `new StateMachine(config, owner, { clock, scheduler, monitor, errorHandler, logger })` with all five deterministic seams pre-forwarded from `env`, so the scheduler-omission footgun is structurally impossible.
@@ -210,10 +460,14 @@ if (!result.ok) {
 | --- | --- | --- |
 | `seed` | `bigint \| string` | Required. Drives the PRNG; the only source of nondeterminism. |
 | `steps?` | `number` | Macrostep budget (default 16). |
+| `maxTurns?` | `number` | Microtask-pump budget per macrostep settle (default 1024). Running out is never a failure — see [budget truncation](#breaking-changes-in-100-beta5). |
 | `faults?` | `FaultPlan` | Seed-keyed fault injection plan (see the 7 kinds below). |
 | `invariants?` | `readonly Invariant[]` | Safety-oracle registry evaluated at each step boundary. |
-| `mode?` | `'safety' \| 'liveness'` | Oracle policy (default `'safety'`). |
+| `mode?` | `'safety' \| 'liveness' \| 'both'` | Oracle policy. Omitted means safety only. |
+| `script?` | `readonly DriverOp[]` | Drive from a fixed op stream instead of the fuzzer. |
 | `onTrace?` | `(frame: TraceFrame) => void` | Per-frame streaming callback. |
+
+The remaining fields (`eventPayload`, `maxQueueDepth`) are in [`etc/statemachine-sim.api.md`](./etc/statemachine-sim.api.md), which is the generated public surface.
 
 ### Fault injection (7 kinds)
 
@@ -225,7 +479,7 @@ A `FaultPlan` may inject any of the seven fault kinds (`FaultKind`), keyed deter
 4. **overflow** — flood the queue past its bound
 5. **clock-skew** — perturb the logical clock
 6. **timer-jitter** — perturb armed-timer deadlines
-7. **callback-throw** — make an action/guard/invoke callback throw
+7. **throw** — make an action/guard/invoke callback throw
 
 Fault-free runs behave exactly as a simulation with no plan.
 
@@ -235,7 +489,9 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 
 ### Back-compatibility
 
-> Omitting **both** `clock` and `scheduler` keeps runtime behavior byte-identical to prior releases: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before. The DST machinery only engages when you opt in by injecting a scheduler.
+> The DST machinery engages only when you opt in. Omitting **both** `clock` and `scheduler` leaves the real-time path as it was: `createDefaultScheduler()` uses `Date.now`, the `isActive()`-gated `setTimer` fallback to native `setTimeout` is unchanged, and `process()`'s default argument resolves to the same value it did before.
+>
+> One deliberate exception in `1.0.0-beta.5`: under a `transitionTimeout`, the deadline timer is now cleared on the default scheduler too, where the cleanup used to be attached only when a scheduler was injected. A process that had finished its work could previously stay alive for up to one `transitionTimeout` per outstanding handle; it now exits promptly.
 
 ### API reference
 
@@ -246,9 +502,80 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 | `StateMachineOptions.clock?` | option | Inject a virtual clock (default `Date.now`). |
 | `ITimerScheduler.process?(now?)` | method | Optional manual drain; implemented by `createVirtualScheduler`. |
 
+### Dynamic config check — `checkMachine`
+
+`checkMachine(config, ownerFactory, options?)` (from `@vedmalex/statemachine/sim`)
+is the **dynamic** complement to the static `validateConfig`: it fuzzes your
+machine over N deterministic runs through the simulator's oracle suite and returns
+a structured `CheckReport`. The report's `ok` cannot lie — `ok === true` implies
+`oraclesRun > 0 ∧ transitionsFired > 0`. **It is fuzzing, not model-checking:** the
+absence of a finding is not a proof of correctness. Full guide, contract, and the
+list of what it does NOT check: [`docs/dynamic-check.md`](./docs/dynamic-check.md).
+
+```ts
+import { checkMachine } from '@vedmalex/statemachine/sim'
+const report = await checkMachine(myConfig, () => ({ state: 'idle' }), { seed: 'ci-1', runs: 32 })
+if (!report.ok) throw new Error(`checkMachine failed: ${report.failedOn.join(', ')}`)
+```
+
+Beside `ok` and `failedOn`, the report carries `violations`, `unreachableStates`,
+`reachableStates`, `deadEvents`, `deadlocks`, `livelocks`, `uncoveredTransitions`,
+`nonConvergingRegions` (a parallel region that can never complete its join),
+`guardOutcomes` (per transition, whether the guard was ever seen returning true and
+ever seen returning false — one that never returned true is the classic dead
+branch), `saturation`, and `warnings`. **A warning is never a verdict** and never
+flips `ok`; `failOn` and `degradationExcept` decide which causes do.
+
+Three options are worth knowing about:
+
+- `shrink` (**default `true`**) delta-debugs the first violation down to a minimal
+  reproduction. Reduction runs against your live config, so closures, guards and
+  object payloads survive, and every candidate is decided by an actual re-run — a
+  stream that does not reproduce the finding is reported as a `shrink-skipped`
+  warning and the original run is kept. A minimal repro is never printed without
+  having been verified. A green sweep spends nothing extra.
+- `script` replays a fixed op stream instead of fuzzing — the executable twin of a
+  printed repro, so a minimal repro is something you can paste back in. With a
+  script the per-event `payload` generators are not consulted; the ops carry their
+  args.
+- `maxTurns` (**default 1024**) is the microtask-pump budget each macrostep settle
+  uses. Raise it when a report carries a `budget-progressing` or `budget-frozen`
+  warning and you need to know which reading is real.
+
 ## Stability policy
 
 5 firm `@stable` symbols: `createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`. The all-regions-final join API lives on these stable symbols — `State.final?: boolean`, `StateMachine.isDone(compositeId)`, and the engine-raised `done.state.<id>` event (all reflected in `etc/statemachine.api.md`). Other exports are `@unstable` and may evolve between minor versions. See [`STABILITY.md`](./STABILITY.md) for the full policy.
+
+## Breaking changes in 1.0.0-beta.5
+
+Five changes in this release are observable from outside a machine you already have working.
+
+**Enter/exit callback order now follows W3C SCXML §3.13.** Entry is document order — a DFS pre-order walk of the config — and exit is its exact reverse, so `exited.reverse()` is now precisely `entered`. Two sequences move. `onExit` of sibling states in parallel regions fires in the **reverse** of declaration order (regions `r1, r2, r3` exit `r3 → r2 → r1`, where they previously exited `r1 → r2 → r3`), which restores the LIFO property: the region that acquired a paired resource first releases it last. And nested regions are no longer interleaved — the previous walk ordered the whole set by depth, so a shallow region's leaf could be visited *between* two states of another region's chain; each region is now walked to completion, on both entry and exit. The **set** of callbacks invoked and the **reached configuration** are unchanged, as are the layering guarantees (a parent enters before its region children and exits after them) and the entry sibling order. Order-independent `onExit` handlers — the common case — need no migration; if some code depended on the old sibling-exit order, invert that expectation. Detail and migration guidance: [docs/regions-and-parallel.md](./docs/regions-and-parallel.md#3-entryexit-ordering-scxml-313).
+
+**An unrecognized serialized action shape is no longer accepted in silence.** `deserializeAction` used to install any object it did not recognize verbatim, so a hand-written `{ source, name }` guard *became* the guard and then failed only at fire time — where the guard-error path absorbs the failure into "transition disabled". The event no-opped forever with nothing thrown anywhere. That branch now warns unconditionally, and under `strictActions` throws a `StateMachineError` naming the keys it found — matching what the adjacent unresolvable-identity branches already did. It is reachable only from a payload this library did not write: `serializeActionRef` emits `{ type: 'string', name }`, `{ type: 'function', name, slot? }` or nothing at all, and none of those reach it, so a normal `toJSON` / `fromJSON` round-trip is unaffected. If you hand-assemble machine JSON, re-serialize it with `toJSON()` or drop the offending slot.
+
+**A failing `invoke` action now reports.** The timer form of `invoke` swallowed both of its failure modes — an action that threw, and an action whose `transitionTimeout` expired. Neither reached `monitor.recordError`, neither reached the config-level `onError`, and nothing was thrown; the machine simply stopped advancing. Both now route through those same two channels, on the fresh-entry path and on the `resumeTimers` path alike. The invoke's `event` still is **not** raised — raising it would fabricate a completion the action never reached — so the machine's *behaviour* is what it was. **If you have a config-level `onError`, expect it to be called for failures it has never seen.** They were always happening; they were invisible.
+
+**Exhausting the harness turn budget no longer fails a `checkMachine` / `./sim` run.** A correct machine whose `onEnter` awaited a long but finite chain of microtasks was convicted of a run-to-completion violation and a livelock: an awaited enter/exit hook is deliberately not counted as in-flight async, so while one runs the settle fingerprint is frozen — indistinguishable from a wedged drain. The verdict turned on exceeding an internal constant that no option could raise. Budget exhaustion is now an advisory warning and never a verdict: `budget-progressing` when the machine was still moving as the pump stopped watching, `budget-frozen` when it had already stopped. **A run that reported `ok: false` for this reason now reports `ok: true` with a warning.** The honest cost is that a genuinely wedged drain observed only through budget exhaustion is no longer convicted either — see [Known gaps](#known-gaps-in-100-beta). Alongside it: `maxTurns` is now a public option on both `SimOptions` and `CheckOptions` (default 1024), so the advice those warnings give is actionable; `LivenessParams.microtaskBudgetExhausted` is removed, because it turned the same truncated observation into a hard verdict; `SettleReason` and the check report's `WarningKind` both gained members, which breaks an exhaustive `switch` at compile time; and the DST trace header version moved to `'6'`, so any pinned `traceHash` changes.
+
+**`I-3` (run-to-completion) left the default oracle set.** The teeth were left on the
+one non-budget witness, `WAITING_ON_INTERNAL` — and that turned out to be the same
+truncated observation over a 16-turn window. It is now the advisory `rtc-unobserved`
+warning, which leaves `I-3` with no witness a real run can reach, so shipping it in the
+default set would ship an inert oracle wearing a default badge. **A run that reported
+`ok: false` for `WAITING_ON_INTERNAL` now reports `ok: true` with a warning.** Trace
+hashes are unaffected — the header stays `'6'`. `SimWarning['kind']` gained
+`rtc-unobserved`; the check report's `WarningKind` gained `rtc-unobserved` and
+`lifecycle-truncated`, which previously reached consumers mislabelled as
+`residual-rejection`. The measured cost of the removal is zero: the zero-false-positive
+corpus never produced a single frame in the guarded branch (438 frames, 6 non-quiescent,
+all `WAITING_ON_TIMER`), so the oracle was catching nothing there before. A genuinely
+hung machine is still surfaced by `transitionTimeout` and by the liveness plane's
+virtual-time budget.
+
+**A `done.state.<C>` join is now raised after an `errorState` recovery.** When a transition failed and the machine recovered into the configured `errorState`, the recovery configuration was committed without a completion check. If that configuration happened to be all-final, `isDone(C)` reported `true` while `done.state.<C>` was never raised — a handler waiting on the join silently never ran. Completion is a property of the committed configuration, not of the path taken into it, so the check now runs on the recovery path too. A machine that has both an `errorState` and a `done.state.<C>` transition may therefore take a transition it did not take before. Recovery is still recovery — the attempted transition is not recorded as successful, and `fired: false` is unchanged — and the join stays edge-triggered, so a recovery into a partially-final configuration raises nothing.
+
+Not a break, but new output you will see: on a runtime with no async-context primitive — a browser, today — the machine logs one `WARN` per process, at the first such construction, disclosing that precise reentrancy detection is unavailable. [Runtime support](#runtime-support) explains what that costs and how to silence it.
 
 ## Status & module format
 
@@ -256,9 +583,89 @@ The same `seed` always produces the same trace and the same `result.traceHash`, 
 
 **Module format**: ESM + CJS dual bundle (TASK-005). `require('@vedmalex/statemachine')` works in CommonJS runtimes via `dist/index.cjs`. `import` works via `dist/index.js`. The `exports` map resolves automatically.
 
+## Runtime support
+
+The core entry point (`@vedmalex/statemachine`) contains **no Node built-in imports** and loads in any ES2022 runtime. One capability, however, is not uniformly available, and the package degrades on it rather than refusing to load.
+
+That capability is **precise reentrancy detection**. Each drain tags the actions and guards it runs with an epoch held in an async-context primitive. A `fireEvent` whose async context carries the currently active epoch was issued from *inside* that drain — a true reentrant call that can never be drained — so it is rejected with a clear error instead of parking forever. The primitive is `AsyncLocalStorage` where the runtime has it; there is no portable equivalent everywhere.
+
+| Runtime | `sm.contextTrackerKind` | Reentrancy detection | Measured on |
+|---|---|---|---|
+| Node | `'async-local-storage'` | **Precise** — unchanged | Node 24.18.0 |
+| Deno | `'async-local-storage'` | **Precise** — same tier as Node | Deno 2.2.12 |
+| Browser | `'none'` | **Degraded** — see below | Chromium 147 (headless) |
+| Any other tracker-less runtime | `'none'` | **Degraded** — see below | — |
+
+Detection is by feature probe, not a runtime name: the engine tries `process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global `AsyncContext.Variable`, and verifies each with a live round-trip — including that `run` restores on its own
+synchronous return when the body returned a pending promise, which is the shape the
+engine actually uses. Propagation across an `await` is *not* checked, because detection
+runs synchronously in the constructor; a tracker that fails that degrades to no
+detection rather than to false rejection, which is the safe direction. Deno lands in the precise tier because its Node-compat layer provides the first. A browser that ships `AsyncContext.Variable` will report `'async-context'` and get the precise tier automatically.
+
+### What "degraded" means, exactly
+
+On a runtime reporting `'none'`, the machine **loads and works** — states, transitions, hierarchy, regions, timers, invoke, persistence and the queue are all unaffected. Precisely two things change:
+
+- **A true reentrant `fireEvent` is not detected.** Calling `await sm.fireEvent(...)` from inside an `onEnter` / `onExit` / `onTransition` / guard no longer rejects with a diagnostic error. The event is queued behind the very action awaiting it, so **that drain parks and never settles**, and the awaiting caller never resolves. This is a real loss of capability, not a cosmetic one. Bound it by setting [`transitionTimeout`](#action-timeouts-transitiontimeout), which settles the caller with an action-timeout error instead of hanging — a less precise diagnosis, but not a deadlock. The structural fix is the same as on Node: do not fire events inline from an action; model the follow-up as an internal transition (an `invoke` timer or a `done.state.*` completion), or dispatch from an independent async callback.
+- **One `WARN` is logged at construction**, disclosing the above. `WARN` is the default log level, so it appears with no setup; silence it with `setDefaultLogLevel` or by injecting your own `logger`.
+
+**Legitimate concurrency is never affected.** The degraded tracker reports an empty store, which can never equal the numeric active epoch, so the reject condition is *unreachable* — a `fireEvent` from an independent timer/IO callback, a chained `await fireEvent(A); await fireEvent(B)`, an `onError` recovery, or an event for a second adaptee mid-drain all queue and resolve exactly as they do on Node. The degradation is strictly missed detection; **false rejection is impossible by construction**. Both halves are pinned by `src/tests/reentrancy_degradation.test.ts`.
+
+### Restoring precision on a custom host
+
+If your runtime has an equivalent primitive under some other name, implement [`IContextTracker`](./etc/statemachine.api.md) (`run` / `exit` / `getStore`) and pass it as `contextTracker`. Each machine needs its **own** instance — the store is a per-machine drain epoch, and a shared instance can collide across machines.
+
+```ts
+const sm = createMachine(config, owner, { contextTracker: myTracker })
+sm.contextTrackerKind // 'injected' — you own the capability statement
+```
+
+### `./sim` is Node-only
+
+The `@vedmalex/statemachine/sim` entry point is **deliberately** Node-bound — it uses `process`, `fs` and `path` for scenario I/O, CLI wiring and signal handling. It is not intended to load in a browser or a bare runtime and no portability is claimed for it. The core entry point above carries none of that.
+
+## Performance
+
+The composite-write hot path (`setCurrentState` region-conflict scan and the
+all-regions-final completion check) is **O(R)** in the number of parallel regions
+R. Two former Θ(R²) sites — the per-part conflict scan and the per-region
+completion scan — were reduced to linear (measured with a deterministic counting
+probe over R ∈ {40…320}: ~65× → ~8× growth per 8× region increase), behaviour
+preserved (the full suite is the oracle). Entering a leaf is a dot-boundary-exact
+region replacement, so a prefix-named sibling region (`r1` vs `r10`) is never
+evicted.
+
 ## Known gaps in 1.0.0-beta
 
-- **Multi-runtime CI (Tier B)**: Deno + Browser smokes run with `continue-on-error: true` and are tracked for full enablement at stable 1.0.0.
+- **Multi-runtime CI (Tier B)**: the `tier-b-deno` and `tier-b-browser` jobs still
+  carry `continue-on-error: true` — they report, they do not gate, and a regression
+  in either runtime will not fail CI. The defect that was failing both lanes (a bare
+  `async_hooks` specifier in the bundle) is fixed, and the browser smoke now drives a
+  real transition instead of merely constructing a machine, so the jobs are no longer
+  expected to be red — but flipping them to blocking is still tracked for stable
+  1.0.0 and has not happened.
+- **A wedged drain seen only through budget exhaustion is not convicted.** Since
+  `1.0.0-beta.5`, running out of the harness turn budget produces a warning rather
+  than a verdict, because an `onEnter`/`onExit` hook doing a large but finite amount
+  of internal work leaves a frozen prefix byte-identical to a hook that never
+  returns — an awaited hook is not tracked as in-flight async, so no fixed window can
+  tell the two apart. Raising `maxTurns` can: a finite hook eventually completes.
+  The pump's EARLY break turned out to be the same truncation over a 16-turn window
+  instead of a 1024-turn one: the settle fingerprint is frozen across an entire
+  ordinary microstep, whose length grows with the machine's own width. A parallel
+  composite whose sibling region merely holds an armed timer was convicted for a
+  *synchronous* `onEnter`. So that boundary does not convict either, and `I-3`
+  (run-to-completion) is no longer in the default oracle set — request it explicitly
+  if you want those frames flagged.
+- **`checkMachine` (dynamic check)**: fuzzing, not model-checking (see
+  [`docs/dynamic-check.md`](./docs/dynamic-check.md)) — the absence of a finding is
+  never a proof of correctness. Two builtin oracles are additionally limited by what
+  the observation channel can see, and both under-report rather than false-fire:
+  `I-4` (enter/exit hierarchy order) compares only states that actually ran a hook,
+  and skips the reserved `microstep 0` used by construction / `reset` /
+  `resumeTimers`; `I-5` (parallel join) samples completion at settle boundaries, so a
+  composite that becomes all-final and is *left again* inside the same macrostep is
+  never observed done — a missing `done.state.<C>` there goes unreported.
 
 ## Known internal debt (Phase 1)
 
@@ -275,7 +682,7 @@ The Phase 1 bootstrap copied several modules as-is from the legacy `@grainjs/sta
 - **`tsconfig.moduleResolution = "bundler"`** — TASK-003 TD-T3-5 / F-CR-4 conditional closure. Downstream tasks (TASK-005 CI/CD + CJS) MUST keep an import-rewriting bundler (`tsup`, `esbuild`, `rollup` with `node-resolve`, `vite build` library mode). Flipping to a non-rewriting toolchain (raw `tsc --module commonjs`) requires upgrading `moduleResolution` to `"node16"`/`"nodenext"` first and migrating all internal imports to use `.js` extensions explicitly.
 - **`tsup` is the runtime bundler** — TASK-005 selection. Future tasks must keep an import-rewriting bundler (`tsup`/`esbuild`/`rollup`-with-node-resolve) per TD-T3-5 conditional bundler constraint.
 - **`etc/statemachine.api.md`** is the canonical `@stable` surface snapshot — generated by `api-extractor`; CI fails on uncommitted drift. Promoting a symbol from `@unstable` to `@stable` requires updating this file deliberately.
-- **knip ignore-list cap = 5 entries** — TASK-003 PLAN F-PL-5 governance. Adding a 6th ignore requires either removing an existing one OR opening a new DA review against the Sustainability lens. Currently 2/5 used (`ValidationConfig`, `MonitoringConfig`).
+- **knip ignore-list cap = 5 entries** — TASK-003 PLAN F-PL-5 governance. Adding a 6th ignore requires either removing an existing one OR opening a new DA review against the Sustainability lens. Currently 2/5 used (`src/tests/**`, `src/presets.ts` — see `knip.json`).
 - **`@stable` public surface** — 5 firm symbols (`createMachine`, `StateMachine`, `StateMachineConfig`, `Transition`, `State`). Changing their signatures is a 1.0.0-stable breaking change. The `src/tests/public_surface.test.ts` ratchet test enforces non-regression at CI time.
 
 A full review trail for Phase 1 lives in the MB3 work tree (see root README): `memory-bank/tasks/2026-05-03_TASK-002_.../code-review.md` (bootstrap) and `memory-bank/tasks/2026-05-03_TASK-003_.../code-review.md` (quality baseline).

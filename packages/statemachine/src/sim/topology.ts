@@ -112,6 +112,20 @@ export interface GeneratedTopology {
  * composite with >=2 parallel regions reaching `done.state`, history, and invoke
  * timers); the DETAILS — names, which constants, delays, transition wiring — vary
  * by seed so validation is guaranteed clean for every seed.
+ *
+ * SCOPE (D1 — honest accounting): this is an ENGINE-PATH fuzzer, NOT a
+ * topology-SHAPE fuzzer. The generated shape is FIXED at composite→region→leaf
+ * (depth 2); across N seeds only the DETAILS vary (lane length 3..5, names,
+ * constants, delays, wiring, and — with a fault plan — the injected faults and op
+ * stream). So `generateScenario` fuzzes the engine's EXECUTION paths (selection,
+ * RTC drain, parallel join, history, invoke timers, faults) richly, but never
+ * exercises a topology deeper or differently shaped than the skeleton — a
+ * depth-3+ or non-parallel-nesting bug is NOT in its reach. Topology-shape
+ * coverage comes from the hand-authored corpus (the W1 MB3 corpus +
+ * `defineScenario`), not from this generator. Keeping the shape fixed is what
+ * makes every seed correct-by-construction (validator-clean) and replay-
+ * deterministic; varying it would forfeit both. `bounds.maxStateDepth` is only a
+ * CLAMP guard here, never a depth driver.
  */
 export function genConfig(prng: Prng, bounds: Bounds): GeneratedTopology {
   // Clamp depth to <=10 (the ONLY ERROR-bearing bound). Our skeleton never

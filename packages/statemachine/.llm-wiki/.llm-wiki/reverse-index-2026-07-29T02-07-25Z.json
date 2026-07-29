@@ -1,0 +1,20 @@
+{
+  "schema": "llm-wiki-reverse-index/v1",
+  "run_id": "2026-07-29T02-07-25Z",
+  "ts": "2026-07-29T02:07:43.115Z",
+  "sources": {
+    "raw/regions-and-parallel.md": [
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/all-final-join.md",
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/regions-and-parallel.md",
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/entry-exit-ordering.md"
+    ],
+    "raw/hierarchical.test.ts": [
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/all-final-join.md",
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/regions-and-parallel.md",
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/entry-exit-ordering.md"
+    ],
+    "raw/README.md": [
+      "/Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki/pages/regions-and-parallel.md"
+    ]
+  }
+}

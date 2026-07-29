@@ -1,6 +1,6 @@
 # Extension Points
 
-The package exposes 7 extension points for host integration. Each EP is a
+The package exposes 8 extension points for host integration. Each EP is a
 TypeScript interface from `@vedmalex/statemachine` that hosts may implement
 to customize behavior.
 
@@ -88,6 +88,22 @@ receive the underlying owner object directly. The adapter wrapper stays
 internal to the machine boundary so host code does not need to unwrap it in
 each callback.
 
+**One adapter binds one owner; one machine drives many.** The active state lives in
+the owner, under the config's `stateAttribute`, and is read and written through this
+contract — so a second owner needs only a second adapter, not a second machine. Drive
+it through the `*For` family (`fireEventFor(owner, event, …)` and siblings), which
+accepts a raw object and wraps it in a `MemoryAdapter` internally, cached per object.
+See "Driving several objects with one machine" in the README.
+
+**The adaptee's identity is load-bearing.** Every per-owner structure the engine keeps
+— history for `history` states, state entry times, armed `invoke` timers, in-flight
+`invoke` operations, invoke restart counts — is held in a `WeakMap` keyed by
+`adapter.adaptee`. Two adapters over the *same* object therefore share one set of
+records, which is what makes wrapping-on-demand safe; two adapters over *equal but
+distinct* objects do not. An implementation whose `adaptee` getter returns a fresh
+object per call (a projection, a clone, a proxy created on read) silently loses that
+runtime on every access. Return a stable reference.
+
 ## EP-5 — ILogger (logging)
 
 **Contract** (from `src/types.ts`):
@@ -120,6 +136,15 @@ shape (NOT optional). The `state` argument to `save` IS optional (`state?: ...`)
 if provided, the inner shape must include all 3 fields. async; method named `restore`
 (NOT `load`). See `examples/integration/persistence-adapter/`.
 
+**Scope: the construction owner only.** `machine.saveState()` reads the current state,
+history map and entry times of the owner the machine was constructed with, and
+`machine.restoreState()` writes them back to that same owner and re-arms its timers. A
+record driven through the `*For` family is not covered by either — it does not appear
+in the saved shape, and a restore does not touch it. The same is true of `toJSON` /
+`fromJSON`. For many records, the persisted state is the record's own `stateAttribute`
+field and this EP is not involved; see "Driving several objects with one machine" in
+the README, including the per-record runtime that no persistence path carries.
+
 ## EP-7 — validateConfig (config validation)
 
 **Contract** (from `src/config_validator.ts`):
@@ -139,3 +164,38 @@ export function isValidConfig<T extends object>(config: StateMachineConfig<T>): 
 
 **Note**: this EP exposes function-level validation entry points only. The internal
 `ConfigValidator` class is NOT exported; the public surface is the three functions above.
+
+## EP-8 — IContextTracker (async-context host)
+
+**Contract** (from `src/types.ts`):
+
+```ts
+export interface IContextTracker {
+  run<R>(store: number, fn: () => R): R
+  exit<R>(fn: () => R): R
+  getStore(): number | undefined
+}
+```
+
+**Propagation contract**: `run` binds `store` for the duration of `fn` **including
+across every `await` inside it** — that is the whole point, and a synchronous-only
+implementation silently breaks the property it exists to provide. `exit` must
+observe `undefined` for its duration and must NOT catch: a throw from `fn`
+propagates unchanged.
+
+**What depends on it**: the precise reentrancy detector. The engine stamps each
+drain pass with an epoch and rejects a `fireEvent` only when the caller's async
+context carries the ACTIVE epoch — which is what separates a genuinely reentrant
+call (issued from inside an action, and therefore undrainable) from a legitimate
+concurrent one issued by an independent timer or IO callback.
+
+**When to implement**: to restore precise detection on a runtime that offers no
+async-context primitive of its own. `AsyncContext.Variable` maps directly onto
+this contract once browsers ship it (`exit` is `run(undefined, fn)`).
+
+**Default factory**: resolved per machine, without any import statement, from
+`process.getBuiltinModule('node:async_hooks').AsyncLocalStorage`, then a global
+`AsyncContext.Variable`, then a no-op. `machine.contextTrackerKind` reports which
+was taken. On the no-op the machine logs one `WARN` at construction and true
+reentrancy goes UNDETECTED — the call parks the drain instead of being rejected.
+A legitimate concurrent `fireEvent` is never falsely rejected in any mode.

@@ -13,6 +13,11 @@ import * as pkg from '../index'
  * a CODE_REVIEW DA gate justifying the change.
  */
 
+// W4 П13/EO-8 (observability export): `StateMachineMonitor`, `createDefaultMonitor`
+// and `Logger` were PROMOTED to the intentional @unstable public surface so a
+// consumer can read metrics / drive health / control logging without reaching
+// into `(sm as any).monitor`. They are exported only AFTER EO-3 fixed the lying
+// errorRate/health/successCount. The remaining helpers below stay internal.
 const BANNED_SYMBOLS = [
   // TASK-004 singletons (eliminated in TASK-004 per ISS-007/ISS-008)
   'globalStateMachineMonitor',
@@ -23,13 +28,10 @@ const BANNED_SYMBOLS = [
   'HealthChecker',
   'MetricsCollector',
   'PerformanceMonitor',
-  'StateMachineMonitor',
   // TASK-004 internal factories (@internal; not for public consumption)
   'createDefaultScheduler',
-  'createDefaultMonitor',
   'createDefaultErrorHandler',
-  // Internal logger plumbing
-  'Logger',
+  // Internal logger plumbing (Logger promoted per EO-8; the rest stay internal)
   'LoggerFactory',
   'ConsoleAppender',
   'MemoryAppender',

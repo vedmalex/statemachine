@@ -327,8 +327,10 @@ async function driveOneScenario(spec: ScenarioSpec): Promise<{ trace: CanonicalT
       await driver.step(dop)
     }
   }
-  // getDurations() is the Step-2 NON-HASHED latency accumulator — every engine
-  // recordTransition(duration, true) value, never reaching the hash plane.
+  // getDurations() is the Step-2 NON-HASHED latency accumulator — the engine's
+  // recordTransition(duration, success) values for SUCCESSES only (post-W4
+  // refusals record success===false with duration 0 and are excluded, W4.1 LOW),
+  // never reaching the hash plane.
   return { trace: driver.trace(), durations: monitor.getDurations() }
 }
 

@@ -38,6 +38,18 @@ export type { StateMachineConfig } from './types'
 export type { Transition } from './types'
 
 /**
+ * @stable — discriminated result of `fireEventDetailed` (SPEC §7).
+ * @category Stable
+ */
+export type { FireResult } from './types'
+
+/**
+ * @stable — what `StateMachine.detachOwner` released for one owner (B3).
+ * @category Stable
+ */
+export type { OwnerDetachResult } from './types'
+
+/**
  * @stable — state node shape; consumed by States<T> map.
  * @category Stable
  */
@@ -56,6 +68,9 @@ export type {
   StateMachineOptions,
   RegionsConfig,
   StateInvocation,
+  InvokeTimer,
+  InvokeOperation,
+  ExitContext,
   StateName,
   EventName,
   RegionName,
@@ -73,6 +88,13 @@ export type {
   KeysOf,
   ExtractAdaptee,
   ErrorContext,
+  // W8: the payload type of the optional `IMonitor.recordLifecycle` observability
+  // channel — a consumer implementing that method must be able to name it.
+  LifecycleEvent,
+  // A1/A2: the return shape of `StateMachine#getProgress()` — the engine
+  // phase-advance heartbeat plus the consumer callables it is currently inside.
+  EngineProgress,
+  OpenDispatch,
 } from './types'
 
 /**
@@ -86,6 +108,86 @@ export type { ValidationConfig } from './config_validator'
  * @unstable — monitoring preset/config shape used by monitoring helpers and presets.
  */
 export type { MonitoringConfig } from './monitoring'
+
+// === П13/EO-8 — observability RUNTIME surface ===
+// Previously only the TYPE (IMonitor / MonitoringConfig) reached consumers; the
+// monitor CLASS and its default factory were unreachable, so metrics could only
+// be scraped via `(sm as any).monitor`. Exported ONLY AFTER EO-3 fixed the lying
+// errorRate/health/successCount — the public surface must not carry the lie.
+
+/**
+ * @category Unstable
+ * @unstable — comprehensive monitor implementation (metrics + health). Read the
+ * machine's live instance via `StateMachine#getMonitor()`, or construct one to
+ * inject through `StateMachineOptions.monitor`.
+ */
+export { StateMachineMonitor, createDefaultMonitor, HealthStatus } from './monitoring'
+
+// === W8/V2 — lifecycle TRACER (consumer-side debugging instrument) ===
+// The raw `IMonitor.recordLifecycle` channel is a time-free, un-aggregated
+// stream. The tracer is the consumer-side half: it pairs begin/end edges,
+// stamps subscriber time, and renders the callback timeline — so "why was my
+// onExit never called?" / "which callback is hung?" is a `format()` call rather
+// than a hundred lines of bespoke bookkeeping.
+
+/**
+ * @category Unstable
+ * @unstable — lifecycle tracer factory. Pass the result straight to
+ * `StateMachineOptions.monitor`, or decorate an existing monitor with
+ * `tracer.wrap(myMonitor)`.
+ *
+ * @see docs/lifecycle-tracing.md
+ *
+ * @example
+ * ```ts
+ * const tracer = createLifecycleTracer()
+ * const sm = new StateMachine(config, owner, { monitor: tracer })
+ * await sm.fireEvent('go')
+ * console.log(tracer.format())
+ * ```
+ */
+export { createLifecycleTracer } from './lifecycle-tracer'
+
+/**
+ * @category Unstable
+ * @unstable — render a {@link EngineProgress} snapshot as the answer to "on what
+ * is this machine standing right now?". `StateMachine#describeProgress()` is the
+ * zero-setup way in; call this directly when you hold a snapshot rather than the
+ * machine, or when you want to cross-check against a tracer the machine does not
+ * have installed as its monitor.
+ *
+ * @see docs/lifecycle-tracing.md — "When the machine goes quiet"
+ */
+export { describeProgress } from './lifecycle-tracer'
+
+/**
+ * @category Unstable
+ * @unstable — lifecycle tracer surface and its payload / option shapes.
+ */
+export type {
+  LifecycleTracer,
+  LifecycleRecord,
+  LifecycleTracerOptions,
+  LifecycleTracerStats,
+  LifecycleFormatOptions,
+  DescribeProgressOptions,
+  GuardCoverage,
+} from './lifecycle-tracer'
+
+// === П13/EO-8 — logger RUNTIME surface ===
+
+/**
+ * @category Unstable
+ * @unstable — the machine's default logger and the level control. Import
+ * `setDefaultLogLevel` to raise/lower verbosity of the built-in logging.
+ */
+export {
+  stateMachineLogger,
+  setDefaultLogLevel,
+  getLogger,
+  Logger,
+  LogLevel,
+} from './logger'
 
 // === Public adapter classes (live in types.ts) ===
 
@@ -127,6 +229,7 @@ export {
   type ValidationResult,
   type ValidationError,
   type ValidationWarning,
+  type ValidationInfo,
 } from './config_validator'
 
 // === Extension-point interfaces (per TASK-006 EP catalog) — @unstable ===
@@ -167,6 +270,25 @@ export type { Clock } from './scheduler'
  * ```
  */
 export { createVirtualScheduler } from './scheduler'
+
+/**
+ * @category Unstable
+ * @unstable — async-context tracking injection contract, backing PRECISE
+ * reentrancy detection. Implement (and pass via
+ * `StateMachineOptions.contextTracker`) to restore precise detection on a
+ * runtime that has an equivalent primitive but exposes it under neither
+ * `AsyncLocalStorage` nor `AsyncContext.Variable`.
+ *
+ * @see StateMachine#contextTrackerKind
+ */
+export type { IContextTracker } from './types'
+
+/**
+ * @category Unstable
+ * @unstable — the primitive backing a machine's reentrancy detection, as
+ * reported by `StateMachine#contextTrackerKind`.
+ */
+export type { ContextTrackerKind } from './context_tracker'
 
 /**
  * @category Unstable

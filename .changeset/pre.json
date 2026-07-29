@@ -5,9 +5,13 @@
     "@vedmalex/statemachine": "1.0.0-beta.0"
   },
   "changesets": [
+    "budget-truncation-and-runtime-support",
     "composite-region-final-join",
     "dst-clock-injection",
     "dst-simulation-environment",
-    "phase-1-baseline"
+    "lifecycle-channel-and-w3c-ordering",
+    "phase-1-baseline",
+    "standing-report-and-owner-detach",
+    "w9-oracle-teeth-and-shrink"
   ]
 }

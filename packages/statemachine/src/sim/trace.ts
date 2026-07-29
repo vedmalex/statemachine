@@ -5,6 +5,10 @@
  * ADR-1 FROZEN canonical content-only trace schema + hashTrace + the '|'
  * part-normalizer + configHash.
  *
+ * The single cross-module type dependency is `import type { SettleReason }`
+ * (settle.ts) — a TYPE-ONLY import (fully erased, no runtime edge / cycle) so the
+ * frame can record WHY a boundary was non-quiescent for the I-3 oracle.
+ *
  * The hash plane is content-ONLY: a {@link TraceFrame} is structurally
  * incapable of carrying wall-clock / duration / heap / hrtime / errorCode /
  * message. Two runs of the same scenario+seed produce byte-identical
@@ -18,6 +22,8 @@
  * `cause` and `synthetic` are TWO ORTHOGONAL closed unions (R6): `cause` is the
  * 4 engine-causal kinds; `synthetic` is the separate harness-origin discriminator.
  */
+
+import type { SettleReason } from './settle'
 
 /** CLOSED engine-causal kinds. */
 export type TraceCause = 'init' | 'external' | 'timer' | 'internal'
@@ -64,6 +70,28 @@ export interface TraceFrame {
   /** channel-fault tag (NOT 'corrupt-state'). */
   readonly faultApplied?: FaultKind
   readonly fireOutcome?: FireOutcome
+  /**
+   * Why a settle of this step did NOT reach quiescence — the {@link SettleReason}
+   * the macrostep returned. This is DETERMINISTIC content (never wall-clock): a
+   * WAITING_ON_* boundary is a DOCUMENTED, legitimate non-quiescence (a concurrent
+   * region's own future timer / transitionTimeout), which the I-3
+   * RTC-serialization oracle MUST NOT mistake for a real serialization break.
+   * Absent on a step whose every settle converged — so it perturbs the content
+   * hash ONLY for scenarios that were genuinely non-quiescent. (C1 fix.)
+   *
+   * WHICH settle. Normally the one whose outcome {@link quiescent} also reports:
+   * the step's post-fire drain, or the construction drain for a `cause:'init'`
+   * frame. A step also runs a PRE-fire drain (after any clock advance, before the
+   * op) whose result was previously discarded entirely; when THAT one failed to
+   * converge and the post-fire one succeeded, its reason is recorded here instead
+   * — otherwise a budget exhaustion that the following fire happened to clear
+   * would leave no trace at all, and the advisory budget warnings would
+   * under-count. In that case (and only that case) `quiescent` is `true` while
+   * this field is present: the step DID end settled, and the reason describes an
+   * earlier drain within the same step. Oracles key on `quiescent === false`
+   * first, so the combination cannot manufacture a violation.
+   */
+  readonly settleReason?: SettleReason
   /**
    * captured isDone(C)-per-composite at the settle boundary, stored as DERIVED
    * frame data. Probes read THIS, never a live sm.isDone() (which requires a

@@ -91,8 +91,24 @@ export type WrappableAction<O> = (owner: O, ...args: unknown[]) => unknown | Pro
  * premature quiescence while the real action body still runs. Bracketing the
  * action's own promise keeps the count honest until the body actually settles.
  *
+ * ## C2 — the test is THENABLE, not `instanceof Promise`
+ * "Still running" must mean the same thing here as it does to the engine, and
+ * the engine `await`s anything with a `then`. `r instanceof Promise` is false for
+ * a Bluebird/Q promise, a mocking-library thenable, or a native promise from
+ * another realm (`vm`, an iframe, a second bundled copy of a polyfill) — all of
+ * which the engine adopts and waits on. On that branch the old code took the
+ * SYNCHRONOUS path: it decremented the count while the body was still running,
+ * which is premature quiescence, i.e. exactly the failure the frozen rule above
+ * was written to prevent. `state_machine.ts` `isThenable` asks the identical
+ * question for the engine-side funnel and the two are checked against each other
+ * in `src/tests/thenable_liveness.test.ts`.
+ *
  * - synchronous throw → `exit()` immediately, then rethrow (settles now).
- * - promise result    → `exit()` in `.finally` on THAT promise.
+ * - native promise    → `exit()` in `.finally` on THAT promise (UNCHANGED: the
+ *   returned derived promise keeps the pre-C2 microtask-hop count exactly).
+ * - foreign thenable  → `exit()` from a SIBLING `then` reaction, returning `r`
+ *   ITSELF: a bare thenable has no `.finally` to derive from, and returning the
+ *   original is also what keeps the caller's chain unlengthened.
  * - sync non-promise  → `exit()` immediately.
  */
 export function bracketAsync<O>(env: Env, fn: WrappableAction<O>): WrappableAction<O> {
@@ -109,6 +125,29 @@ export function bracketAsync<O>(env: Env, fn: WrappableAction<O>): WrappableActi
       return r.finally(() => {
         env.exitAsync()
       })
+    }
+    if (
+      r !== null &&
+      (typeof r === 'object' || typeof r === 'function') &&
+      typeof (r as PromiseLike<unknown>).then === 'function'
+    ) {
+      // A foreign thenable is consumer code: it may settle twice or throw out of
+      // `then`. Guard the decrement so the count can never go negative — a
+      // negative in-flight count reads as "quiescent" to every oracle that
+      // compares it against zero, which is the very lie this branch removes.
+      let settled = false
+      const exitOnce = (): void => {
+        if (settled) return
+        settled = true
+        env.exitAsync()
+      }
+      try {
+        ;(r as PromiseLike<unknown>).then(exitOnce, exitOnce)
+      } catch (e) {
+        exitOnce()
+        throw e
+      }
+      return r
     }
     env.exitAsync()
     return r

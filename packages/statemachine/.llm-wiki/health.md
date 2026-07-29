@@ -1,7 +1,7 @@
 <!-- Template for llm-wiki-* family. Authored under TASK-357. Substituted by skills/llm-wiki-init/scripts/init-node.ts. -->
 ---
 node: /Users/vedmalex/work/statemachine/packages/statemachine/.llm-wiki
-last-check: 2026-06-15T07:21:53.810Z
+last-check: 2026-07-29T02:10:20.543Z
 ---
 
 # Health — .llm-wiki
@@ -10,7 +10,7 @@ Updated by llm-wiki-maintain. Reflects current node health state.
 
 ## Last Check
 
-- Date: 2026-06-15T07:21:53.810Z
+- Date: 2026-07-29T02:10:20.543Z
 - Status: uninitialized
 
 ## Open Issues
@@ -45,3 +45,6 @@ The `recurring_lint_findings` counter = rows where Count >= 3.
 ## Maintenance History
 
 See [log.md](./log.md) for detailed operation history.
+
+- 2026-07-29 (W8/V11): pages `entry-exit-ordering` and `regions-and-parallel` refreshed — callback ordering is now W3C SCXML §3.13 (entry = document order, exit = reverse document order); the stale "insertion-dependent" claim removed. Sources re-checked, freshness=fresh.
+- KNOWN LINT FALSE-POSITIVE: `AGENTS.md` "broken internal link → ./path.md" is a syntax EXAMPLE inside an inline-code span in the skill's managed block; the linter does not exclude code spans. Not a real link; a local edit would be overwritten by the next managed-block repair.

@@ -60,12 +60,23 @@ export function runSafety(
   }
 
   // (2) first checkFinal in registry order.
+  //
+  // The final-scope context carries the trace FRAMES: a `checkStep` hook sees one
+  // frame at a time and can never compare a frame with its predecessor, so a sound
+  // SEQUENCE-shaped predicate (e.g. counting `false → true` edges of a per-frame
+  // projection) has no other honest home. This adds NO impurity — the runner already
+  // holds the trace, the frames are the same CAPTURED data `checkStep` receives, and
+  // no live engine call is introduced. Supplied here rather than by each caller so a
+  // sequence-shaped oracle can never be silently vacuous on one call path and armed
+  // on another. Built ONCE per sweep, not per invariant. The runner stays BLIND — it
+  // still references no invariant id.
   const finalState = finalStateOf(trace)
+  const finalCtx: CheckerContext = { ...ctx, frames: trace.frames }
   for (const inv of invariants) {
     if (inv.checkFinal === undefined) {
       continue
     }
-    const v = inv.checkFinal(finalState, ctx)
+    const v = inv.checkFinal(finalState, finalCtx)
     if (v !== null) {
       return v
     }

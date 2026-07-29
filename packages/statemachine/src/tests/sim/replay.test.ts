@@ -92,3 +92,34 @@ describe('replay: distinct seeds produce distinct traces (sanity)', () => {
     expect(hashes.size).toBeGreaterThan(1)
   }, 30000)
 })
+
+// ── W5b #22 — B1 persistent hash + D5 undrivable-op error ────────────────────
+
+describe('W5b #22: repro-hash strength (B1) + undrivable-op error (D5)', () => {
+  it('B1: the shrinker replay traceHash is the FULL canonical hashTrace, not the weak configHash:frameCount digest', async () => {
+    const { defaultShrinkRunner } = await import('../../sim/shrinker')
+    const spec = await generateScenario(11n)
+    const run = await defaultShrinkRunner(spec)
+    // The persisted replay hash MUST equal the full content-only hashTrace so two
+    // distinct runs that merely share a config + frame count cannot collide.
+    expect(run.traceHash).toBe(hashTrace(await runScenario(spec)))
+    // The weak digest was `${configHash}:${frameCount}` (colon-joined); the full
+    // canonical hash is two concatenated fnv1a32 hex segments — never a colon pair.
+    expect(run.traceHash).not.toContain(':')
+    expect(run.traceHash.length).toBeGreaterThanOrEqual(16)
+  }, 30000)
+
+  it('D5: runScenario THROWS on an undrivable restore/snapshot op instead of silently skipping it', async () => {
+    const base = await generateScenario(7n)
+    const withRestore: ScenarioSpec = {
+      ...base,
+      ops: [...base.ops, { kind: 'restore', id: 'r1', fromSnapshotId: 'snap1' }],
+    }
+    await expect(runScenario(withRestore)).rejects.toThrow(/not drivable/)
+    const withSnapshot: ScenarioSpec = {
+      ...base,
+      ops: [...base.ops, { kind: 'snapshot', id: 's1' }],
+    }
+    await expect(runScenario(withSnapshot)).rejects.toThrow(/not drivable/)
+  }, 30000)
+})

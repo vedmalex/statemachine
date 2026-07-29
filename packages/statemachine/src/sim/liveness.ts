@@ -146,20 +146,35 @@ export interface LivenessParams {
    * TIMEOUT_BUDGET_EXCEEDED. Exceeding it ⇒ TIMEOUT_BUDGET_EXCEEDED.
    */
   readonly budgetVirtualMs: number
-  /**
-   * If the underlying settleMacrostep returned a `microtask-budget`
-   * non-quiescence, the harness sets this so the liveness verdict surfaces it.
-   */
-  readonly microtaskBudgetExhausted?: boolean
+  // REMOVED — `microtaskBudgetExhausted`. It carried the settle pump's
+  // `'microtask-budget'` exhaustion into a TIMEOUT_BUDGET_EXCEEDED verdict, which
+  // forces `ok:false` and is a HARD `FailCause` that `failOn` cannot relax.
+  //
+  // WHY IT CANNOT BE FED AGAIN. A budget exhaustion is a TRUNCATED observation,
+  // and a truncated observation cannot support a verdict. When the pump stops at
+  // `maxTurns` the prefix it saw from an `onEnter` hook that finishes at turn 2000
+  // is byte-identical to the prefix from a hook that never finishes: enter/exit
+  // hooks are deliberately excluded from `inFlightAsyncCount` (driver.ts), so
+  // while one runs `queueTotal|isProcessingEvents|inFlightAsyncCount` is frozen
+  // and no timer is armed. The producer that used to live in `public.ts`
+  // convicted exactly such a correct machine. This is the same indistinguishability
+  // argument the zero-delay livelock already rests on (docs/dynamic-check.md).
+  //
+  // Both budget outcomes are now surfaced as advisory WARNINGS on `SimResult`
+  // (`budget-progressing` / `budget-frozen`) and reach no verdict path. The field
+  // is deleted rather than left unfed so it cannot read as a wiring gap someone
+  // is invited to close.
 }
 
 /**
  * Analyze a sequence of per-step liveness samples into a {@link LivenessResult}.
  *
  * Rules (ADR-6):
- *  - The settleMacrostep `microtask-budget` non-quiescence surfaces as
- *    TIMEOUT_BUDGET_EXCEEDED (a liveness finding, never a throw).
- *  - A virtual-time budget overrun ⇒ TIMEOUT_BUDGET_EXCEEDED.
+ *  - A virtual-time budget overrun ⇒ TIMEOUT_BUDGET_EXCEEDED. The settle pump's
+ *    microtask-budget exhaustion deliberately does NOT reach this analyzer — it
+ *    is a truncated observation, not a liveness fact (see {@link LivenessParams}).
+ *    Virtual TIME, by contrast, only advances when the machine actually armed the
+ *    deadlines that moved it, so an overrun there is a positive observation.
  *  - A configuration cycle within the healthy window — the SAME normalized
  *    fingerprint recurs after K = stateCount + 1 distinct steps while
  *    `resolve-true` keeps firing without terminal progress ⇒ STUCK
@@ -180,14 +195,11 @@ export function analyzeLiveness(
   const last = samples[samples.length - 1]
   const finalQuiescence = last !== undefined ? classifyQuiescence(last) : 'QUIESCENT_NO_WORK'
 
-  // (0) microtask-budget livelock from settleMacrostep → liveness finding.
-  if (params.microtaskBudgetExhausted === true) {
-    return {
-      verdict: 'TIMEOUT_BUDGET_EXCEEDED',
-      quiescence: finalQuiescence,
-      reason: 'macrostep microtask-budget exhausted',
-    }
-  }
+  // (0) REMOVED — the settle pump's microtask-budget exhaustion used to return
+  // TIMEOUT_BUDGET_EXCEEDED here. See the note on LivenessParams: a
+  // budget-truncated observation cannot support a verdict, and this branch
+  // convicted a correct machine whose `onEnter` hook simply did a lot of finite
+  // internal work.
 
   // (1) virtual-time budget overrun.
   if (last !== undefined && last.t > params.budgetVirtualMs) {
@@ -221,17 +233,41 @@ export function analyzeLiveness(
     healthyFps.push({ fp, idx: i })
   }
 
-  // (3) self-loop STUCK: resolve-true + config unchanged on a HEALTHY sample.
-  for (const s of samples) {
-    if (s.healthy && s.fireOutcome === 'resolve-true' && !s.configChanged && !s.terminal) {
-      // A resolve-true that did not change the config and did not terminate is a
-      // no-progress self-loop ⇒ STUCK (only on a healthy sample — fairness gate).
-      return {
-        verdict: 'STUCK',
-        quiescence: classifyQuiescence(s),
-        witness: normalizeParts(s.config),
-        reason: 'resolve-true with no configuration change (self-loop)',
-      }
+  // (3) self-loop STUCK: resolve-true + config unchanged on a HEALTHY sample —
+  // BUT only when NO observable progress accompanies the unchanged config (C2).
+  // A resolve-true self-transition that leaves the composite unchanged yet keeps
+  // GROWING (or shrinking) an observable — the queue depth, the pending-timer
+  // count, or the earliest armed deadline — is doing real work, not livelocking.
+  // Ignoring that progress (the pre-C2 `!configChanged`-only branch) falsely
+  // classified a legitimate progressing self-loop as STUCK. We therefore compare
+  // each unchanged-config self-loop sample against its immediate predecessor and
+  // only declare STUCK when the observables ALSO held identical (true no-progress).
+  for (let i = 0; i < samples.length; i++) {
+    const s = samples[i]
+    if (s === undefined) {
+      continue
+    }
+    if (!(s.healthy && s.fireOutcome === 'resolve-true' && !s.configChanged && !s.terminal)) {
+      continue
+    }
+    const prev = samples[i - 1]
+    const observableProgress =
+      prev !== undefined &&
+      (s.queueDepth !== prev.queueDepth ||
+        s.pendingTimers !== prev.pendingTimers ||
+        s.earliestTimerAt !== prev.earliestTimerAt)
+    if (observableProgress) {
+      // The config held but an observable moved: real progress, not a self-loop.
+      continue
+    }
+    // A resolve-true that changed NEITHER the config NOR any observable and did
+    // not terminate is a genuine no-progress self-loop ⇒ STUCK (healthy only —
+    // fairness gate).
+    return {
+      verdict: 'STUCK',
+      quiescence: classifyQuiescence(s),
+      witness: normalizeParts(s.config),
+      reason: 'resolve-true with no configuration change (self-loop)',
     }
   }
 

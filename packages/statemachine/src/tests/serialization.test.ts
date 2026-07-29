@@ -70,8 +70,13 @@ describe('StateMachine Serialization/Deserialization', () => {
   it('should serialize and deserialize a simple state machine', () => {
     const sm = new StateMachine(SMC)
     const serializedSM = sm.toJSON()
+    // W0: functions restore by NAME from a consumer registry. The `born`
+    // event's `onAfter: (root, fn) => fn(root)` serializes under its inferred
+    // name 'onAfter'; supply it so restoration resolves the reference.
     const deserializedSM = StateMachine.fromJSON<Person, typeof SMC>(
       serializedSM,
+      undefined,
+      { actions: { onAfter: (root: any, fn: any) => fn(root) } },
     )
     expect(deserializedSM.getCurrentState()).toBe(sm.getCurrentState())
     expect(deserializedSM.initialState).toBe(sm.initialState)
@@ -123,9 +128,13 @@ describe('StateMachine Serialization/Deserialization', () => {
       event: actionFn,
     })
 
+    // W0: `onAfter: actionFn` serializes as a name reference ('actionFn').
+    // Restoration resolves it from the supplied registry — the body is never
+    // recompiled — and firing the event runs the real function.
     const deserializedSM = StateMachine.fromJSON<Person, typeof actionSMC>(
       serializedSM,
       newPerson,
+      { actions: { actionFn } },
     )
 
     expect(deserializedSM.getCurrentState()).toBe(sm.getCurrentState())

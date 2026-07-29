@@ -54,6 +54,61 @@ export const DEFAULT_GENOPS_PARAMS: GenOpsParams = {
 export const SCENARIO_RUNTIME = 'node-sim-v1'
 
 /**
+ * Cheap syntactic gate on a literal-callback `source` BEFORE it reaches
+ * `new Function` (W7 U2 / task #26 / defect B4-учёт; W8 V6a widened the
+ * accepted-shape set). NOT a sandbox and NOT an attacker mitigation — a
+ * determined caller can still craft a `source` that matches this pattern and
+ * does harm; it is fail-fast HYGIENE against an empty/malformed/non-function
+ * `source` (e.g. an accidental `''`, `undefined` coerced to a string, or a
+ * stray non-callable expression) reaching the compiler, with a message that
+ * names the TRUSTED-INPUT-ONLY boundary instead of surfacing an opaque
+ * `SyntaxError` from inside `new Function`.
+ *
+ * Matched AFTER {@link stripLeadingCommentsAndWhitespace} runs on the
+ * trimmed source, so it accepts (in addition to a bare `function`/`async
+ * function` literal and any arrow form):
+ *  - a parenthesis-wrapped function literal: `(function(o){...})`;
+ *  - a function literal preceded by a leading block comment (`/* ... *\/`)
+ *    and/or line comment(s) (`// ...\n`), in any combination, before the
+ *    `function`/`async function`/`(function` keyword.
+ *
+ * It still rejects (throws before `new Function` is ever reached): an empty
+ * or whitespace-only source, a non-string source, and source that is not
+ * function-shaped at all (e.g. `'42'`, `'{ evil: 1 }'`, `'alert(1)'`).
+ *
+ * PRECISION OF THE CHECK (do not mistake it for a filter). The `function`
+ * alternative is anchored; the ARROW alternative (`=>`) is NOT — a source that
+ * merely CONTAINS `=>` anywhere passes the shape check (e.g.
+ * `'alert(1), (x) => x'` is a valid comma-expression and WOULD run). Likewise a
+ * paren-wrapped IIFE with a trailing statement now passes the shape check and
+ * fails later, inside `new Function`, as a raw SyntaxError. Neither is a
+ * regression of SAFETY — this is hygiene for author typos, NOT a sandbox and NOT
+ * an attacker mitigation; the whole path is trusted-input-only (see below).
+ */
+const FUNCTION_LITERAL_PATTERN = /^\(?\s*(async\s+)?function\b|=>/
+
+/**
+ * Strip leading whitespace and leading comments (block `/* *\/` and line
+ * `// ...`) from `source` so {@link FUNCTION_LITERAL_PATTERN} can anchor on
+ * the actual `function`/`(function` keyword instead of false-rejecting a
+ * well-formed literal that merely has a leading comment (W8 V6a). Hygiene
+ * pre-processing ONLY — the ORIGINAL untouched `source` string is still what
+ * gets embedded into the `new Function` body below; this stripped `probe` is
+ * used solely for the guard's pattern test, never for compilation.
+ */
+function stripLeadingCommentsAndWhitespace(source: string): string {
+  let probe = source
+  for (;;) {
+    const before = probe
+    probe = probe.replace(/^\s+/, '')
+    probe = probe.replace(/^\/\*[\s\S]*?\*\//, '')
+    probe = probe.replace(/^\/\/[^\r\n]*(\r\n|\r|\n)?/, '')
+    if (probe === before) break
+  }
+  return probe
+}
+
+/**
  * Re-create the live function for a closure-free literal callback. The source is
  * a function-EXPRESSION reading only its parameter; we re-create it through the
  * same restricted-scope contract the engine uses (`security.ts:640`) so a
@@ -62,8 +117,32 @@ export const SCENARIO_RUNTIME = 'node-sim-v1'
  * NOTE: this is the harness-side re-eval used when a {@link ScenarioSpec} arrives
  * as pure JSON (no live `fn`); the generator's own `fn` is used directly when
  * present. The created function ignores extra args and reads only the owner.
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26). `source` is COMPILED via
+ * `new Function` below; the {@link FUNCTION_LITERAL_PATTERN} guard (run against
+ * a {@link stripLeadingCommentsAndWhitespace}-cleaned probe) is fail-fast
+ * HYGIENE on an empty/malformed source — it accepts a bare `function`/`async
+ * function` literal, the SAME wrapped in parentheses (`(function(){})`), any
+ * of those with a leading block/line comment, and any arrow-function form —
+ * it is NOT a sandbox and does not defend against a crafted,
+ * syntactically-valid-looking malicious literal. Callers MUST treat `source`
+ * as author-side trusted input (see `./index` barrel doc and
+ * `toEngineConfig`/`runScenario` for the full contract). The engine's own
+ * untrusted-JSON path (`StateMachine.fromJSON`/`fromSecureJSON`) never reaches
+ * this function — it resolves callbacks by NAME from a caller-supplied
+ * `FunctionRegistry` (`state_machine.ts` `deserializeAction`), never compiling
+ * a source string.
  */
 function recreateLiteral(source: string): (...args: unknown[]) => unknown {
+  const trimmed = typeof source === 'string' ? source.trim() : ''
+  const probe = stripLeadingCommentsAndWhitespace(trimmed)
+  if (trimmed.length === 0 || !FUNCTION_LITERAL_PATTERN.test(probe)) {
+    const shown = typeof source === 'string' ? source : String(source)
+    const truncated = shown.length > 120 ? `${shown.slice(0, 120)}…` : shown
+    throw new Error(
+      `recreateLiteral: refusing to compile a non-function / empty source '${truncated}' — trusted author-side function literals only`,
+    )
+  }
   // Mirror security.ts:640: shadow dangerous globals, evaluate the source as an
   // expression, call it with (adaptee, ...args). Closure-free source survives.
   const executor = new Function(
@@ -85,6 +164,30 @@ function recreateLiteral(source: string): (...args: unknown[]) => unknown {
   `,
   ) as (adaptee: unknown, args: unknown[]) => unknown
   return (adaptee: unknown, ...args: unknown[]) => executor(adaptee, args)
+}
+
+/**
+ * `InvokeSpec.cond`/`InvokeSpec.action` are typed as {@link LiteralCallback},
+ * but an off-label / hand-rolled `TopologySpec` (e.g. a coverage-harness
+ * fixture proving the string-method-invoke residual, ISS-029) may pass a bare
+ * STRING method-name instead. A bare string has no `.source`, so calling
+ * {@link recreateLiteral} on it would now hit the new guard and throw at
+ * config-BUILD time — a behavior change from the pre-guard code (which
+ * compiled `(${undefined})` without erroring until the wrapper was actually
+ * invoked). Preserve pass-through for anything that is not LiteralCallback
+ * SHAPED (an object with a string `.source`): only a genuine literal-callback
+ * value is compiled; anything else (e.g. a string method-name reference)
+ * flows to the engine unchanged, exactly as a `string | Action` field would.
+ */
+function recreateLiteralIfShaped(value: unknown): unknown {
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { source?: unknown }).source === 'string'
+  ) {
+    return recreateLiteral((value as { source: string }).source)
+  }
+  return value
 }
 
 /**
@@ -138,10 +241,10 @@ function toEngineState(spec: StateSpec): Record<string, unknown> {
     out['invoke'] = spec.invoke.map((inv) => {
       const e: Record<string, unknown> = { delay: inv.delay, event: inv.event }
       if (inv.cond) {
-        e['cond'] = recreateLiteral(inv.cond.source)
+        e['cond'] = recreateLiteralIfShaped(inv.cond)
       }
       if (inv.action) {
-        e['action'] = recreateLiteral(inv.action.source)
+        e['action'] = recreateLiteralIfShaped(inv.action)
       }
       return e
     })
@@ -202,6 +305,17 @@ function toEngineEvent(spec: EventSpec): Record<string, unknown> {
 /**
  * Build the engine {@link StateMachineConfig} from a {@link TopologySpec}. All
  * callbacks are live functions (closure-free literal bodies).
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt). Every callback
+ * `source` string in `topology` is COMPILED via `new Function` in
+ * {@link recreateLiteral} (define.ts). The restricted-scope shadowing there is
+ * a hardening measure, NOT a sandbox: a crafted `source` is RCE-class. Treat
+ * `topology` (and any {@link ScenarioSpec} / {@link TopologySpec} you pass here
+ * or to {@link runScenario}) as a TRUSTED author-side input. NEVER feed
+ * untrusted JSON — a JSON payload carrying `source` strings would be compiled
+ * and executed. This is a harness/author surface exposed through the public
+ * `./sim` entry; the engine's own JSON deserialization (`StateMachine.fromJSON`)
+ * never compiles bodies and is the path for untrusted input.
  */
 export function toEngineConfig<T extends object = { state: string; log: number[]; k: number }>(
   topology: TopologySpec,
@@ -302,7 +416,7 @@ function buildDriver(topology: TopologySpec, seed: bigint, faults: FaultPlan = {
 /** Map a closed-union {@link Op} onto the Step-3 {@link DriverOp} the driver runs.
  * The op's STABLE `id` is carried as `opId` so the driver can resolve per-op
  * channel faults keyed by that id (R22). */
-function toDriverOp(op: Op): DriverOp | null {
+function toDriverOp(op: Op): DriverOp {
   switch (op.kind) {
     case 'fire':
       return { kind: 'fire', event: op.event, args: op.args, opId: op.id }
@@ -310,10 +424,22 @@ function toDriverOp(op: Op): DriverOp | null {
       return { kind: 'advance', dtMs: op.dtMs, opId: op.id }
     case 'noop':
       return { kind: 'noop', opId: op.id }
-    // snapshot/restore are part of the frozen Op union but are not driven until
-    // the Simulator lands snapshot/restore (Step 10); skip them here.
-    default:
-      return null
+    // D5 fix: `snapshot`/`restore` are part of the frozen Op union but the driver
+    // has NO DriverOp for them yet (Step 10 not landed). Previously they were
+    // SILENTLY SKIPPED — a hand-authored scenario with a `restore` op ran clean,
+    // producing NO frame and NO error, so the author was misled into thinking the
+    // restore was exercised. Fail LOUDLY instead: an undrivable op is a scenario
+    // authoring error, not a no-op. (The coverage-path persistence round-trip uses
+    // the SEPARATE `CoverageScenario.snapshotRestore` engine saveState/restoreState
+    // flag — coverage.ts:286 — NOT this Op union, so it is unaffected.)
+    default: {
+      const undrivable = op as { kind: string; id?: string }
+      throw new Error(
+        `runScenario: op kind '${undrivable.kind}'${undrivable.id !== undefined ? ` (id '${undrivable.id}')` : ''} is not drivable — ` +
+          `snapshot/restore ops are declared in the frozen Op union but the Simulator does not yet drive them (Step 10). ` +
+          `Remove the op or drive persistence via the Simulator snapshot()/restore() API.`,
+      )
+    }
   }
 }
 
@@ -322,6 +448,14 @@ function toDriverOp(op: Op): DriverOp | null {
  * and return the canonical content-only trace. Pure in `(spec.seed, spec,
  * header.runtime)`: two calls with the same spec produce a bit-identical
  * `traceHash` (proven by `replay.test.ts`).
+ *
+ * ⚠️ SECURITY — TRUSTED INPUT ONLY (W0 B4 / task #26 open debt). `spec` is a
+ * TRUSTED author-side input. Its callback `source` strings are COMPILED via
+ * `new Function` ({@link recreateLiteral} / {@link toEngineConfig}); the
+ * restricted-scope shadowing is hardening, NOT a sandbox, so a crafted `source`
+ * is RCE-class. NEVER pass a `ScenarioSpec` reconstructed from untrusted JSON —
+ * its `source` strings would be compiled and executed. Untrusted input belongs
+ * on the engine's non-compiling `StateMachine.fromJSON` path instead.
  */
 export async function runScenario(spec: ScenarioSpec): Promise<CanonicalTrace> {
   defineScenario(spec)
@@ -332,10 +466,7 @@ export async function runScenario(spec: ScenarioSpec): Promise<CanonicalTrace> {
   const driver = buildDriver(spec.topology, seed, spec.faults)
   await driver.init()
   for (const op of spec.ops) {
-    const dop = toDriverOp(op)
-    if (dop !== null) {
-      await driver.step(dop)
-    }
+    await driver.step(toDriverOp(op))
   }
   return driver.trace()
 }

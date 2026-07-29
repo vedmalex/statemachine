@@ -25,6 +25,17 @@
  * taken. The wrapped Adapter is ALWAYS passed as the EXPLICIT 2nd positional arg
  * to `fireEvent` (ADR-7 c13), never via the `:469-471` unshift path.
  *
+ * **Event payload (W8).** `DriverOp.fire.args` is `readonly unknown[]` and the
+ * driver forwards it VERBATIM — it does NOT filter to numbers. An OBJECT payload
+ * (the typical case: a verdict object meaningful relative to the current state)
+ * therefore reaches the machine's guard/action callbacks, which is the only way
+ * arg-dependent transition branches get covered. This is SAFE with respect to the
+ * `isAdapter` duck-check (`'set' in inp && 'get' in inp`, types.ts `isAdapter`, ~:725-726)
+ * BECAUSE the driver always passes the wrapped Adapter EXPLICITLY as the 2nd
+ * positional arg: payload values start at position 3 and `state_machine.ts`
+ * :469-471 only inspects position 2. Never call `sm.fireEvent(event, ...args)`
+ * without the explicit adapter from this module.
+ *
  * Determinism premise (M5): V8 microtask order is FIFO within one isolate and
  * the virtual scheduler creates no real timers/IO; vitest does NOT fake
  * `queueMicrotask`. `header.runtime` pins that premise into the hash.
@@ -45,7 +56,12 @@ import {
 } from './faults'
 import { type FireResult, type SubmissionEntry, applyQueueFaults, applyThrowFaults, buildOverflowFlood, fireBuffered } from './harness'
 import type { Prng } from './prng'
-import { type SettlePolicy, settleMacrostep } from './settle'
+import {
+  type SettlePolicy,
+  type SettleReason,
+  type SettleSample,
+  settleMacrostep,
+} from './settle'
 import type { SimErrorHandler } from './sim-error-handler'
 import type { SimMonitor } from './sim-monitor'
 import {
@@ -99,6 +115,28 @@ export interface DriverConfig<T extends object> {
   /** Forwarded to `StateMachineOptions.maxQueueDepth` (types.ts:146). */
   readonly maxQueueDepth?: number
   /**
+   * Per-macrostep microtask-pump budget, forwarded to EVERY {@link settleMacrostep}
+   * this driver makes (init, pre-fire, post-fire, batch). Defaults to
+   * {@link DEFAULT_MAX_TURNS} = 1024.
+   *
+   * This is the knob the budget warnings' advice presupposes: raising it is what
+   * separates a hook doing a lot of finite internal work from a genuine wedge,
+   * because the two are indistinguishable over any FIXED window.
+   */
+  readonly maxTurns?: number
+  /**
+   * Optional per-pump-turn sample sink, forwarded to EVERY {@link settleMacrostep}
+   * this driver makes — the I-13 RTC-stall observation plane. Wire
+   * `makeRtcStallRecorder().onSample` here; absent ⇒ no samples are taken and the
+   * I-13 oracle is VACUOUS (the I-4 convention: a missing observation plane must
+   * never manufacture a violation).
+   *
+   * It belongs in {@link settleArgs} for the same reason `maxTurns` does: a new
+   * DRIVER settle site must not be able to silently drop it, which would make the
+   * oracle observe only part of the run.
+   */
+  readonly onSample?: (sample: SettleSample) => void
+  /**
    * INTERNAL (not a public-ABI field): the resolved {@link FaultPlan} to apply
    * DURING this run. When present the driver routes external fires through the
    * fault-aware {@link fireBuffered} (reorder/drop/dup + overflow flood), wraps
@@ -130,6 +168,49 @@ interface LiveSink extends CaptureSink {
   drain(): CapturedWrite[]
 }
 
+/**
+ * Every REGIONS-BEARING composite id of a config, as the engine renders its dotted
+ * path (`root`, `root.region.child`, …). Duck-typed on the same structural fields
+ * `buildConfigGraph` walks, so it has no dependency on any topology type.
+ *
+ * ALL composites are enumerated, not only those with a declared `done.state.<C>`:
+ * a parallel composite that reaches all-final and STAYS there has no join
+ * transition to leave it, and its done-ness is exactly what the liveness
+ * `terminal` derivation needs to see.
+ */
+function compositeIdsOf(config: unknown): string[] {
+  const out: string[] = []
+  const visit = (name: string, node: unknown, prefix: string): void => {
+    const path = prefix === '' ? name : `${prefix}.${name}`
+    const n = (node ?? {}) as Record<string, unknown>
+    const regions = n['regions']
+    if (regions && typeof regions === 'object') {
+      out.push(path)
+      for (const [rn, rstates] of Object.entries(regions as Record<string, unknown>)) {
+        if (rstates && typeof rstates === 'object') {
+          for (const [sn, sv] of Object.entries(rstates as Record<string, unknown>)) {
+            visit(sn, sv, `${path}.${rn}`)
+          }
+        }
+      }
+    }
+    const states = n['states']
+    if (states && typeof states === 'object') {
+      for (const [sn, sv] of Object.entries(states as Record<string, unknown>)) {
+        visit(sn, sv, path)
+      }
+    }
+  }
+  const cfg = (config ?? {}) as Record<string, unknown>
+  const top = cfg['states']
+  if (top && typeof top === 'object') {
+    for (const [name, node] of Object.entries(top as Record<string, unknown>)) {
+      visit(name, node, '')
+    }
+  }
+  return out
+}
+
 function makeLiveSink(): LiveSink {
   let buf: CapturedWrite[] = []
   return {
@@ -156,6 +237,14 @@ export class SimDriver<T extends object> {
   private readonly frames: TraceFrame[] = []
   private readonly header: CanonicalHeader
   private readonly initialNormalized: string
+  /**
+   * W8/V5b — every REGIONS-BEARING composite id of the wired config, as the engine
+   * renders its dotted path. Sampled through the PUBLIC `isDone(C)` at every settle
+   * boundary and stamped onto the boundary frame as {@link TraceFrame.doneDelta}.
+   * Empty for a config with no composite (the sampling is then a no-op and the
+   * frames stay byte-identical to a pre-W8 run).
+   */
+  private readonly doneComposites: readonly string[]
   private stepIndex = 0
   private initialized = false
 
@@ -177,7 +266,43 @@ export class SimDriver<T extends object> {
   constructor(private readonly cfg: DriverConfig<T>) {
     this.sink = makeLiveSink()
     const counter = makeAsyncCounter()
-    this.env = makeEnv(counter, cfg.schedulerView)
+    const baseEnv = makeEnv(counter, cfg.schedulerView)
+    // W8/V8 (ISS-030) — COMPOSE the settledness signal from BOTH in-flight sources.
+    //
+    // `bracketAsync` wraps FUNCTION-VALUED invoke actions at the CONFIG layer, so a
+    // STRING-METHOD invoke action — resolved INSIDE `callAction`, past that wrap
+    // boundary — was invisible to `inFlightAsyncCount`. A machine legitimately
+    // awaiting one settled as `pending ∧ inFlight===0`, which settle.ts classifies
+    // WAITING_ON_INTERNAL — the I-3 witness. That was ISS-030: a reachable I-3
+    // FALSE POSITIVE on a correct machine, and the sole reason I-3 was opt-in.
+    //
+    // The W8/V1b lifecycle channel wraps the CALL rather than the action VALUE, so
+    // `invoke.action` begin/end pairs cover the string-method case identically. Only
+    // `invoke.action` is folded in — NOT `invoke.operation`, whose pair spans the
+    // ENTIRE lifetime of a long-running `src` promise (a subscription-style
+    // operation would hold `inFlightAsyncCount` non-zero forever and no macrostep
+    // could ever reach quiescence), and NOT the `invoke.abort` POINT pair (adjacent
+    // begin+end, net zero).
+    //
+    // A function-valued invoke action is counted TWICE (bracket + channel). That is
+    // harmless by construction: settle.ts only ever asks `> 0` / `=== 0`, and both
+    // counters are incremented and decremented around the SAME call, so they reach
+    // zero together.
+    //
+    // Enter/exit HOOKS are also observable on the channel but are deliberately NOT
+    // folded in. They are awaited inside `applyMicrostep`, where
+    // `isProcessingEvents()` is already `true`, so the structural conjunct of the
+    // quiescence predicate covers them. The one place it does not — the
+    // construction-time fire-and-forget `executeEnterActions` — is covered by the
+    // pump's QUIET_FLUSH window by design (settle.ts); folding it in here would move
+    // the settle fixed point itself, which is a separate change from ISS-030.
+    const monitor = cfg.monitor
+    this.env = {
+      ...baseEnv,
+      inFlightAsyncCount(): number {
+        return baseEnv.inFlightAsyncCount() + monitor.invokeActionInFlightCount()
+      },
+    }
     this.plan = cfg.faults ?? { faults: [] }
     this.faultsActive = this.plan.faults.length > 0
 
@@ -232,11 +357,39 @@ export class SimDriver<T extends object> {
     })
 
     this.initialNormalized = normalizeParts(String(cfg.config.initialState))
+    this.doneComposites = compositeIdsOf(cfg.config)
     this.header = {
       seed: cfg.prng.seed.toString(),
       configHash: configHash(cfg.config),
       engine: '@vedmalex/statemachine',
-      version: '1',
+      // '5' (was '1'→'2'→'3'→'4'): '2' added the hashed `settleReason` field (C1);
+      // '3' re-semantized its closed union (U1: the `pending ∧ inFlight==0` case
+      // that hashed as WAITING_ON_TRANSITION_TIMEOUT now hashes as
+      // WAITING_ON_INTERNAL).
+      // '4' (W8/V5b) POPULATES the hashed `doneDelta` field on this path for the
+      // first time: the boundary frame of every step now carries the sampled
+      // isDone(C) projection per declared composite. `doneDelta` was always part of
+      // the frame schema and always hashed, but only coverage.ts ever set it — a
+      // Simulator trace of a composite machine now hashes DIFFERENTLY than it did
+      // under '3'.
+      // '5' (W9/Г2) EXTENDS the `SettleReason` closed union with
+      // `'budget-progressing'`: a budget exhaustion where the machine was still
+      // observably moving no longer hashes as `'microtask-budget'`. Any trace of a
+      // machine long enough to exhaust the pump budget therefore hashes DIFFERENTLY
+      // than it did under '4'.
+      // '6' POPULATES the hashed `settleReason` field on TWO paths that always
+      // dropped it: the mandatory post-construction drain (frame 0 and every
+      // during-drain init frame recorded `quiescent` but no reason, so a machine
+      // that wedged during CONSTRUCTION was completely silent) and the step's
+      // PRE-fire drain (whose result was discarded outright, so a budget
+      // exhaustion the following fire happened to clear left no trace). Any trace
+      // of a machine that is non-quiescent on either path therefore hashes
+      // DIFFERENTLY than it did under '5'.
+      // Per the trace.ts version contract ("bump on closed-union/hashed-field
+      // change") each of these is corpus-breaking and the schema version advances.
+      // MUST stay in lockstep with public.ts `emptyHeader` — pinned by
+      // `src/tests/sim/budget_truncation.test.ts` (the two constants are equal).
+      version: '6',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,
@@ -304,6 +457,39 @@ export class SimDriver<T extends object> {
     return { ...config, states: nextStates as StateMachineConfig<T>['states'] }
   }
 
+  /**
+   * The invariant part of every {@link settleMacrostep} THIS DRIVER makes. Built
+   * in ONE place so a new DRIVER settle site cannot silently drop the configured
+   * `maxTurns` (the budget knob must reach every drain the driver runs, or raising
+   * it would fix only some of them).
+   *
+   * The scope is the driver, not the harness. `Simulator.runSentinelProbe`
+   * (public.ts) constructs its settle args INLINE with a hardcoded `maxTurns: 64`
+   * and a throwaway env, deliberately: it is a one-shot behavioural assertion that
+   * a harness-owned sentinel timer fires through the injected scheduler, not a
+   * drain of consumer work, and it must stay a fixed cost that a consumer's
+   * `maxTurns` cannot inflate. It is outside this helper and outside the claim.
+   */
+  private settleArgs(policy: SettlePolicy): {
+    sm: StateMachine<T, StateMachineConfig<T>>
+    scheduler: DriverConfig<T>['scheduler']
+    clock: SimClock
+    env: Env
+    policy: SettlePolicy
+    maxTurns?: number
+    onSample?: (sample: SettleSample) => void
+  } {
+    return {
+      sm: this.sm,
+      scheduler: this.cfg.scheduler,
+      clock: this.cfg.clock,
+      env: this.env,
+      policy,
+      ...(this.cfg.maxTurns !== undefined ? { maxTurns: this.cfg.maxTurns } : {}),
+      ...(this.cfg.onSample !== undefined ? { onSample: this.cfg.onSample } : {}),
+    }
+  }
+
   /** Logical time. */
   get t(): number {
     return this.cfg.clock.now()
@@ -338,17 +524,14 @@ export class SimDriver<T extends object> {
     // at the start instant; a liveness jump here would skip past it and fire
     // armed timers before any op runs). A configured 'liveness' policy applies
     // only to step() drains.
-    const result = await settleMacrostep({
-      sm: this.sm,
-      scheduler: this.cfg.scheduler,
-      clock: this.cfg.clock,
-      env: this.env,
-      policy: 'safety',
-    })
+    const result = await settleMacrostep(this.settleArgs('safety'))
     const drainedWrites = this.sink.drain()
 
     // Frame 0: the init snapshot, recorded AFTER the drain. cause:'init',
-    // normalized from===to===initialState.
+    // normalized from===to===initialState. W8/V5b: it carries the init-boundary
+    // doneDelta sample (a degenerate all-final initial configuration is done
+    // immediately) — the same boundary coverage.ts has always sampled.
+    const initDone = this.sampleDoneDelta()
     this.frames.push({
       step: this.stepIndex,
       t: this.cfg.clock.now(),
@@ -357,6 +540,26 @@ export class SimDriver<T extends object> {
       to: this.initialNormalized,
       queue: this.queueSnapshot(),
       quiescent: result.quiescent,
+      // The init drain's REASON, on the same terms as every step boundary. It was
+      // dropped here until now, which made a machine that wedges during
+      // CONSTRUCTION completely silent: frame 0 stamped `quiescent:false` and no
+      // `settleReason`, so nothing downstream could say WHY. Populating a hashed
+      // field on the init path is corpus-breaking — see `header.version` '6'.
+      //
+      // SCOPE, precisely (do not read this as "a construction wedge is now
+      // reported"): frame 0 has no `fireOutcome` and never can — nothing was fired.
+      // Every INVARIANT that reads a settle boundary keys on `fireOutcome`
+      // (I-3: `fireOutcome === 'resolve-true' && quiescent === false`), so NO
+      // invariant can see this field on the init frame. Its only consumers are the
+      // advisory warning counters in public.ts, which scan frames by
+      // `settleReason` irrespective of cause. A construction-time non-quiescence is
+      // therefore reported iff its reason has a warning attached — the two budget
+      // reasons and, since the wave-B demotion, `WAITING_ON_INTERNAL` via
+      // `rtc-unobserved` — and is silent for `WAITING_ON_TIMER` /
+      // `WAITING_ON_TRANSITION_TIMEOUT`, which at construction are the NORMAL
+      // outcome (an initial state that arms a timer is not a defect).
+      ...(result.reason ? { settleReason: result.reason } : {}),
+      ...(initDone !== undefined ? { doneDelta: initDone } : {}),
     })
 
     // Any state-writes captured DURING the construction drain (e.g. a
@@ -367,7 +570,10 @@ export class SimDriver<T extends object> {
     // is wired (deterministic per (seed, plan)).
     const jitterTag: FaultKind | undefined = this.recordPlanJitter() ? 'timer-jitter' : undefined
     for (const w of drainedWrites) {
-      this.frames.push(this.frameFromWrite('init', w, result.quiescent, undefined, undefined, jitterTag))
+      // The 7th arg (settleReason) was omitted here, so every during-drain init
+      // frame silently carried `undefined` while frame 0 recorded the quiescence
+      // boolean it belongs to. Pass it explicitly.
+      this.frames.push(this.frameFromWrite('init', w, result.quiescent, undefined, undefined, jitterTag, result.reason))
     }
     // If the jitter perturbed a timer but no writes landed during the construction
     // drain, the init snapshot frame still records the jitter tag so the applied
@@ -444,7 +650,7 @@ export class SimDriver<T extends object> {
     }
 
     // (b) settle BEFORE the fire (drain anything armed by the clock advance).
-    await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    const preFire = await settleMacrostep(this.settleArgs(policy))
     this.sink.drain() // pre-fire writes already framed in prior steps / init
 
     // (c) the op itself.
@@ -467,7 +673,10 @@ export class SimDriver<T extends object> {
         // No-fault fast path: the ORIGINAL Step-3 raw fire (ADR-7 c13 explicit
         // Adapter), byte-identical to the pre-Step-5 driver so a clean run's trace,
         // hash and PERF are unchanged by the fault wiring.
-        const r = await this.fireOne(op.event, (op.args ?? []).filter((a): a is number => typeof a === 'number'))
+        // W8: args are forwarded VERBATIM (`unknown[]`) — no number-filter. The
+        // explicit-Adapter 2nd positional arg keeps the :469-471 unshift path out
+        // of reach, so an object payload is safe here (see module doc).
+        const r = await this.fireOne(op.event, op.args ?? [])
         fireOutcome = r.outcome
         if (r.errorClass !== undefined) {
           errorClassOnFire = r.errorClass
@@ -476,7 +685,7 @@ export class SimDriver<T extends object> {
     }
 
     // (d) settle AFTER the fire to a joint fixed point.
-    const result = await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    const result = await settleMacrostep(this.settleArgs(policy))
 
     // A throw fault that fired DURING this step's drain (e.g. an invoke-action
     // throw) stamps the channel tag 'throw' on this step's frames.
@@ -484,11 +693,37 @@ export class SimDriver<T extends object> {
       faultApplied = 'throw'
     }
 
+    /**
+     * The reason recorded for THIS step: the post-fire drain's when it has one,
+     * otherwise the pre-fire drain's (whose result was previously dropped on the
+     * floor). See the boundary frame below and TraceFrame.settleReason.
+     *
+     * TWO IMPRECISIONS, both known, both currently harmless, and neither fixable
+     * without moving a hashed field:
+     *
+     *  1. A step runs TWO settles (pre-fire and post-fire) but records at most ONE
+     *     reason, so when the post-fire drain converged and the fallback supplies
+     *     the PRE-fire drain's reason, the boundary frame — which describes the
+     *     post-fire settle, and may well be `quiescent:true` — carries a reason
+     *     produced by a DIFFERENT settle. Nothing reads the pair as a unit today
+     *     (the invariants gate on `quiescent === false`, and a frame that is
+     *     quiescent with a stale reason attached is excluded by that conjunct), so
+     *     this is latent rather than live. Separating them needs a second hashed
+     *     field on TraceFrame, which is corpus-breaking.
+     *
+     *  2. The one reason is then stamped on EVERY frame this step emits — the
+     *     boundary frame plus one per state-write captured during the drain — so a
+     *     frame COUNT of a given reason over-reports a single non-quiescent
+     *     macrostep by however many transitions landed in it. The advisory warning
+     *     counters in public.ts therefore count DISTINCT STEPS, not frames.
+     */
+    const settleReasonForStep: SettleReason | undefined = result.reason ?? preFire.reason
+
     // (e) per-transition frames via the Adapter seam DURING the drain.
     const writes = this.sink.drain()
     for (const w of writes) {
       this.frames.push(
-        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied),
+        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied, settleReasonForStep),
       )
     }
 
@@ -496,6 +731,12 @@ export class SimDriver<T extends object> {
     // is a no-op snapshot; for resolve-false / reject / errorState fallback it is
     // the BACKSTOP record (ADR-1 c10) — a try/catch-wrapped getCurrentState diff.
     const afterState = this.safeCurrentState()
+    // W8/V5b: the settle-boundary doneDelta sample — the SAME boundary and the same
+    // PUBLIC isDone(C) reader coverage.ts injects post-hoc, now recorded inline so
+    // the Simulator/runSafety VERDICT path carries it too (it previously did not,
+    // which made every doneDelta-keyed oracle and the liveness `terminal`
+    // derivation vacuous e2e).
+    const doneDelta = this.sampleDoneDelta()
     const boundaryFrame: TraceFrame = {
       step: this.stepIndex,
       t: this.cfg.clock.now(),
@@ -508,6 +749,18 @@ export class SimDriver<T extends object> {
       ...(fireOutcome ? { fireOutcome } : {}),
       ...(errorClassOnFire ? { errorClass: errorClassOnFire } : {}),
       ...(faultApplied ? { faultApplied } : {}),
+      // C1: record WHY a non-quiescent boundary is non-quiescent so I-3 can exclude
+      // a legitimate WAITING_ON_* (a concurrent region's own future timer).
+      //
+      // FALLBACK to the PRE-fire drain's reason. That settle's result used to be
+      // discarded outright, so a step whose pre-fire drain exhausted its budget and
+      // whose post-fire drain then converged recorded NOTHING — the advisory budget
+      // warnings under-counted, and a wedge cleared by the very next fire was
+      // invisible. The post-fire reason always wins when present, so this only ever
+      // fills a slot that would otherwise be empty. See TraceFrame.settleReason for
+      // why `quiescent:true` alongside a reason is well-defined here.
+      ...(settleReasonForStep !== undefined ? { settleReason: settleReasonForStep } : {}),
+      ...(doneDelta !== undefined ? { doneDelta } : {}),
     }
     this.frames.push(boundaryFrame)
 
@@ -614,8 +867,14 @@ export class SimDriver<T extends object> {
     opFault: { kind: 'reorder' | 'drop' | 'dup' | 'overflow'; floodCount?: number } | undefined,
   ): Promise<{ outcome: FireOutcome; errorClass?: TraceFrame['errorClass']; faultApplied?: FaultKind }> {
     const opId = op.opId ?? `step-${this.stepIndex}`
-    const numericArgs = (op.args ?? []).filter((a): a is number => typeof a === 'number')
-    const entry: SubmissionEntry = { opId, event: op.event, args: numericArgs }
+    // W8: the FAULT path carries the payload IDENTICALLY to the no-fault path —
+    // args are forwarded VERBATIM into the submission entry (no number-filter), so
+    // every downstream consumer (applyQueueFaults dup/reorder/drop, the overflow
+    // flood, fireOne) fires with the SAME arguments a fault-free run would use.
+    // Dropping the payload here would make a fault run observably diverge from its
+    // no-fault twin for reasons unrelated to the fault — a new class of
+    // irreproducibility.
+    const entry: SubmissionEntry = { opId, event: op.event, args: op.args ?? [] }
 
     // Overflow: flood maxQueueDepth+1 copies; the (max+1)-th fire rejects
     // synchronously at enqueue (state_machine.ts:228-240). The flood entries are
@@ -704,7 +963,7 @@ export class SimDriver<T extends object> {
    * the FROZEN structural classifier — never misread as a queue error. Used for
    * every non-overflow fire (no fault, drop, dup).
    */
-  private async fireOne(event: string, args: readonly number[]): Promise<{ outcome: FireOutcome; errorClass?: ErrorClass }> {
+  private async fireOne(event: string, args: readonly unknown[]): Promise<{ outcome: FireOutcome; errorClass?: ErrorClass }> {
     try {
       const resolved = await this.sm.fireEvent(event as never, this.wrapped as never, ...args)
       return { outcome: resolved ? 'resolve-true' : 'resolve-false' }
@@ -721,7 +980,7 @@ export class SimDriver<T extends object> {
    * reorder/overflow integration tests; the normal {@link step} drives one op.
    */
   async fireMany(
-    ops: ReadonlyArray<{ event: string; args?: readonly number[]; opId: string }>,
+    ops: ReadonlyArray<{ event: string; args?: readonly unknown[]; opId: string }>,
   ): Promise<readonly FireResult[]> {
     if (!this.initialized) {
       throw new Error('SimDriver.fireMany() called before init()')
@@ -738,17 +997,22 @@ export class SimDriver<T extends object> {
       results.push(await fireBuffered(this.boundFireEvent(), this.wrapped, e))
     }
     const policy = this.cfg.policy ?? 'safety'
-    await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    await settleMacrostep(this.settleArgs(policy))
     return results
   }
 
-  /** The engine `fireEvent` bound for {@link fireBuffered} (explicit-Adapter path). */
-  private boundFireEvent(): (event: never, adapter: never, ...args: number[]) => Promise<boolean> {
-    return ((event: never, adapter: never, ...args: number[]) =>
-      this.sm.fireEvent(event, adapter, ...args)) as (
+  /**
+   * The engine `fireEvent` bound for {@link fireBuffered} (explicit-Adapter path).
+   * W8: the rest parameter is `unknown[]` so an OBJECT payload reaches the
+   * machine's callbacks. The adapter stays the EXPLICIT 2nd positional arg, so the
+   * `isAdapter` unshift branch (state_machine.ts:469-471) is never entered.
+   */
+  private boundFireEvent(): (event: never, adapter: never, ...args: unknown[]) => Promise<boolean> {
+    return ((event: never, adapter: never, ...args: unknown[]) =>
+      this.sm.fireEvent(event, adapter, ...(args as never[]))) as (
       event: never,
       adapter: never,
-      ...args: number[]
+      ...args: unknown[]
     ) => Promise<boolean>
   }
 
@@ -762,6 +1026,7 @@ export class SimDriver<T extends object> {
     event?: string,
     fireOutcome?: FireOutcome,
     faultApplied?: FaultKind,
+    settleReason?: SettleReason,
   ): TraceFrame {
     return {
       step: this.stepIndex,
@@ -774,12 +1039,40 @@ export class SimDriver<T extends object> {
       ...(event ? { event } : {}),
       ...(fireOutcome ? { fireOutcome } : {}),
       ...(faultApplied ? { faultApplied } : {}),
+      ...(settleReason ? { settleReason } : {}),
     }
   }
 
   private queueSnapshot(): { internal: number; external: number } {
     const q = this.sm.getQueueDepth()
     return { internal: q.internal, external: q.external }
+  }
+
+  /**
+   * W8/V5b — sample the PUBLIC `isDone(C)` for every composite of the config at the
+   * CURRENT (settled) instant. The RUNNER legitimately drives the engine here; the
+   * result is stored as DERIVED frame data so the checkers read the captured
+   * projection and never make a live call (ADR-6 c3 purity).
+   *
+   * Returns `undefined` for a config with no composite, so the frame keeps its
+   * pre-W8 shape (an absent optional is dropped by the hash serializer) and a
+   * composite-free scenario's traceHash is unchanged by this feature.
+   */
+  private sampleDoneDelta(): ReadonlyArray<{ composite: string; done: boolean }> | undefined {
+    if (this.doneComposites.length === 0) {
+      return undefined
+    }
+    return this.doneComposites.map((composite) => {
+      let done = false
+      try {
+        done = this.sm.isDone(composite)
+      } catch {
+        // A corrupt-state probe can make the read path throw; an unreadable
+        // configuration is reported as not-done rather than crashing the driver.
+        done = false
+      }
+      return { composite, done }
+    })
   }
 
   /**

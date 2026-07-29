@@ -56,6 +56,15 @@ jobs:
       # Baseline is measured on Node 24 (== this leg); refresh with
       # SM_DIST_UPDATE_BASELINE=1 on a Node 24 runner.
       - run: node test/verify-dist-bytes.cjs
+      # SM_SIM-gated COMPILE-LEVEL guards. These spawn `tsc` (~8s total), so they
+      # are not on the unconditional `npm test` legs — but SM_SIM=1 previously
+      # reached them on NO leg at all: the only SM_SIM step is `sim:pr`, and that
+      # script scopes vitest to one unrelated file. The guards themselves still
+      # bit through the project-wide `tsc`; what was dormant was the PROOF that
+      # they bite. Runs after `npm run build` because the byte guard now FAILS on
+      # an unbuilt tree instead of skipping. Asserted by an ungated test in
+      # wire_seam_forwarding.test.ts so this step cannot be dropped silently.
+      - run: npm run sim:guards
 
   tier-b-deno:
     runs-on: ubuntu-latest

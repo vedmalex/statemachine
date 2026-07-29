@@ -20,6 +20,22 @@ export interface Adapter<T extends object> {
 // @public
 export type Clock = () => number;
 
+// @public
+export type ContextTrackerKind =
+/** Node/Deno `AsyncLocalStorage` — precise detection. */
+'async-local-storage'
+/** A global `AsyncContext.Variable` — precise detection. */
+| 'async-context'
+/** No primitive available — detection DEGRADED to no-op. */
+| 'none'
+/** Supplied via `StateMachineOptions.contextTracker` — capability is the caller's. */
+| 'injected';
+
+// Warning: (ae-internal-missing-underscore) The name "createDefaultMonitor" should be prefixed with an underscore because the declaration is marked as @internal
+//
+// @internal
+export function createDefaultMonitor(): IMonitor;
+
 // @public (undocumented)
 export function createEnhancedError(message: string, context: ErrorContext, options?: {
     severity?: ErrorSeverity;
@@ -29,25 +45,39 @@ export function createEnhancedError(message: string, context: ErrorContext, opti
 }): EnhancedStateMachineError;
 
 // @public
-export function createMachine<T extends object>(config: StateMachineConfig<T>, owner?: T | Adapter<T>, options?: StateMachineOptions): StateMachine<T, any>;
+export function createLifecycleTracer(options?: LifecycleTracerOptions): LifecycleTracer;
+
+// Warning: (ae-forgotten-export) The symbol "TypedMachineConfig" needs to be exported by the entry point index.d.ts
+//
+// @public
+export function createMachine<T extends object, const S extends States<T> = States<T>>(config: TypedMachineConfig<T, S>, owner?: T | Adapter<T>, options?: StateMachineOptions): StateMachine<T, any>;
 
 // @public
 export function createVirtualScheduler(clock: Clock): ITimerScheduler;
 
-// Warning: (ae-forgotten-export) The symbol "StringKey" needs to be exported by the entry point index.d.ts
+// Warning: (ae-forgotten-export) The symbol "StatePathsOf" needs to be exported by the entry point index.d.ts
 //
 // @public (undocumented)
-export type DeepNestedStateName<S> = {
-    [K in keyof S & string]: S[K] extends {
-        regions?: infer R;
-    } ? R extends Record<string, any> ? {
-        [RegKey in keyof R & string]: R[RegKey] extends Record<string, any> ? {
-            [ChildKey in keyof R[RegKey] & string]: R[RegKey][ChildKey] extends {
-                regions?: infer CR;
-            } ? CR extends Record<string, any> ? `${K}.${RegKey}.${ChildKey}.${StringKey & keyof CR}` : never : never;
-        }[keyof R[RegKey] & string] : never;
-    }[keyof R & string] : never : never;
-}[keyof S & string];
+export type DeepNestedStateName<S> = StatePathsOf<S>;
+
+// @public
+export function describeProgress(progress: EngineProgress, options?: DescribeProgressOptions): string;
+
+// @public
+export interface DescribeProgressOptions {
+    limit?: number;
+    oneLine?: boolean;
+    trace?: LifecycleTracer;
+}
+
+// @public
+export interface EngineProgress {
+    readonly inFlightUserCallables: number;
+    readonly lastTickSeq: number;
+    readonly lastTickSite: string;
+    readonly openDispatches: readonly OpenDispatch[];
+    readonly tick: number;
+}
 
 // @public (undocumented)
 export class EnhancedErrorHandler {
@@ -143,6 +173,7 @@ export type ErrorContext = {
     action?: string;
     transition?: string;
     phase?: 'guard' | 'action' | 'transition' | 'enter' | 'exit';
+    slot?: string;
 };
 
 // @public (undocumented)
@@ -196,6 +227,14 @@ export type EventName = string;
 // @public (undocumented)
 export type Events<T extends object, S extends States<T>> = Record<EventName, Omit<Event_2<T, S>, 'name'>>;
 
+// @public
+export interface ExitContext {
+    event: string;
+    preempted: boolean;
+    target: string;
+    wasFinal: boolean;
+}
+
 // @public (undocumented)
 export interface ExtendedErrorContext extends ErrorContext {
     // (undocumented)
@@ -235,6 +274,57 @@ export class FallbackStateRecoveryStrategy implements ErrorRecoveryStrategy {
 }
 
 // @public
+export type FireResult = {
+    fired: true;
+    transitions: Array<{
+        event: string;
+        from: string;
+        to: string;
+    }>;
+} | {
+    fired: false;
+    reason: 'no-transition' | 'guard-rejected' | 'guard-error' | 'aborted' | 'error-state';
+    rejected?: Array<{
+        transition: string;
+        reason: 'guard-rejected' | 'guard-error';
+        error?: Error;
+    }>;
+};
+
+// Warning: (ae-forgotten-export) The symbol "LoggerFactory" needs to be exported by the entry point index.d.ts
+//
+// @public (undocumented)
+export const getLogger: typeof LoggerFactory.getLogger;
+
+// @public
+export interface GuardCoverage {
+    readonly evaluations: number;
+    readonly sawFalse: boolean;
+    readonly sawTrue: boolean;
+    readonly state: string;
+    readonly threw: number;
+    readonly transition: string;
+}
+
+// @public
+export const HealthStatus: {
+    readonly HEALTHY: "healthy";
+    readonly WARNING: "warning";
+    readonly CRITICAL: "critical";
+    readonly UNKNOWN: "unknown";
+};
+
+// @public (undocumented)
+export type HealthStatus = (typeof HealthStatus)[keyof typeof HealthStatus];
+
+// @public
+export interface IContextTracker {
+    exit<R>(fn: () => R): R;
+    getStore(): number | undefined;
+    run<R>(store: number, fn: () => R): R;
+}
+
+// @public
 export interface IErrorHandler {
     // (undocumented)
     addRecoveryStrategy(strategy: ErrorRecoveryStrategy): void;
@@ -270,8 +360,26 @@ export interface IMonitor {
     recordError(error: Error, context?: ErrorContext): void;
     // (undocumented)
     recordEvent?(eventName: string, duration: number): void;
+    recordLifecycle?(event: LifecycleEvent): void;
     // (undocumented)
     recordTransition(duration: number, success: boolean, context?: TransitionContext): void;
+}
+
+// @public
+export interface InvokeOperation<T extends object> {
+    cond?: (adaptee: T) => boolean;
+    id?: string;
+    onDone?: EventName;
+    onError?: EventName;
+    src: (adaptee: T, signal: AbortSignal, ...args: any[]) => Promise<unknown>;
+}
+
+// @public
+export interface InvokeTimer<T extends object> {
+    action?: ActionOrString<T>;
+    cond?: (adaptee: T) => boolean;
+    delay: number;
+    event: EventName;
 }
 
 // @public (undocumented)
@@ -299,6 +407,73 @@ export type KeysOf<T, R> = {
     [K in keyof T]: T[K] extends R ? K : never;
 }[keyof T];
 
+// @public
+export interface LifecycleEvent {
+    readonly edge: 'begin' | 'end';
+    readonly event?: string;
+    readonly failed?: boolean;
+    readonly hook: string;
+    readonly kind: 'enter' | 'exit' | 'invoke' | 'guard' | 'raise'
+    /** The TRANSITION's own callbacks: `onBefore`, `onTransition`, `onAfter`. */
+    | 'transition'
+    /** A consumer `onError` handler. */
+    | 'error'
+    /** The `StatePersistenceAdapter` `save` / `restore` round trip. */
+    | 'persist';
+    readonly microstep: number;
+    readonly outcome?: boolean;
+    readonly owner: object;
+    readonly seq: number;
+    readonly state: string;
+    readonly transition?: string;
+}
+
+// @public
+export interface LifecycleFormatOptions {
+    microstep?: number | readonly number[];
+    owner?: object;
+    summary?: boolean;
+    timings?: boolean;
+}
+
+// @public
+export interface LifecycleRecord extends LifecycleEvent {
+    readonly ts: number;
+}
+
+// @public
+export interface LifecycleTracer extends IMonitor {
+    byMicrostep(microstep: number): LifecycleRecord[];
+    byOwner(owner: object): LifecycleRecord[];
+    failures(): LifecycleRecord[];
+    format(opts?: LifecycleFormatOptions): string;
+    getTrace(): LifecycleRecord[];
+    guardOutcomes(): GuardCoverage[];
+    microsteps(): number[];
+    owners(): object[];
+    recordLifecycle(event: LifecycleEvent): void;
+    reset(): void;
+    stats(): LifecycleTracerStats;
+    readonly truncated: boolean;
+    unfinished(): LifecycleRecord[];
+    wrap(inner: IMonitor): IMonitor;
+}
+
+// @public
+export interface LifecycleTracerOptions {
+    limit?: number;
+    now?: () => number;
+}
+
+// @public
+export interface LifecycleTracerStats {
+    readonly dropped: number;
+    readonly limit: number;
+    readonly malformed: number;
+    readonly recorded: number;
+    readonly seen: number;
+}
+
 // @public (undocumented)
 export class LocalStorageAdapter<T extends object> implements Adapter<T>, StatePersistenceAdapter {
     constructor(data: T, storageKey?: string);
@@ -313,6 +488,47 @@ export class LocalStorageAdapter<T extends object> implements Adapter<T>, StateP
     // (undocumented)
     set(property: keyof T, value: T[keyof T]): void;
 }
+
+// @public (undocumented)
+export class Logger {
+    // Warning: (ae-forgotten-export) The symbol "LoggerConfig" needs to be exported by the entry point index.d.ts
+    constructor(source: string, config?: Partial<LoggerConfig>);
+    // Warning: (ae-forgotten-export) The symbol "LogAppender" needs to be exported by the entry point index.d.ts
+    //
+    // (undocumented)
+    addAppender(appender: LogAppender): void;
+    // (undocumented)
+    child(childSource: string, _additionalContext?: Record<string, any>): Logger;
+    // (undocumented)
+    debug(message: string, context?: Record<string, any>): void;
+    // (undocumented)
+    error(message: string, context?: Record<string, any>, error?: Error): void;
+    // (undocumented)
+    fatal(message: string, context?: Record<string, any>, error?: Error): void;
+    // (undocumented)
+    info(message: string, context?: Record<string, any>): void;
+    // (undocumented)
+    isLevelEnabled(level: LogLevel): boolean;
+    // (undocumented)
+    removeAppender(appender: LogAppender): void;
+    // (undocumented)
+    updateConfig(config: Partial<LoggerConfig>): void;
+    // (undocumented)
+    warn(message: string, context?: Record<string, any>): void;
+}
+
+// @public
+export const LogLevel: {
+    readonly DEBUG: 0;
+    readonly INFO: 1;
+    readonly WARN: 2;
+    readonly ERROR: 3;
+    readonly FATAL: 4;
+    readonly OFF: 5;
+};
+
+// @public (undocumented)
+export type LogLevel = (typeof LogLevel)[keyof typeof LogLevel];
 
 // @public (undocumented)
 export class MemoryAdapter<T extends object> implements Adapter<T>, StatePersistenceAdapter {
@@ -367,12 +583,15 @@ export interface MonitorMetricsSnapshot {
     averageDuration: number;
     // (undocumented)
     errorCount: number;
+    failedTransitions?: number;
     // (undocumented)
     successCount: number;
     // (undocumented)
     totalTransitions: number;
 }
 
+// Warning: (ae-forgotten-export) The symbol "StringKey" needs to be exported by the entry point index.d.ts
+//
 // @public (undocumented)
 export type NestedStateName<S> = {
     [K in keyof S & string]: S[K] extends {
@@ -381,6 +600,23 @@ export type NestedStateName<S> = {
         [RegKey in keyof R & string]: R[RegKey] extends Record<string, any> ? `${K}.${RegKey}.${StringKey & keyof R[RegKey]}` : never;
     }[keyof R & string] : never : never;
 }[keyof S & string];
+
+// @public
+export interface OpenDispatch {
+    readonly hook: string;
+    readonly openedAtTick: number;
+    readonly openTicks: number;
+    readonly owner: object;
+    readonly state: string;
+}
+
+// @public
+export interface OwnerDetachResult {
+    continuationsCut: number;
+    operationsAborted: number;
+    queuedEventsDropped: number;
+    timersCleared: number;
+}
 
 // @public (undocumented)
 export type PropertiesOf<T> = {
@@ -444,6 +680,9 @@ export class SessionStorageAdapter<T extends object> implements Adapter<T>, Stat
 }
 
 // @public (undocumented)
+export const setDefaultLogLevel: (level: LogLevel) => void;
+
+// @public (undocumented)
 export type SimpleStateName<S> = StringKey & keyof S;
 
 // @public (undocumented)
@@ -466,13 +705,8 @@ export type State<T extends object> = {
     invoke?: StateInvocation<T>[];
 };
 
-// @public (undocumented)
-export interface StateInvocation<T extends object> {
-    action?: ActionOrString<T>;
-    cond?: (adaptee: T) => boolean;
-    delay: number;
-    event: EventName;
-}
+// @public
+export type StateInvocation<T extends object> = InvokeTimer<T> | InvokeOperation<T>;
 
 // @public (undocumented)
 export class StateMachine<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>> {
@@ -482,25 +716,40 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
         [key: string]: string;
     }): void;
     canFireEvent(eventName: keyof SMConfig['events'] | '*', adaptee?: Adapter<PropertiesOf<TOwner>>): boolean;
+    canFireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*'): boolean;
+    get contextTrackerKind(): ContextTrackerKind;
     set currentState(state: StateName);
     // (undocumented)
     get currentState(): string;
+    describeProgress(): string;
+    detachOwner(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): OwnerDetachResult;
+    // (undocumented)
     fireEvent(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<boolean>;
+    fireEventDetailed(eventName: keyof SMConfig['events'] | '*', ...args: any[]): Promise<FireResult>;
+    fireEventDetailedFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<FireResult>;
+    fireEventFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>, eventName: keyof SMConfig['events'] | '*', ...args: unknown[]): Promise<boolean>;
     // (undocumented)
     static fromData<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(config: SMConfig, initialState?: string, context?: TOwner, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
-    // (undocumented)
     static fromJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     // (undocumented)
     static fromJSONWithContext<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, context?: MethodsOf<TOwner>, options?: StateMachineOptions): StateMachine<TOwner, SMConfig>;
     static fromSecureJSON<TOwner extends object, SMConfig extends StateMachineConfig<TOwner>>(jsonData: string, obj?: TOwner | Adapter<TOwner>, options?: StateMachineOptions): Promise<StateMachine<TOwner, SMConfig>>;
     // (undocumented)
     getAvailableEvents(adaptee?: Adapter<PropertiesOf<TOwner>>): string[];
+    getAvailableEventsFor(owner: PropertiesOf<TOwner> | Adapter<PropertiesOf<TOwner>>): string[];
+    // Warning: (ae-forgotten-export) The symbol "CompiledModel" needs to be exported by the entry point index.d.ts
+    //
+    // @internal
+    getCompiledModel(): CompiledModel;
     // (undocumented)
     getCurrentState(adaptee?: Adapter<PropertiesOf<TOwner>>): string | undefined;
     // Warning: (ae-forgotten-export) The symbol "StateInfo" needs to be exported by the entry point index.d.ts
     //
     // (undocumented)
     getCurrentStateInfo(): StateInfo | undefined;
+    getMetrics(): MonitorMetricsSnapshot | undefined;
+    getMonitor(): IMonitor;
+    getProgress(): EngineProgress;
     // (undocumented)
     getQueueDepth(): {
         internal: number;
@@ -529,7 +778,6 @@ export class StateMachine<TOwner extends object, SMConfig extends StateMachineCo
     setContext(context: MethodsOf<TOwner>): void;
     // (undocumented)
     get targetState(): string | undefined;
-    // (undocumented)
     toJSON(): string;
     toSecureJSON(): Promise<string>;
 }
@@ -562,19 +810,48 @@ export class StateMachineError extends Error {
 }
 
 // @public (undocumented)
+export const stateMachineLogger: Logger;
+
+// @public
+export class StateMachineMonitor {
+    constructor(config?: Partial<MonitoringConfig>);
+    exportMetrics(): {
+        prometheus?: string;
+        json: any;
+    };
+    getMetrics(): MonitorMetricsSnapshot;
+    getMonitoringReport(): {
+        health: HealthCheckResult;
+        performance: ReturnType<PerformanceMonitor['getPerformanceStatus']>;
+        metrics: ReturnType<MetricsCollector['getMetricsSummary']>;
+        config: MonitoringConfig;
+    };
+    recordError(_error?: Error, _context?: ErrorContext): void;
+    recordEvent(_eventName: string, _duration: number): void;
+    recordTransition(transitionTime: number, success?: boolean, _context?: TransitionContext): void;
+    start(): void;
+    stop(): void;
+}
+
+// @public (undocumented)
 export interface StateMachineOptions {
     abortOnExitError?: boolean;
+    // Warning: (ae-forgotten-export) The symbol "FunctionRegistry" needs to be exported by the entry point index.d.ts
+    actions?: FunctionRegistry;
     clock?: () => number;
+    contextTracker?: IContextTracker;
     // (undocumented)
     errorHandler?: IErrorHandler;
     errorState?: string;
     // (undocumented)
     logger?: ILogger;
     maxQueueDepth?: number;
+    maxTransitionDepth?: number;
     // (undocumented)
     monitor?: IMonitor;
     // (undocumented)
     scheduler?: ITimerScheduler;
+    strictActions?: boolean;
     transitionTimeout?: number;
 }
 
@@ -582,7 +859,7 @@ export interface StateMachineOptions {
 export type StateName = string;
 
 // @public (undocumented)
-export type StatePaths<S> = SimpleStateName<S> | RegionStateName<S> | NestedStateName<S> | DeepNestedStateName<S>;
+export type StatePaths<S> = StatePathsOf<S>;
 
 // @public (undocumented)
 export interface StatePersistenceAdapter {
@@ -605,8 +882,8 @@ export type States<T extends object> = Record<StateName, Omit<State<T>, 'name'>>
 
 // @public (undocumented)
 export type Transition<T extends object, S extends States<T>> = {
-    from: StatePaths<S>;
-    to: StatePaths<S>;
+    from: StatePaths<S> | WildcardFrom;
+    to: StatePaths<S> | '*';
     priority?: number;
     guard?: ActionOrString<T, boolean>;
     onTransition?: ActionOrString<T>;
@@ -668,15 +945,22 @@ export interface ValidationError {
     // (undocumented)
     path: string;
     // (undocumented)
-    severity: 'error' | 'warning';
+    severity: 'error' | 'warning' | 'info';
     // (undocumented)
     suggestion?: string;
+}
+
+// @public (undocumented)
+export interface ValidationInfo extends ValidationError {
+    // (undocumented)
+    severity: 'info';
 }
 
 // @public (undocumented)
 export interface ValidationResult {
     // (undocumented)
     errors: ValidationError[];
+    infos: ValidationInfo[];
     // (undocumented)
     isValid: boolean;
     // (undocumented)
@@ -688,5 +972,12 @@ export interface ValidationWarning extends ValidationError {
     // (undocumented)
     severity: 'warning';
 }
+
+// Warnings were encountered during analysis:
+//
+// types/monitoring.d.ts:207:9 - (ae-forgotten-export) The symbol "HealthCheckResult" needs to be exported by the entry point index.d.ts
+// types/monitoring.d.ts:208:9 - (ae-forgotten-export) The symbol "PerformanceMonitor" needs to be exported by the entry point index.d.ts
+// types/monitoring.d.ts:209:9 - (ae-forgotten-export) The symbol "MetricsCollector" needs to be exported by the entry point index.d.ts
+// types/types.d.ts:721:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
 
 ```

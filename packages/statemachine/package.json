@@ -1,6 +1,6 @@
 {
   "name": "@vedmalex/statemachine",
-  "version": "1.0.0-beta.4",
+  "version": "1.0.0-beta.5",
   "description": "Hierarchical state machine for TypeScript with monitoring, validation, and persistence (lite-only DI-free surface).",
   "keywords": [
     "state-machine",
@@ -52,6 +52,7 @@
     "build:types": "tsc -p tsconfig.build.json --emitDeclarationOnly",
     "lint": "biome check .",
     "typecheck": "tsc --noEmit",
+    "typecheck:types": "tsc -p tsconfig.typecheck.json",
     "check": "biome check . && tsc --noEmit && knip --no-progress",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -63,6 +64,7 @@
     "api:check": "api-extractor run --local --verbose",
     "api:check:sim": "api-extractor run --local --config api-extractor.sim.json",
     "sim:coverage": "SM_SIM=1 vitest run src/tests/sim/sim-coverage.run.test.ts",
+    "sim:guards": "SM_SIM=1 vitest run src/tests/sim/wire_seam_forwarding.test.ts src/tests/sim/dist_byte_guard.test.ts src/tests/sim/tsconfig_isolation.test.ts",
     "sim:perf": "SM_SIM=1 NODE_OPTIONS=--expose-gc vitest run src/tests/sim/metrics.perf.test.ts",
     "sim:perf:baseline": "SM_SIM=1 SM_PERF_UPDATE_BASELINE=1 NODE_OPTIONS=--expose-gc vitest run src/tests/sim/metrics.perf.test.ts",
     "sim:pr": "SM_SIM=1 vitest run src/tests/sim/sim-pr.run.test.ts",

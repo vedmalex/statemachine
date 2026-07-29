@@ -23,6 +23,33 @@
  * (`'set' in inp && 'get' in inp`, types.ts:301-303), so the `fireEvent`
  * `args[0]`-misparse hazard (state_machine.ts:469-471) cannot arise for
  * generated scenarios.
+ *
+ * ## W8 — why `Op.fire.args` STAYS `number[]` while the LIVE driver widened
+ *
+ * W8 widened the LIVE fuzzing path (`DriverOp.fire.args`, `SubmissionEntry.args`,
+ * `SimDriver.fireOne`/`fireMany`/`boundFireEvent`, `fireBuffered`) from `number[]`
+ * to `unknown[]` so `checkMachine` can fuzz OBJECT payloads. The PERSISTED
+ * {@link ScenarioSpec} deliberately did NOT follow, for three independent reasons:
+ *
+ *  1. **Key determinism.** `shrinker.ts:shrinkCacheKey` folds a fire op as
+ *     `f:<id>:<event>:${op.args.join(',')}`. `join` on objects yields
+ *     `[object Object]` for EVERY distinct object, so two structurally different
+ *     candidates would COLLIDE on one memo key and the shrinker would return a
+ *     wrong (unverified) minimal repro. A widened `args` therefore requires a
+ *     canonical serializer inside the shrink key — a change outside this schema.
+ *  2. **Shrink move M5** (`shrinker.ts:706-750`) narrows args ARITHMETICALLY
+ *     (`Math.abs(value)`, `value < 0`, binary search toward 0). That move is only
+ *     meaningful for numbers; `unknown` would make it type-unsound.
+ *  3. **JSON round-trip.** A `ScenarioSpec` is the SERIALIZED corpus artifact
+ *     (`repro-codegen.ts` embeds it in a `MinimalRepro`). `unknown` is not
+ *     JSON-round-trippable in general (functions/symbols/cycles), which would
+ *     break the module's "deterministic, JSON-serializable" contract.
+ *
+ * Consequence: `MINIMAL_REPRO_SCHEMA_VERSION` (repro-codegen.ts) is UNCHANGED at
+ * 1 — no persisted shape changed. Object payloads live only on the LIVE
+ * `Simulator`/`checkMachine` path (`SimOptions.eventPayload`), which is
+ * seed-reproducible but not corpus-serialized. Widening this field is the
+ * prerequisite work for object-payload shrinking, not part of W8.
  */
 
 // The fault taxonomy is owned by Step 5 (`faults.ts`, tech-spec §3.5); the single
@@ -41,7 +68,9 @@ export type { FaultPlan } from './faults'
  * A single deterministic operation against the running machine. CLOSED union;
  * each variant carries a STABLE `id` (R22) so faults/shrinking reference ops by
  * identity, never by position. `fire.args` is `number[]` (never an Adapter — see
- * module doc).
+ * module doc); it stays number-only even after the W8 live-path widening, because
+ * the shrink cache key and the M5 narrow move both require numeric args (module
+ * doc §W8).
  *
  * Step 4 emits ONLY `fire`/`advance`/`noop` (the Step-3 driver's drivable op
  * set); `snapshot`/`restore` are part of the frozen union (tech-spec §3.6) and
