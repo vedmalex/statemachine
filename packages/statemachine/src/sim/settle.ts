@@ -53,10 +53,18 @@ export interface SettleScheduler {
 /** Settle policy: `'safety'` never jumps the clock; `'liveness'` may jump it forward. */
 export type SettlePolicy = 'safety' | 'liveness'
 
-/** Why a settle did NOT reach quiescence (only populated when `quiescent:false`). */
+/**
+ * Why a settle did NOT reach quiescence (only populated when `quiescent:false`).
+ *
+ * The two BUDGET reasons are ADVISORY readings of a truncated window and neither
+ * can convict a machine; the three `WAITING_ON_*` reasons are positive
+ * observations made at an EARLY break (the pump reached a stable point on its
+ * own, inside budget) and `WAITING_ON_INTERNAL` is where the RTC oracle's teeth
+ * now live.
+ */
 export type SettleReason =
-  | 'microtask-budget' // pump exhausted maxTurns with no RECENT observable progress — a wedged drain (RTC concern)
-  | 'budget-progressing' // pump exhausted maxTurns while the machine was STILL progressing — a long legal chain, NOT an RTC concern
+  | 'microtask-budget' // pump exhausted maxTurns with no RECENT observable progress — advisory: a wedge OR a hook doing long internal work
+  | 'budget-progressing' // pump exhausted maxTurns while the machine was STILL progressing — advisory: it was working when we stopped watching
   | 'WAITING_ON_TIMER' // queues+inFlight empty but a future timer is pending (safety: no jump)
   | 'WAITING_ON_TRANSITION_TIMEOUT' // GENUINE in-flight async (inFlight>0) racing a future deadline (safety: no jump)
   | 'WAITING_ON_INTERNAL' // pending queue/processing with NO tracked in-flight async + a future timer — a wedged-flag / undrained-queue RTC concern (U1)
@@ -80,6 +88,74 @@ export interface SettleResult {
  * SIGNAL — it never throws or truncates silently.
  */
 export const DEFAULT_MAX_TURNS = 1024
+
+/**
+ * A small quiet-flush window: how many consecutive no-change turns the pump
+ * treats as the structural stability witness.
+ *
+ * The engine arms invoke timers and queues `checkCompletion` via FLOATING
+ * microtasks during construction enter-actions and after each transition
+ * (state_machine.ts:executeEnterActions(...).catch() + queueMicrotask). Those are
+ * NOT observable via getQueueDepth / isProcessingEvents / inFlightAsyncCount
+ * until they run, so the pump keeps draining microtasks for a few quiet turns
+ * even when the structural predicate momentarily reads empty — otherwise it
+ * would conclude before a `delay:0` invoke timer is even armed.
+ *
+ * CRITICAL ORDERING: timers must be `process`ed only AFTER the microtask queue
+ * is quiet, never on every turn. An invoke timer is ARMED inside
+ * `executeEnterActions` (state_machine.ts:2184) which runs in Phase 6, BEFORE
+ * `setCurrentState(newState)` commits the entered state in Phase 8 (:2048).
+ * Firing the timer eagerly (before the state write lands) makes the invoke
+ * callback's `getCurrentState().includes(stateName)` guard (:2167) FALSE, so the
+ * raised event is silently dropped and a `delay:0` re-arm chain stalls. The
+ * engine's own DST idiom is flush-to-quiet THEN `process()` — the loop mirrors
+ * it: drain microtasks to quiescence, then fire due timers once, then re-enter.
+ *
+ * The value must exceed the deepest engine microtask chain between an observable
+ * becoming idle and its delayed follow-on enqueue. After an awaited invoke action
+ * resolves (inFlightAsyncCount -> 0) the engine takes several microtasks before
+ * the raised event lands in the queue (the resolved-action continuation ->
+ * raiseEvent -> scheduleProcessing -> queueMicrotask chain, empirically ~5-6
+ * turns); a generous window absorbs it without ever masking true quiescence (an
+ * idle machine keeps a stable fingerprint forever). The 1024 turn budget leaves
+ * ample headroom.
+ */
+const QUIET_FLUSH = 16
+
+/**
+ * Nominal RECENCY window for the budget-exhaustion classification: how many
+ * turns may have passed since the fingerprint last MOVED for the exhaustion to
+ * still be described as "the machine was working".
+ *
+ * MEASURED, NOT STRUCTURAL. 16 (`QUIET_FLUSH`) is the largest quiet gap OBSERVED
+ * on the zero-delay chain fixtures (`budget_progressing.test.ts`, chains of
+ * 5/20/40/60/120 hops), with 9-11 turns at the exhaustion site itself; the wedge
+ * fixture (`budget_wedge.test.ts`) sat at 1007. `4 * QUIET_FLUSH` therefore
+ * carries a 4x margin over the measured worst case. It is NOT a bound the pump's
+ * break conditions imply — see the note at the exhaustion site — which is exactly
+ * why the resulting classification is ADVISORY and never a verdict.
+ */
+export const PROGRESS_RECENCY_WINDOW = 4 * QUIET_FLUSH
+
+/**
+ * The EFFECTIVE recency window for a given pump budget.
+ *
+ * {@link PROGRESS_RECENCY_WINDOW} is an absolute 64 while `maxTurns` is per-call.
+ * For any caller with `maxTurns <= 64` the recency test `turns - lastMoveTurn <=
+ * 64` is unconditionally TRUE the moment anything has moved (the whole settle is
+ * shorter than the window), so the moving/frozen distinction silently collapses
+ * to "moving" — the classification stops carrying information without saying so.
+ * The public sentinel probe already runs at exactly `maxTurns: 64`.
+ *
+ * The window is therefore capped at HALF the budget: the largest fraction that
+ * still leaves an equally-sized STALE region the predicate can observe. At the
+ * default 1024 the cap is inactive (512 > 64) and the constant applies unchanged.
+ * The floor of 1 keeps a degenerate 1-2 turn budget from producing a zero-width
+ * window that would call every exhaustion frozen.
+ */
+export function progressRecencyWindow(maxTurns: number): number {
+  return Math.min(PROGRESS_RECENCY_WINDOW, Math.max(1, Math.floor(maxTurns / 2)))
+}
 
 /**
  * Tunables passed to {@link settleMacrostep}. The microtask pump and the
@@ -166,84 +242,33 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
    */
   let lastMoveTurn: number | null = null
 
-  // A small quiet-flush window. The engine arms invoke timers and queues
-  // `checkCompletion` via FLOATING microtasks during construction enter-actions
-  // and after each transition (state_machine.ts:executeEnterActions(...).catch()
-  // + queueMicrotask). Those are NOT observable via getQueueDepth /
-  // isProcessingEvents / inFlightAsyncCount until they run, so the pump keeps
-  // draining microtasks for a few quiet turns even when the structural predicate
-  // momentarily reads empty — otherwise it would conclude before a delay:0
-  // invoke timer is even armed. QUIET_FLUSH consecutive no-change turns is the
-  // structural stability witness.
-  //
-  // CRITICAL ORDERING: timers must be `process`ed only AFTER the microtask queue
-  // is quiet, never on every turn. An invoke timer is ARMED inside
-  // `executeEnterActions` (state_machine.ts:2184) which runs in Phase 6, BEFORE
-  // `setCurrentState(newState)` commits the entered state in Phase 8 (:2048).
-  // Firing the timer eagerly (before the state write lands) makes the invoke
-  // callback's `getCurrentState().includes(stateName)` guard (:2167) FALSE, so
-  // the raised event is silently dropped and a delay:0 re-arm chain stalls. The
-  // engine's own DST idiom is flush-to-quiet THEN `process()` — this loop
-  // mirrors it: drain microtasks to quiescence, then fire due timers once, then
-  // re-enter.
-  //
-  // QUIET_FLUSH must exceed the deepest engine microtask chain between an
-  // observable becoming idle and its delayed follow-on enqueue. After an awaited
-  // invoke action resolves (inFlightAsyncCount -> 0) the engine takes several
-  // microtasks before the raised event lands in the queue (the resolved-action
-  // continuation -> raiseEvent -> scheduleProcessing -> queueMicrotask chain,
-  // empirically ~5-6 turns); a generous window absorbs it without ever masking
-  // true quiescence (an idle machine keeps a stable fingerprint forever). The
-  // 1024 turn budget leaves ample headroom.
-  const QUIET_FLUSH = 16
-
   /**
-   * RECENCY window for the {@link classifyExhaustion} discriminator: how many
-   * turns may have passed since the fingerprint last MOVED for the budget
-   * exhaustion to still count as "the machine was working".
-   *
-   * WHY THIS BOUND. A legitimate hop's quiet gap is bounded by the pump's OWN
-   * break conditions: the inner loop leaves the stable window as soon as
-   * `quiet >= QUIET_FLUSH` (exit a) or `stuck >= QUIET_FLUSH` + an armed timer
-   * (exit b), so a legal hop can hold the fingerprint for ~QUIET_FLUSH+1 turns
-   * before the outer loop fires its timer and the fingerprint moves again. A
-   * WEDGED tail has no such bound — nothing will ever move it, so the gap grows
-   * to the remaining budget (hundreds of turns).
-   *
-   * MEASURED on the correct-machine fixture (`budget_progressing.test.ts`, the
-   * delay-0 invoke chain), by instrumenting this loop:
-   *   - chains of 5/20/40/60/120 hops: max gap ANYWHERE in the settle = 16 turns
-   *     (exactly QUIET_FLUSH), and at the budget-exhaustion return site the gap
-   *     was 9-11 turns.
-   *   - the wedge fixture (`budget_wedge.test.ts`, one legal hop then an
-   *     `onEnter` that never resolves): 1007 turns at the exhaustion site.
-   * `4 * QUIET_FLUSH` = 64 therefore carries a 4x margin over the measured
-   * worst case and still sits ~16x below the wedged observation.
-   *
-   * SOUNDNESS — why this cannot introduce a NEW false positive. The predicate
-   * is `moved at least once AND the last move was recent`. That is a strict
-   * SUBSET of "moved at least once" (the sticky flag it replaces), which is in
-   * turn a strict subset of the exhaustion set the PRE-fix code labelled
-   * `microtask-budget` wholesale. So every settle this code calls
-   * `budget-progressing` was called `microtask-budget` before the split, and
-   * I-3 can only fire on FEWER runs than it did under the pre-fix code that was
-   * validated on the zero-false-positive corpus — never on more. Widening the
-   * window can only SILENCE I-3 further; it can never accuse a correct machine.
+   * The EFFECTIVE recency window for THIS settle's budget. See
+   * {@link progressRecencyWindow}: the nominal 64 is capped at half `maxTurns`
+   * so a small per-call budget cannot make the recency test trivially true.
    */
-  const PROGRESS_RECENCY_WINDOW = 4 * QUIET_FLUSH
+  const recencyWindow = progressRecencyWindow(maxTurns)
 
   /**
    * The shared budget-exhaustion classification (both exhaustion return sites
    * MUST use this — a divergence between them is exactly how the sticky-flag
    * defect stayed invisible).
+   *
+   * ADVISORY, NEVER A VERDICT. Both outcomes describe the SAME event — the pump
+   * stopped watching — and neither can convict. A frozen `maxTurns`-turn prefix
+   * produced by a hook that finishes at turn 2000 is byte-identical to one
+   * produced by a hook that never finishes; the classification only says which
+   * of the two READINGS the observed prefix is more consistent with, so the
+   * consumer knows which question to ask next. Nothing downstream may turn
+   * either value into a `FailCause`, an invariant violation, or a liveness
+   * verdict (see the I-3 note in `invariants.ts` and the removal note in
+   * `liveness.ts`).
    */
   const classifyExhaustion = (): SettleReason => {
     if (lastMoveTurn === null) {
-      return 'microtask-budget' // never moved once — unambiguously wedged
+      return 'microtask-budget' // nothing moved during the whole window
     }
-    return turns - lastMoveTurn <= PROGRESS_RECENCY_WINDOW
-      ? 'budget-progressing'
-      : 'microtask-budget'
+    return turns - lastMoveTurn <= recencyWindow ? 'budget-progressing' : 'microtask-budget'
   }
 
   /** Observable settle fingerprint at the current instant. */
@@ -315,19 +340,30 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
 
     if (turns >= maxTurns && pendingNow && earliest === null) {
       // Budget exhausted with pending work and NO future deadline that could
-      // clear it: a genuine microtask-budget livelock finding (never a
-      // throw/truncate). Timer-gated pending work falls through to the policy
-      // decision below regardless of budget (the pump broke early on exit (b)).
+      // clear it. This is a TRUNCATED OBSERVATION, not a finding: the pump
+      // stopped watching, and it cannot report what the machine did afterwards.
+      // Never a throw/truncate. Timer-gated pending work falls through to the
+      // policy decision below regardless of budget (the pump broke early on exit
+      // (b)).
+      //
+      // WHY THE CLASSIFICATION IS ADVISORY. The quiet gap of a LEGITIMATE hop is
+      // not bounded by the pump's break conditions. Exit (a) needs
+      // `!pending`, exit (b) needs an armed timer — in the region
+      // `pending && earliestExecuteAt() === null` NEITHER applies, so the inner
+      // loop simply runs to `maxTurns` and the gap is unbounded. That region is
+      // EXACTLY the one this site fires in: an `onEnter`/`onExit` hook is awaited
+      // where `isProcessingEvents()` is already true and is deliberately not
+      // counted in `inFlightAsyncCount` (driver.ts), so a hook doing a long but
+      // FINITE amount of internal microtask work freezes all three fingerprint
+      // components with no timer armed — indistinguishable from a wedge over any
+      // truncated window. 16 is a MEASURED number on the chain fixtures, not a
+      // structural bound, and no structural bound exists here.
+      //
+      // Consequently neither value may convict. Downstream both are surfaced as
+      // warnings only; see `classifyExhaustion` above.
       return {
         quiescent: false,
         turns,
-        // HONEST CLASSIFICATION (W9/Г2, remediated): exhausting the pump budget is
-        // an RTC witness unless the machine was STILL moving when the budget ran
-        // out. A machine walking a long legal chain (each delay-0 invoke hop costs
-        // QUIET_FLUSH stabilisation turns, so ~40 hops exhaust the default 1024) is
-        // WORKING, not wedged — reporting it as `microtask-budget` made I-3 fire on
-        // a correct machine. RECENCY, not a sticky "ever moved" flag: a machine that
-        // makes one legal hop and THEN wedges must stay a `microtask-budget` witness.
         reason: classifyExhaustion(),
         t: clock.now(),
       }
@@ -346,13 +382,8 @@ export async function settleMacrostep(args: SettleArgs): Promise<SettleResult> {
       return {
         quiescent: false,
         turns,
-        // HONEST CLASSIFICATION (W9/Г2, remediated): exhausting the pump budget is
-        // an RTC witness unless the machine was STILL moving when the budget ran
-        // out. A machine walking a long legal chain (each delay-0 invoke hop costs
-        // QUIET_FLUSH stabilisation turns, so ~40 hops exhaust the default 1024) is
-        // WORKING, not wedged — reporting it as `microtask-budget` made I-3 fire on
-        // a correct machine. RECENCY, not a sticky "ever moved" flag: a machine that
-        // makes one legal hop and THEN wedges must stay a `microtask-budget` witness.
+        // Same truncated observation as the site above, reached defensively;
+        // same advisory classification, same prohibition on convicting from it.
         reason: classifyExhaustion(),
         t: clock.now(),
       }

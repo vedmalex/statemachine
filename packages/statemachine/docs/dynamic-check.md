@@ -51,7 +51,7 @@ field — `ok`. The causes:
 |---|---|
 | `violation` | a builtin oracle or one of *your* `invariants` was violated |
 | `deadlock` | a reached non-final state has no outgoing transition |
-| `livelock` | the liveness plane found a no-progress cycle / budget overrun |
+| `livelock` | the liveness plane found a no-progress cycle / a **virtual-time** budget overrun (never the settle *turn* budget — see "Run-to-completion and the settle budget") |
 | `no-progress` | `transitionsFired === 0` — the machine never moved |
 | `escape` | a real (non-virtual) timer escaped the scheduler (see below) |
 | `degradation` | a dead event / uncovered transition survived a **saturated** coverage sweep |
@@ -202,8 +202,8 @@ interface CheckReport {
   maybe.
 - **`warnings`** are typed (`no-payload`, `timer-escape`, `dead-events-at-plateau`,
   `uncovered-at-plateau`, `dead-guard-at-plateau`, `non-converging-region`,
-  `residual-rejection`, `init-check-skipped`, `shrink-skipped`) so you can triage or
-  relax by kind.
+  `residual-rejection`, `init-check-skipped`, `shrink-skipped`,
+  `budget-progressing`, `budget-frozen`) so you can triage or relax by kind.
 
 ### Reproducing a finding
 
@@ -284,71 +284,103 @@ Override with `onRealTimerEscape: 'ignore' | 'warn' | 'fail'`.
 ## Run-to-completion and the settle budget
 
 Every step ends by draining the machine to quiescence: queues empty, nothing in
-flight, no timer pending. The drain is bounded — it pumps microtasks for a fixed
-number of turns — so a wedged machine can never hang the run. A boundary that did
-not reach quiescence records *why*, as `settleReason` on its trace frame. Two of
-those reasons look alike and mean opposite things:
+flight, no timer pending. The drain is bounded — it pumps microtasks for at most
+`maxTurns` turns, **default 1024** — so a wedged machine can never hang the run. A
+boundary that did not reach quiescence records *why*, as `settleReason` on its
+trace frame.
 
-- **`microtask-budget`** — the pump ran out and the machine's observable state had
-  not moved for a long time (or never moved at all). Nothing was progressing when
-  the budget ended: this is a wedged drain, and the builtin `I-3` run-to-completion
-  oracle reports it as a violation. A machine that takes one legal hop and *then*
-  wedges lands here too — what counts is whether it was still moving at the end, not
-  whether it ever moved.
+Two of those reasons say the harness ran out of budget. **Neither is a verdict.**
+Both are advisory warnings, and `ok` is unaffected by either:
+
 - **`budget-progressing`** — the pump ran out while the machine was *still*
   observably moving. A long legal chain of zero-delay `invoke` hops does exactly
   this: each hop costs a stabilisation window, so on the order of forty of them
-  exhaust the default budget. That is the harness stopping, not a run-to-completion
-  break — `I-3` excludes it, and the drain continues on the following steps until
-  the machine reaches its final state. It is surfaced as a `budget-progressing`
-  warning (once per run), never as a verdict: `ok` is unaffected.
+  exhaust the default budget. The machine was working when the run stopped watching
+  it, and the drain continues on the following steps.
+- **`budget-frozen`** (`settleReason: 'microtask-budget'`) — the pump ran out and
+  the machine's observable state had already stopped changing before it did. This
+  is *compatible with* a wedge, and also with a hook doing a large amount of
+  internal work; see the gap below for why the harness cannot tell them apart.
 
 The two are separated by *recency* — how many turns passed since the observable
-state last changed — and the separation is deliberately lopsided. A legitimate hop's
-quiet gap is bounded by the pump's own stabilisation window (measured at 16 turns on
-the zero-delay chain fixtures, whatever their length); a wedge has no bound at all
-and holds the state frozen for whatever remains of the budget (measured at 1007).
-The threshold sits at four stabilisation windows, well clear of both.
+state last changed. The threshold is four stabilisation windows (64 turns), capped
+at half `maxTurns` so a small per-call budget cannot make the test trivially true.
+16 turns is the largest gap **measured** on the zero-delay chain fixtures, not a
+bound anything guarantees, which is precisely why the result is advisory.
 
-The other reasons describe a settle waiting on *time* rather than on the budget:
-`WAITING_ON_TIMER` (nothing pending, only a future timer) and
-`WAITING_ON_TRANSITION_TIMEOUT` (a genuine in-flight async action racing a future
-deadline) are both legitimate and excluded; `WAITING_ON_INTERNAL` — queued or
-in-progress work with no in-flight async behind it — is a real run-to-completion
-concern and an `I-3` witness.
+The other reasons describe a settle waiting on *time* rather than on the budget,
+and those the pump reaches at its own early break, **inside** budget — they are
+things it observed, not things it ran out of time to disprove. `WAITING_ON_TIMER`
+(nothing pending, only a future timer) and `WAITING_ON_TRANSITION_TIMEOUT` (a
+genuine in-flight async action racing a future deadline) are legitimate and
+excluded; `WAITING_ON_INTERNAL` — queued or in-progress work with no in-flight
+async behind it, alongside an armed timer — is a real run-to-completion concern and
+is where `I-3`'s teeth live.
 
-### Known gap — a zero-delay livelock cannot be convicted
+### `maxTurns`
 
-`budget-progressing` is compatible with two situations the harness cannot tell
-apart, and it is a warning rather than a verdict precisely because of that:
+`maxTurns` (on both `checkMachine` and `runSimulation`) sets the per-macrostep pump
+budget. **Default 1024.** Raise it when a run reports either budget warning and you
+need to know which reading is the real one: work that is finite completes at a
+larger budget, and a genuine wedge reports the same thing at every budget you try.
+Cost is bounded by the value — one microtask turn each.
 
-1. A long but **finite** chain of zero-delay hops that simply needs a bigger turn
-   budget. It will settle; the run stopped watching first.
-2. A genuine **livelock** — `A -(invoke delay:0, raise e)-> B -(invoke delay:0,
-   raise e)-> A`, forever. It will never settle.
+### Known gap — a budget-truncated observation cannot convict
 
-There is no observation that separates them. For any budget-truncated prefix the
-livelock produces, a **correct** machine exists that produces a byte-identical
-prefix: the same topology, plus a counter in the owner data that exits the loop
-after more iterations than the budget can reach. The state that distinguishes them —
-context fields, closure variables — is consumer-private and appears in no channel
-the harness reads: `TraceFrame` carries no context, and lifecycle records are
-deliberately payload-free. Any rule that convicted case 2 would convict case 1 as
-well, and case 1 is a correct machine. Warning-only is the sound maximum here.
+**No finding may rest on the drain having run out of turns.** Both budget reasons
+are warnings, and neither reaches an invariant, a liveness verdict or a fail cause.
+The reason is general: at the cutoff the harness holds a *prefix* of the machine's
+behaviour, and for any prefix a truncated run can produce, a **correct** machine
+exists that produces a byte-identical one. Convicting on a prefix therefore
+convicts correct machines. Two concrete witnesses:
 
-**You can usually resolve it and the harness cannot.** The per-macrostep turn budget
-is fixed and not an option, but the drain resumes on the *next* step, so raising
-`steps` gives the machine more total budget to finish in. A 200-hop zero-delay chain
-reaches `h36` at `steps: 1`, `h108` at `steps: 2` and its final state at `steps: 6`.
-A finite chain settles that way; a livelock reports the same warning at every `steps`
-value you try. That is the signal to go looking.
+**A slow hook.** `s0 -E-> h1 -(invoke delay:0)-> slow`, where `slow.onEnter` is
+`async () => { for (let i = 0; i < N; i++) await Promise.resolve() }` — a hook that
+does a long but strictly finite amount of internal work and then returns. The
+machine reaches `slow` for every `N`. But the settle fingerprint is
+`queueDepth | isProcessingEvents | inFlightAsyncCount`, and an awaited `onEnter` is
+deliberately *not* counted as in-flight async (it is awaited where
+`isProcessingEvents()` is already true, so the structural conjunct normally covers
+it). While the hook runs, all three components are frozen and no timer is armed —
+exactly what a wedge looks like. Under the earlier rule this machine passed at
+`N = 100` and failed at `N = 1000`, with an `I-3` violation and a
+`TIMEOUT_BUDGET_EXCEEDED` livelock. The only thing that changed between those two
+runs was the internal turn budget.
 
-Note what is *not* in this gap. Exhaustion with no recent movement stays
-`microtask-budget` and remains a hard `I-3` violation, and that one **is** soundly
-distinguishable: a legitimate hop's quiet gap is bounded by the pump's own
-stabilisation window, so a machine still making progress cannot hold its observable
-state frozen for hundreds of turns. Absence of movement is a positive observation,
-not an absence of evidence.
+**A zero-delay livelock.** `A -(invoke delay:0, raise e)-> B -(invoke delay:0,
+raise e)-> A`, forever. Genuinely broken — and still not convictable, because the
+correct machine with the same topology plus a counter that exits the loop after
+more iterations than the budget can reach produces the identical prefix.
+
+Note *why* they are indistinguishable, since one plausible objection does not hold:
+it is **not** that the deciding state is unreadable. Owner data *is* readable —
+`checkMachine` builds a payload snapshot from the adaptee and hands `ownerData(...)`
+to your invariants, so a loop counter in the owner is visible to the harness. The
+argument is different, and stronger. Reading the counter still does not tell the
+harness whether the guard's threshold is ever reached: that is a question about the
+machine's *future*, and answering it means running the machine to completion —
+which is the thing the budget prevents. (Closure and module-scope state is
+genuinely unreadable on top of that, but the gap does not depend on it.)
+
+**You can usually resolve it and the harness cannot.** Two knobs, and they work
+differently:
+
+- `maxTurns` raises the per-macrostep budget directly. This is the one that
+  separates the two readings of a *frozen* fingerprint: finite work completes at a
+  larger budget, an infinite wedge does not.
+- `steps` gives the machine more macrosteps, and the drain resumes on each. This is
+  the one for a *progressing* chain: a 200-hop zero-delay chain reaches `h36` at
+  `steps: 1`, `h108` at `steps: 2` and its final state at `steps: 6`.
+
+Either way the shape of the answer is the same: a finite computation settles at
+*some* budget, a genuine livelock reports the same warning at every value you try.
+That is the signal to go looking.
+
+Note also what the zero-false-positive corpus does **not** prove here. It never
+enters the exhaustion path at all — pinning the trace-header version back and
+watching the hash table pass unchanged is the direct evidence (see the note above
+`CORPUS_HASHES` in `payload_substrate.test.ts`). A corpus that never reaches a code
+path is not evidence about that path.
 
 Separately: a machine that drives itself through unbounded zero-delay `invoke` hops
 is outside the macrostep contract to begin with. A macrostep is meant to converge;

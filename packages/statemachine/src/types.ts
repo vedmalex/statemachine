@@ -344,8 +344,40 @@ export interface StateMachineOptions {
    */
   clock?: () => number
   /**
-   * Maximum time (ms) to wait for async entry/exit actions.
-   * If exceeded, the transition aborts with an error.
+   * Deadline (ms) applied to EACH INDIVIDUAL action call: guards, `onBefore` /
+   * `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and
+   * `invoke` actions. Every call races its own timer.
+   *
+   * It is a PER-ACTION budget — NOT per transition and NOT per microstep (SPEC
+   * §11). Since one event fires one transition per region, a microstep of N
+   * transitions running K hooks each gets N×K independent deadlines, so this
+   * value does NOT bound how long the microstep takes in total. Read it as "no
+   * single callback may hang longer than this", not "an event settles within
+   * this".
+   *
+   * On expiry the call rejects with `StateMachineError('Transition timeout')`
+   * carrying `phase: 'action'`. The action is NOT cancelled — it keeps running
+   * and its side effects still land, after the machine has already unwound.
+   * What the consumer observes depends on which hook expired:
+   *  - a GUARD → the transition is merely disabled; `fireEvent` resolves
+   *    `false` and nothing is thrown;
+   *  - `onEnter` with {@link StateMachineOptions.errorState} → the machine
+   *    commits the error state;
+   *  - `onExit` with {@link StateMachineOptions.abortOnExitError} → the
+   *    microstep aborts back to the source state;
+   *  - an `invoke` action → the invoke's `event` is NOT raised and the machine
+   *    stays put, but the expiry is reported on `monitor.recordError` and the
+   *    config-level `onError` (nothing is thrown — the timer callback has no
+   *    caller to catch it). An `invoke` action that THROWS reports identically,
+   *    so an expiry is simply one more way that action failed;
+   *  - otherwise the error propagates out of `fireEvent` and the machine stays
+   *    in the source state.
+   *
+   * The deadline timer is cancelled as soon as the race settles — on the
+   * default scheduler as well as an injected one — so a fast action leaves no
+   * pending timer behind it.
+   *
+   * See the README "Action timeouts" section for the worked example.
    */
   transitionTimeout?: number
   /**

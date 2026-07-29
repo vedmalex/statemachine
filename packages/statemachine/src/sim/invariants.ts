@@ -413,10 +413,27 @@ const I3: Invariant = {
     //    a future deadline (liveness' jurisdiction), not a wedged flag. Before U1 it
     //    fired on ANY pending work + a timer, so excluding it risked a false-negative;
     //    now the inFlight>0 guarantee makes the exclusion SOUND.
+    //  - BOTH BUDGET REASONS — `budget-progressing` AND `microtask-budget`. A budget
+    //    exhaustion is a TRUNCATED observation, and a truncated observation cannot
+    //    convict. The frozen `maxTurns`-turn prefix left by an `onEnter` hook that
+    //    finishes at turn 2000 is byte-identical to the prefix left by a hook that
+    //    never finishes: enter/exit hooks are deliberately NOT counted in
+    //    `inFlightAsyncCount` (driver.ts), so while one runs all three fingerprint
+    //    components are frozen with no timer armed. `microtask-budget` used to be an
+    //    I-3 witness and convicted exactly such a CORRECT machine — reproduced with
+    //    `s0 -E-> h1 -(invoke delay:0)-> slow`, `slow.onEnter = async () => { for
+    //    (let i=0;i<1000;i++) await Promise.resolve() }`, which reaches `slow`
+    //    every time yet failed I-3 at N>=1000 and passed at N<=100. The deciding
+    //    variable was `DEFAULT_MAX_TURNS`, an internal harness constant — never the
+    //    machine. Both reasons are now surfaced as WARNINGS (public.ts) instead.
     // STILL flagged as I-3 witnesses:
     //  - WAITING_ON_INTERNAL (U1): pending queue/processing with NO tracked in-flight
-    //    async + a timer — a wedged processing-flag / undrained internal queue.
-    //  - microtask-budget: a livelock the run could not drain.
+    //    async + a timer — a wedged processing-flag / undrained internal queue. This
+    //    is where I-3's teeth now rest, and it is a POSITIVE observation rather than
+    //    a truncation: the pump reached it at its EARLY break (exit (b): a stable
+    //    fingerprint for QUIET_FLUSH turns WHILE a future timer is armed), inside
+    //    budget, so the "nothing is moving" reading is something the harness
+    //    observed rather than something it ran out of time to disprove.
     //  - a resolve-true boundary with NO settleReason at all (should have settled).
     // ISS-030 — CLOSED in W8/V8, which is what promoted I-3 into the DEFAULT builtin
     // set (public.ts). The residual was: `bracketAsync` wraps only FUNCTION-VALUED
@@ -436,14 +453,10 @@ const I3: Invariant = {
     const legitimateWait =
       frame.settleReason === 'WAITING_ON_TIMER' ||
       frame.settleReason === 'WAITING_ON_TRANSITION_TIMEOUT' ||
-      // W9/Г2: the pump budget ran out while the machine WAS making observable
-      // progress (a long legal delay-0 invoke chain — ~40 hops exhaust the default
-      // 1024 turns, since each hop costs QUIET_FLUSH stabilisation turns). That is
-      // the HARNESS giving up, not a run-to-completion break: the machine reaches
-      // its final state when given a bigger budget. Reported as a liveness/budget
-      // concern instead. `microtask-budget` — exhaustion with NOTHING moving —
-      // REMAINS an I-3 witness.
-      frame.settleReason === 'budget-progressing'
+      // Both budget exhaustions: the HARNESS stopped watching. Neither says
+      // anything about the machine — see the truncation note above.
+      frame.settleReason === 'budget-progressing' ||
+      frame.settleReason === 'microtask-budget'
     if (
       frame.fireOutcome === 'resolve-true' &&
       frame.quiescent === false &&
@@ -662,7 +675,8 @@ const I4: Invariant = {
  *
  * That is no longer true. The recovery path now calls
  * `this.checkCompletion(obj, currentState, errorConfig)`
- * (state_machine.ts:4587), pinned by `src/tests/error_state_join.test.ts`.
+ * from the `kind:'error-state'` branch of `state_machine.ts` (~:4651), pinned by
+ * `src/tests/error_state_join.test.ts`.
  * Completion is a property of the COMMITTED configuration, not of how it was
  * reached; `checkCompletion` is edge-triggered, so a configuration that was already
  * done is not re-raised, and the recovery is still reported as a recovery
@@ -708,7 +722,8 @@ const I5: Invariant = {
     // 'post-restore' (the engine deliberately does not re-fire the join),
     // 'corrupt-state' (the probe writes the configuration past checkCompletion)
     // and 'errorState-fallback' — HISTORICAL: the recovery path DOES run
-    // checkCompletion now (state_machine.ts:4587, W9), so this tag no longer names
+    // checkCompletion now (the `kind:'error-state'` branch of state_machine.ts,
+    // ~:4651, W9), so this tag no longer names
     // a real gap; it has no producer and is kept only so the exclusion exists
     // before any future harness that emits it (see the CLOSED RESIDUAL note above).
     // The first two produce a done configuration the engine was never asked to signal.

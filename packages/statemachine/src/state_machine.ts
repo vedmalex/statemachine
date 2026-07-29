@@ -18,6 +18,7 @@ import {
   type ErrorHandlerOrString,
   type Event,
   type EventAction,
+  type EventName,
   type Events,
   type ExitContext,
   type FireResult,
@@ -2816,6 +2817,13 @@ export class StateMachine<
    *  - a bare string — a method-name reference; returned verbatim. A
    *    code-looking string is NOT compiled; it is simply an action name that
    *    fails to resolve and throws at call time.
+   *  - ANY OTHER object shape (W8/V6b) — not a reference this library can emit,
+   *    so the payload is hand-written or forged. It is passed through untouched
+   *    (unchanged behaviour) but is no longer SILENT: it `warn`s on
+   *    {@link securityLogger} (or, under `strictActions`, THROWS). Left
+   *    unsignalled it fails only at call time, and for a guard that failure is
+   *    absorbed into "transition disabled" — a forged `{ source: '…' }` guard
+   *    otherwise makes an event no-op with no error anywhere.
    */
   private static deserializeAction(
     action: any,
@@ -2922,7 +2930,39 @@ export class StateMachine<
         return fn
       }
 
-      // Any other object shape passes through untouched.
+      // W8/V6b — UNRECOGNIZED OBJECT SHAPE. {@link serializeActionRef} emits
+      // ONLY `{type:'string',name}`, `{type:'function',name,slot?}` or
+      // `undefined`, so no round-trip of a machine this library serialized can
+      // land here: reaching this branch means the payload was hand-written,
+      // forged, or written by a foreign producer.
+      //
+      // The object is then installed VERBATIM into the action slot and nothing
+      // downstream rejects it. `callAction` cannot resolve a non-string,
+      // non-function action and throws 'No action found' at FIRE time — far
+      // from the payload that caused it. For a GUARD that throw is absorbed by
+      // the guard-error path (SPEC §7): the transition is merely DISABLED, so a
+      // forged `{ source: '…' }` guard makes `fireEvent` return `false` forever
+      // with nothing thrown. Empirically confirmed: a `{source,name}` guard is
+      // installed as-is and its event silently no-ops.
+      //
+      // Signal it HERE, at the payload, instead of leaving the slot silent.
+      // Policy matches the sibling unresolvable-identity branches above: warn by
+      // default, THROW under `strictActions`.
+      if (strict) {
+        throw new StateMachineError(
+          `Refusing to restore an unrecognized serialized action shape (keys: ${
+            Object.keys(action).join(', ') || '<none>'
+          }) under strictActions: expected { type: 'string', name } or { type: 'function', name, slot? }. ` +
+            'An unrecognized object is installed verbatim and fails only at call time — as a guard it silently disables the transition.',
+          {},
+        )
+      }
+      securityLogger.warn(
+        'Unrecognized serialized action shape; this library never emits it (expected { type: \'string\', name } or { type: \'function\', name, slot? }). ' +
+          'The value is passed through untouched and will fail to resolve at call time — as a guard it silently disables the transition rather than throwing. ' +
+          'Re-serialize the machine with toJSON(), or drop the slot from the payload.',
+        { keys: Object.keys(action) },
+      )
       return action
     }
 
@@ -3955,12 +3995,25 @@ export class StateMachine<
         }))
         timeoutHandle = this.setTimer(fire, timeoutMs)
       })
-      if (this.schedulerProvided) {
-        return Promise.race([executeAction(), timeoutPromise]).finally(() => {
-          this.clearTimer(timeoutHandle)
-        })
-      }
-      return Promise.race([executeAction(), timeoutPromise])
+      // The deadline handle is disposed on EVERY outcome and on EVERY scheduler.
+      // The cleanup used to be attached only when a scheduler was injected, so
+      // with the DEFAULT scheduler a winning (fast) action left a real
+      // `setTimeout` pending for the whole `transitionTimeout` on every single
+      // action call — and a pending Node timer keeps the event loop alive, so a
+      // process that had finished its work could hang for up to one
+      // `transitionTimeout` per outstanding handle.
+      //
+      // Calling `clearTimer` on the default path is safe: the default scheduler
+      // is never `start()`-ed by the machine, so `isActive()` is permanently
+      // false and `setTimer`/`clearTimer` degrade to a plain
+      // `setTimeout`/`clearTimeout` pair. `timeoutHandle` is a local assigned
+      // synchronously by the executor above, is never published anywhere else,
+      // and `finally` runs exactly once — so this can neither double-clear nor
+      // clear a foreign handle. When the TIMEOUT wins, the handle has already
+      // fired and `clearTimeout` is a harmless no-op.
+      return Promise.race([executeAction(), timeoutPromise]).finally(() => {
+        this.clearTimer(timeoutHandle)
+      })
     }
 
     return executeAction()
@@ -4994,6 +5047,7 @@ export class StateMachine<
               { state: toStateName, event: timer.event },
               err as Error,
             )
+            this.reportInvokeTimerFailure(err, toStateName, timer.event, obj)
           }
         }
       }
@@ -5277,6 +5331,53 @@ export class StateMachine<
     this.reportRuntimeError(
       errObj,
       { state: stateName, action: op.id ?? 'invoke', phase: 'action' },
+      obj as unknown as Adapter<PropertiesOf<TOwner>>,
+    )
+  }
+
+  /**
+   * Route a TIMER-form ({@link InvokeTimer}) invocation failure onto the same
+   * observable channels the OPERATION form already uses
+   * ({@link handleInvokeRejection}): `monitor.recordError` and the config-level
+   * `onError`, via {@link reportRuntimeError}.
+   *
+   * WHY this shape:
+   *  - A timer-form invoke action can fail in exactly two ways — it THROWS, or
+   *    it blows its `transitionTimeout` — and both land in the same `catch`.
+   *    They are two failure modes of one action and must not report
+   *    differently, so both take this route. Previously BOTH were swallowed
+   *    into a bare `logger.error` (and, on the resume path, into nothing at
+   *    all): the invoke's `event` was never raised, the machine simply stopped,
+   *    and no error handler ever ran — a failure invisible on every channel a
+   *    consumer can subscribe to.
+   *  - No NEW error surface is introduced. `reportRuntimeError` is the existing
+   *    route for exactly this situation (a failure raised from a floating
+   *    timer/drain callback with no caller to catch it) and it already carries
+   *    the П2 dedup, the `onError` best-effort contract and the silent-hole
+   *    floor. `InvokeTimer` deliberately gains no `onError` field — the
+   *    operation form is the arm that owns event-shaped error routing.
+   *  - It never throws. The timer callback runs detached from any caller, so
+   *    rethrowing here would surface as an `unhandledRejection`;
+   *    `reportRuntimeError` is documented never to throw.
+   *  - Non-cancellation is untouched: a timed-out action keeps running and its
+   *    side effects still land (SPEC §11). What changes is only that the
+   *    failure is now REPORTED. The invoke's `event` still is not raised — the
+   *    action did not succeed, and raising it would fabricate a completion.
+   */
+  private reportInvokeTimerFailure(
+    err: unknown,
+    stateName: string,
+    event: EventName | undefined,
+    obj?: Adapter<TOwner>,
+  ): void {
+    const errObj = err instanceof Error ? err : new Error(String(err))
+    this.reportRuntimeError(
+      errObj,
+      {
+        state: stateName,
+        action: event !== undefined ? `invoke:${String(event)}` : 'invoke',
+        phase: 'action',
+      },
       obj as unknown as Adapter<PropertiesOf<TOwner>>,
     )
   }
@@ -5618,8 +5719,21 @@ export class StateMachine<
                 })
                 this.scheduleProcessing()
               }
-            } catch (_err) {
-              /* log */
+            } catch (err) {
+              // Parity with the fresh-entry timer lane above: a RESUMED timer
+              // whose action throws or blows its `transitionTimeout` used to be
+              // swallowed here without so much as a log line.
+              this.logger.error(
+                'Invocation error',
+                { state: stateName, event: invocation.event },
+                err as Error,
+              )
+              this.reportInvokeTimerFailure(
+                err,
+                stateName,
+                invocation.event,
+                this.adaptee as Adapter<TOwner> | undefined,
+              )
             }
           }
         }

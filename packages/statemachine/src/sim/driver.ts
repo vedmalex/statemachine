@@ -30,7 +30,7 @@
  * (the typical case: a verdict object meaningful relative to the current state)
  * therefore reaches the machine's guard/action callbacks, which is the only way
  * arg-dependent transition branches get covered. This is SAFE with respect to the
- * `isAdapter` duck-check (`'set' in inp && 'get' in inp`, types.ts:301-303)
+ * `isAdapter` duck-check (`'set' in inp && 'get' in inp`, types.ts `isAdapter`, ~:725-726)
  * BECAUSE the driver always passes the wrapped Adapter EXPLICITLY as the 2nd
  * positional arg: payload values start at position 3 and `state_machine.ts`
  * :469-471 only inspects position 2. Never call `sm.fireEvent(event, ...args)`
@@ -109,6 +109,16 @@ export interface DriverConfig<T extends object> {
   readonly abortOnExitError?: boolean
   /** Forwarded to `StateMachineOptions.maxQueueDepth` (types.ts:146). */
   readonly maxQueueDepth?: number
+  /**
+   * Per-macrostep microtask-pump budget, forwarded to EVERY {@link settleMacrostep}
+   * this driver makes (init, pre-fire, post-fire, batch). Defaults to
+   * {@link DEFAULT_MAX_TURNS} = 1024.
+   *
+   * This is the knob the budget warnings' advice presupposes: raising it is what
+   * separates a hook doing a lot of finite internal work from a genuine wedge,
+   * because the two are indistinguishable over any FIXED window.
+   */
+  readonly maxTurns?: number
   /**
    * INTERNAL (not a public-ABI field): the resolved {@link FaultPlan} to apply
    * DURING this run. When present the driver routes external fires through the
@@ -350,10 +360,19 @@ export class SimDriver<T extends object> {
       // observably moving no longer hashes as `'microtask-budget'`. Any trace of a
       // machine long enough to exhaust the pump budget therefore hashes DIFFERENTLY
       // than it did under '4'.
+      // '6' POPULATES the hashed `settleReason` field on TWO paths that always
+      // dropped it: the mandatory post-construction drain (frame 0 and every
+      // during-drain init frame recorded `quiescent` but no reason, so a machine
+      // that wedged during CONSTRUCTION was completely silent) and the step's
+      // PRE-fire drain (whose result was discarded outright, so a budget
+      // exhaustion the following fire happened to clear left no trace). Any trace
+      // of a machine that is non-quiescent on either path therefore hashes
+      // DIFFERENTLY than it did under '5'.
       // Per the trace.ts version contract ("bump on closed-union/hashed-field
       // change") each of these is corpus-breaking and the schema version advances.
-      // MUST stay in lockstep with public.ts `emptyHeader`.
-      version: '5',
+      // MUST stay in lockstep with public.ts `emptyHeader` — pinned by
+      // `src/tests/sim/budget_truncation.test.ts` (the two constants are equal).
+      version: '6',
       runtime: cfg.runtime,
       prngVersion: 'splitmix64-bigint-v1',
       errorHandlerEnabled: true,
@@ -421,6 +440,30 @@ export class SimDriver<T extends object> {
     return { ...config, states: nextStates as StateMachineConfig<T>['states'] }
   }
 
+  /**
+   * The invariant part of every {@link settleMacrostep} this driver makes. Built
+   * in ONE place so a new settle site cannot silently drop the configured
+   * `maxTurns` (the budget knob must reach every drain, or raising it would fix
+   * only some of them).
+   */
+  private settleArgs(policy: SettlePolicy): {
+    sm: StateMachine<T, StateMachineConfig<T>>
+    scheduler: DriverConfig<T>['scheduler']
+    clock: SimClock
+    env: Env
+    policy: SettlePolicy
+    maxTurns?: number
+  } {
+    return {
+      sm: this.sm,
+      scheduler: this.cfg.scheduler,
+      clock: this.cfg.clock,
+      env: this.env,
+      policy,
+      ...(this.cfg.maxTurns !== undefined ? { maxTurns: this.cfg.maxTurns } : {}),
+    }
+  }
+
   /** Logical time. */
   get t(): number {
     return this.cfg.clock.now()
@@ -455,13 +498,7 @@ export class SimDriver<T extends object> {
     // at the start instant; a liveness jump here would skip past it and fire
     // armed timers before any op runs). A configured 'liveness' policy applies
     // only to step() drains.
-    const result = await settleMacrostep({
-      sm: this.sm,
-      scheduler: this.cfg.scheduler,
-      clock: this.cfg.clock,
-      env: this.env,
-      policy: 'safety',
-    })
+    const result = await settleMacrostep(this.settleArgs('safety'))
     const drainedWrites = this.sink.drain()
 
     // Frame 0: the init snapshot, recorded AFTER the drain. cause:'init',
@@ -477,6 +514,12 @@ export class SimDriver<T extends object> {
       to: this.initialNormalized,
       queue: this.queueSnapshot(),
       quiescent: result.quiescent,
+      // The init drain's REASON, on the same terms as every step boundary. It was
+      // dropped here until now, which made a machine that wedges during
+      // CONSTRUCTION completely silent: frame 0 stamped `quiescent:false` and no
+      // `settleReason`, so nothing downstream could say WHY. Populating a hashed
+      // field on the init path is corpus-breaking — see `header.version` '6'.
+      ...(result.reason ? { settleReason: result.reason } : {}),
       ...(initDone !== undefined ? { doneDelta: initDone } : {}),
     })
 
@@ -488,7 +531,10 @@ export class SimDriver<T extends object> {
     // is wired (deterministic per (seed, plan)).
     const jitterTag: FaultKind | undefined = this.recordPlanJitter() ? 'timer-jitter' : undefined
     for (const w of drainedWrites) {
-      this.frames.push(this.frameFromWrite('init', w, result.quiescent, undefined, undefined, jitterTag))
+      // The 7th arg (settleReason) was omitted here, so every during-drain init
+      // frame silently carried `undefined` while frame 0 recorded the quiescence
+      // boolean it belongs to. Pass it explicitly.
+      this.frames.push(this.frameFromWrite('init', w, result.quiescent, undefined, undefined, jitterTag, result.reason))
     }
     // If the jitter perturbed a timer but no writes landed during the construction
     // drain, the init snapshot frame still records the jitter tag so the applied
@@ -565,7 +611,7 @@ export class SimDriver<T extends object> {
     }
 
     // (b) settle BEFORE the fire (drain anything armed by the clock advance).
-    await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    const preFire = await settleMacrostep(this.settleArgs(policy))
     this.sink.drain() // pre-fire writes already framed in prior steps / init
 
     // (c) the op itself.
@@ -600,7 +646,7 @@ export class SimDriver<T extends object> {
     }
 
     // (d) settle AFTER the fire to a joint fixed point.
-    const result = await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    const result = await settleMacrostep(this.settleArgs(policy))
 
     // A throw fault that fired DURING this step's drain (e.g. an invoke-action
     // throw) stamps the channel tag 'throw' on this step's frames.
@@ -608,11 +654,18 @@ export class SimDriver<T extends object> {
       faultApplied = 'throw'
     }
 
+    /**
+     * The reason recorded for THIS step: the post-fire drain's when it has one,
+     * otherwise the pre-fire drain's (whose result was previously dropped on the
+     * floor). See the boundary frame below and TraceFrame.settleReason.
+     */
+    const settleReasonForStep: SettleReason | undefined = result.reason ?? preFire.reason
+
     // (e) per-transition frames via the Adapter seam DURING the drain.
     const writes = this.sink.drain()
     for (const w of writes) {
       this.frames.push(
-        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied, result.reason),
+        this.frameFromWrite(cause, w, result.quiescent, op.kind === 'fire' ? op.event : undefined, fireOutcome, faultApplied, settleReasonForStep),
       )
     }
 
@@ -640,7 +693,15 @@ export class SimDriver<T extends object> {
       ...(faultApplied ? { faultApplied } : {}),
       // C1: record WHY a non-quiescent boundary is non-quiescent so I-3 can exclude
       // a legitimate WAITING_ON_* (a concurrent region's own future timer).
-      ...(result.reason ? { settleReason: result.reason } : {}),
+      //
+      // FALLBACK to the PRE-fire drain's reason. That settle's result used to be
+      // discarded outright, so a step whose pre-fire drain exhausted its budget and
+      // whose post-fire drain then converged recorded NOTHING — the advisory budget
+      // warnings under-counted, and a wedge cleared by the very next fire was
+      // invisible. The post-fire reason always wins when present, so this only ever
+      // fills a slot that would otherwise be empty. See TraceFrame.settleReason for
+      // why `quiescent:true` alongside a reason is well-defined here.
+      ...(settleReasonForStep !== undefined ? { settleReason: settleReasonForStep } : {}),
       ...(doneDelta !== undefined ? { doneDelta } : {}),
     }
     this.frames.push(boundaryFrame)
@@ -878,7 +939,7 @@ export class SimDriver<T extends object> {
       results.push(await fireBuffered(this.boundFireEvent(), this.wrapped, e))
     }
     const policy = this.cfg.policy ?? 'safety'
-    await settleMacrostep({ sm: this.sm, scheduler: this.cfg.scheduler, clock: this.cfg.clock, env: this.env, policy })
+    await settleMacrostep(this.settleArgs(policy))
     return results
   }
 

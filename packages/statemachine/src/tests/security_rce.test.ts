@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { securityLogger } from '../logger'
 import { StateMachine } from '../state_machine'
 import { MemoryAdapter } from '../types'
 
@@ -235,5 +236,146 @@ describe('W0 RCE — string function bodies must not be executed on deserializat
     expect(() =>
       StateMachine.fromJSON<Owner, any>(JSON.stringify(cfg), owner, { actions: {} }),
     ).toThrow(/not present in the provided function registry/)
+  })
+})
+
+/**
+ * W8/V6b — the UNRECOGNIZED-SHAPE fallback in `deserializeAction` must not be
+ * silent.
+ *
+ * `serializeActionRef` emits exactly three things: `{type:'string',name}`,
+ * `{type:'function',name,slot?}`, or `undefined`. Any OTHER object in an action
+ * slot is therefore hand-written or forged — yet it used to fall through the
+ * `// Any other object shape passes through untouched` branch with no signal at
+ * all, and be installed VERBATIM into the slot.
+ *
+ * Consequence pinned below: `callAction` cannot resolve a non-string,
+ * non-function action, so it throws 'No action found' at FIRE time. For a GUARD
+ * that throw is absorbed by the guard-error path — the transition is merely
+ * DISABLED, so a forged `{ source: '…' }` guard makes `fireEvent` return `false`
+ * forever with nothing thrown anywhere.
+ *
+ * The fix ADDS A SIGNAL ONLY: pass-through behaviour is unchanged under the
+ * default policy (warn), and — matching the sibling unresolvable-identity
+ * branches — it THROWS under `strictActions`.
+ */
+describe('W8/V6b — unrecognized serialized action shape is signalled, not silent', () => {
+  /** A machine whose only guard is the supplied (forged) payload. */
+  const forgedGuardConfig = (guard: unknown) =>
+    JSON.stringify({
+      config: {
+        name: 'ForgedShapeSM',
+        initialState: 'a',
+        stateAttribute: 'state',
+        states: { a: {}, b: {} },
+        events: { go: { transitions: [{ from: 'a', to: 'b', guard }] } },
+      },
+      currentState: 'a',
+      historyMap: [],
+      stateEntryTimes: [],
+    })
+
+  let warnSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(securityLogger, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    warnSpy.mockRestore()
+  })
+
+  it('warns on a forged `source`-bearing guard object, and the transition silently no-ops', async () => {
+    const owner = new MemoryAdapter<Owner>({ state: '', event: () => null })
+    const sm = StateMachine.fromJSON<Owner, any>(
+      // A plausible-looking payload from a foreign writer: a `source` body and a
+      // label, but none of the discriminators this library emits.
+      forgedGuardConfig({ source: '() => true', name: 'isAdmin' }),
+      owner,
+      { actions: {} },
+    )
+
+    // (1) THE SIGNAL — RED before the fix: zero securityLogger.warn calls.
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    const [message, context] = warnSpy.mock.calls[0] as [string, any]
+    expect(message).toMatch(/[Uu]nrecognized serialized action shape/)
+    // The register of the neighbouring warnings: name the risk and the remedy.
+    expect(message).toMatch(/guard/)
+    expect(message).toMatch(/toJSON|drop the slot/)
+    expect(context).toEqual({ keys: ['source', 'name'] })
+
+    // (2) BEHAVIOUR IS UNCHANGED — the object still passes through, and the
+    // consequence the warning describes is real: the event silently no-ops.
+    await expect(sm.fireEvent('go')).resolves.toBe(false)
+    expect(sm.currentState).toBe('a')
+  })
+
+  it('warns on a typeless / bogus-type object in an action slot', async () => {
+    for (const forged of [{}, { type: 'arrow', name: 'x' }, { name: 'onEnter' }]) {
+      warnSpy.mockClear()
+      const owner = new MemoryAdapter<Owner>({ state: '', event: () => null })
+      StateMachine.fromJSON<Owner, any>(forgedGuardConfig(forged), owner, {
+        actions: {},
+      })
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      expect(warnSpy.mock.calls[0]?.[0]).toMatch(/[Uu]nrecognized serialized action shape/)
+    }
+  })
+
+  it('THROWS instead of warning under strictActions (sibling-branch policy)', () => {
+    const owner = new MemoryAdapter<Owner>({ state: '', event: () => null })
+    expect(() =>
+      StateMachine.fromJSON<Owner, any>(
+        forgedGuardConfig({ source: '() => true', name: 'isAdmin' }),
+        owner,
+        { actions: {}, strictActions: true },
+      ),
+    ).toThrow(/[Uu]nrecognized serialized action shape/)
+    expect(warnSpy).not.toHaveBeenCalled()
+  })
+
+  it('a LEGITIMATE toJSON round-trip stays completely silent (no false alarm)', async () => {
+    // Every shape a real round-trip can carry: a function state hook (→
+    // {type:'function',name,slot}), a function event hook (→ {type:'function',
+    // name}), a function guard, and a STRING method reference.
+    const onEnterB = () => {}
+    const source = new StateMachine<any, any>(
+      {
+        name: 'Legit',
+        initialState: 'a',
+        stateAttribute: 'state',
+        states: { a: {}, b: { onEnter: onEnterB } },
+        events: {
+          go: {
+            onBefore: () => {},
+            transitions: [
+              { from: 'a', to: 'b', guard: () => true, onTransition: 'someMethod' },
+            ],
+          },
+        },
+      } as any,
+      new MemoryAdapter<Owner>({ state: '', event: () => null }),
+    )
+    const json = source.toJSON()
+    // Guard the premise: the serializer really did emit only the two known
+    // discriminators (plus the bare string) — otherwise the silence below is
+    // vacuous.
+    expect(json).toMatch(/"type":"function"/)
+    expect(json).not.toMatch(/"source"/)
+
+    warnSpy.mockClear()
+    StateMachine.fromJSON<Owner, any>(
+      json,
+      new MemoryAdapter<Owner>({ state: '', event: () => null }),
+      {
+        actions: {
+          onEnter: onEnterB,
+          'b.onEnter': onEnterB,
+          onBefore: () => {},
+          guard: () => true,
+        },
+      },
+    )
+    expect(warnSpy).not.toHaveBeenCalled()
   })
 })

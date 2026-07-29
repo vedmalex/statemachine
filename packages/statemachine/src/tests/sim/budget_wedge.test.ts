@@ -12,6 +12,21 @@
  * `onEnter` that returns a never-resolving promise, which holds
  * `isProcessingEvents() === true` with a frozen fingerprint for the rest of the
  * budget.
+ *
+ * ## SUPERSEDED IN PART — the classification survived, the CONVICTION did not
+ * The recency discriminator this file pins is still live and still correct: a
+ * machine that hops once and then freezes is classified `microtask-budget`, not
+ * `budget-progressing`. What changed is what the harness is allowed to DO with
+ * that classification. Nothing — it is advisory.
+ *
+ * The reason is that this file's own `wedgeAfterProgress` fixture is not
+ * distinguishable, by the harness, from a CORRECT machine. Its observable
+ * signature is "the settle fingerprint stopped moving and the budget ran out",
+ * and `budget_truncation.test.ts` holds a machine that produces exactly that
+ * signature and reaches its target state every time. Convicting one convicts the
+ * other. The two cases below that asserted a VERDICT (I-3, and the liveness
+ * TIMEOUT_BUDGET_EXCEEDED) are therefore changed by design; each carries its own
+ * justification at the case.
  */
 import { describe, expect, it } from 'vitest'
 import { MemoryAdapter, type StateMachineConfig, StateMachine } from '../../index'
@@ -87,10 +102,45 @@ describe('W9 remediation — a machine that progresses then WEDGES is still an R
     expect(reasons.has('budget-progressing')).toBe(false)
   })
 
-  it('I-3 fires on the wedged tail (the verdict is NOT silently ok)', async () => {
+  /**
+   * CHANGED BY DESIGN — this used to assert `ok:false` with `violation:'I-3'`.
+   *
+   * The `wedgeAfterProgress` fixture above really is wedged: its `onEnter`
+   * returns a promise that never resolves. But the HARNESS cannot know that. It
+   * observes a frozen fingerprint for the remainder of a FIXED turn budget, and
+   * that observation is byte-identical to the one produced by a hook that does a
+   * large but FINITE amount of internal microtask work and then returns —
+   * enter/exit hooks are deliberately excluded from `inFlightAsyncCount`
+   * (driver.ts), so all three fingerprint components freeze either way and no
+   * timer is armed to break the tie.
+   *
+   * That is not hypothetical. `budget_truncation.test.ts` holds the CORRECT
+   * machine this rule convicted: identical topology, `slow.onEnter = async () =>
+   * { for (let i=0;i<N;i++) await Promise.resolve() }`. It reaches `slow` for
+   * every N, yet the old rule passed it at N<=100 and failed it at N>=1000. The
+   * deciding variable was `DEFAULT_MAX_TURNS`, an internal harness constant no
+   * public option could raise — never anything about the machine.
+   *
+   * So the old expectation pinned a rule that could not distinguish this fixture
+   * from a correct machine, and a false positive on a correct machine is worse
+   * than a missed finding. `microtask-budget` is now an advisory WARNING; the
+   * classification below still names the wedged reading, and the RTC oracle's
+   * teeth moved to `WAITING_ON_INTERNAL`, which is reached at the pump's EARLY
+   * break (inside budget) and is therefore a positive observation rather than a
+   * truncation. This case now pins that the wedge is REPORTED but not CONVICTED.
+   */
+  it('does NOT convict: the wedged tail is reported as a warning, not a verdict', async () => {
     const r = await runWedge('safety')
-    expect(r.ok).toBe(false)
-    expect((r as { violation?: { invariantId?: string } }).violation?.invariantId).toBe('I-3')
+    expect(r.ok).toBe(true)
+    expect((r as { violation?: { invariantId?: string } }).violation).toBeUndefined()
+    // Reported, though — silence would be the other failure mode.
+    const w = (r.warnings ?? []).filter((x) => x.kind === 'budget-frozen')
+    expect(w.length).toBe(1)
+    expect(w[0]?.count).toBeGreaterThan(0)
+    // The message must say the harness cannot tell the two readings apart, and
+    // must name the knob that separates them.
+    expect(w[0]?.message).toMatch(/CANNOT tell/)
+    expect(w[0]?.message).toMatch(/maxTurns/)
   })
 })
 
@@ -145,11 +195,13 @@ describe('W9 remediation — the correct 40-hop chain is unaffected and is SURFA
     const r = await runChain(40)
     const w = (r.warnings ?? []).filter((x) => x.kind === 'budget-progressing')
     expect(w.length).toBe(1)
-    // The advice must name a knob that EXISTS: `maxTurns` is internal to
-    // settleMacrostep and reachable from no public option, so the message points
-    // at `steps` (the drain resumes on the next step) — see the probe in the
-    // report: a 200-hop chain reaches h36/h108/h180/h200 at steps 1/2/3/6.
+    // The advice must name knobs that EXIST. `steps` (the drain resumes on the
+    // next step) — see the probe in the report: a 200-hop chain reaches
+    // h36/h108/h180/h200 at steps 1/2/3/6. And `maxTurns`, which used to be
+    // internal to settleMacrostep and reachable from no public option, and is
+    // now on both `SimOptions` and `CheckOptions`.
     expect(w[0]?.message).toMatch(/`steps`/)
+    expect(w[0]?.message).toMatch(/maxTurns/)
     expect(w[0]?.count).toBeGreaterThan(0)
   })
 
@@ -159,9 +211,9 @@ describe('W9 remediation — the correct 40-hop chain is unaffected and is SURFA
   })
 })
 
-// ── (4) the liveness wiring: only `microtask-budget` may feed the verdict ────
+// ── (4) the liveness wiring: NEITHER budget reason may feed the verdict ──────
 
-describe('W9 remediation — liveness is fed by `microtask-budget` ONLY', () => {
+describe('the settle budget feeds NO liveness verdict, in either flavour', () => {
   it('`budget-progressing` does NOT produce a TIMEOUT_BUDGET_EXCEEDED verdict', async () => {
     const r = await runChain(40, 'liveness')
     expect(settleReasons(r).has('budget-progressing')).toBe(true)
@@ -169,11 +221,26 @@ describe('W9 remediation — liveness is fed by `microtask-budget` ONLY', () => 
     expect(r.liveness?.verdict).not.toBe('TIMEOUT_BUDGET_EXCEEDED')
   })
 
-  it('`microtask-budget` DOES produce a TIMEOUT_BUDGET_EXCEEDED verdict', async () => {
+  /**
+   * CHANGED BY DESIGN — this used to assert that `microtask-budget` DOES produce
+   * TIMEOUT_BUDGET_EXCEEDED and `ok:false`.
+   *
+   * `LivenessParams.microtaskBudgetExhausted` and its producer in `public.ts` are
+   * both gone. TIMEOUT_BUDGET_EXCEEDED is a HARD `livelock` cause that `failOn`
+   * cannot relax, and it was being derived from a budget-TRUNCATED window — an
+   * observation that cannot distinguish a wedge from a hook doing finite internal
+   * work (see the case in section (1) and `budget_truncation.test.ts`). The
+   * remaining producer of that verdict is the VIRTUAL-TIME budget, which only
+   * advances when the machine actually armed the deadlines that moved it, so it
+   * is a positive observation rather than a truncation.
+   */
+  it('`microtask-budget` produces NO verdict either — only a warning', async () => {
     const r = await runWedge('liveness')
     expect(settleReasons(r).has('microtask-budget')).toBe(true)
-    expect(r.liveness?.verdict).toBe('TIMEOUT_BUDGET_EXCEEDED')
-    expect(r.liveness?.reason).toBe('macrostep microtask-budget exhausted')
-    expect(r.ok).toBe(false)
+    expect(r.liveness?.verdict).not.toBe('TIMEOUT_BUDGET_EXCEEDED')
+    expect(r.liveness?.reason).not.toBe('macrostep microtask-budget exhausted')
+    expect(r.livelocks).toBeUndefined()
+    expect(r.ok).toBe(true)
+    expect((r.warnings ?? []).some((x) => x.kind === 'budget-frozen')).toBe(true)
   })
 })

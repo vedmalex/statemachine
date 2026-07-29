@@ -139,6 +139,26 @@ the object or an `Adapter` for it.
 
 `fireEvent` itself is unchanged.
 
+## Action timeouts (`transitionTimeout`)
+
+`StateMachineOptions.transitionTimeout` is a **per-action** budget, not a per-transition or per-microstep one. Every individual action call races its own deadline: guards, `onBefore` / `onAfter`, the `onExit` / `onEnter` state hooks, `onTransition`, and `invoke` actions.
+
+**The consequence to budget for.** One event fires one transition **per region** in a single microstep (see [Hierarchical regions, parallel states & join](#hierarchical-regions-parallel-states--join)), and each of those transitions runs its own hook chain. A microstep of N transitions × K hooks therefore gets N×K *separate* deadlines, and `transitionTimeout` does **not** bound the microstep's total duration — three regions running three 40 ms hooks each complete in ~370 ms under a 100 ms `transitionTimeout`. Read the option as "no single callback may hang longer than this", never as "an event settles within this".
+
+On expiry the call rejects with `StateMachineError('Transition timeout')` (`context.phase === 'action'`). The timed-out action is **not** cancelled — it runs to completion and its side effects still land, after the machine has already unwound. What you observe depends on which hook expired:
+
+| expired hook | observable outcome |
+| --- | --- |
+| `guard` | transition disabled; `fireEvent` resolves `false`, nothing thrown |
+| `onEnter`, with `errorState` set | machine commits `errorState`; `fireEvent` resolves `false` |
+| `onExit`, with `abortOnExitError` set | microstep aborts back to the source state; `fireEvent` resolves `false` |
+| `invoke` action | the invoke's `event` is **not** raised and the machine stays put, but the expiry is reported: `monitor.recordError` and the config-level `onError` both receive the `StateMachineError` (`context.phase === 'action'`). Nothing is thrown — the invoke timer callback has no caller to catch it |
+| anything else (`onBefore`, `onTransition`, `onEnter` / `onExit` without the options above) | the error propagates out of `fireEvent`; the machine stays in the source state |
+
+An `invoke` action that **throws** is reported through those same two channels, so an expiry and a throw of the same action are indistinguishable to an error sink — an expiry is just one more way the action failed. (Long-running `invoke` operations — the `src` / `onError` form — keep their own routing: a declared `onError` event wins, and only without one does the rejection fall through to `recordError`.)
+
+The deadline timer is cancelled as soon as the race settles, on the default scheduler as well as an injected one (see [Deterministic testing](#deterministic-testing-dst)), so a fast action leaves nothing pending behind it.
+
 ## Documentation
 
 Full API documentation: [https://vedmalex.github.io/statemachine/](https://vedmalex.github.io/statemachine/)
@@ -202,7 +222,7 @@ scheduler2.process()               // the invoke fires here, not at t=1400
 
 ### transitionTimeout under virtual time
 
-The `transitionTimeout` deadline is also routed through the injected scheduler, so it triggers on a virtual-time advance rather than a real timer:
+Each per-action `transitionTimeout` deadline (see [Action timeouts](#action-timeouts-transitiontimeout) for the scope of the budget) is also routed through the injected scheduler, so it triggers on a virtual-time advance rather than a real timer:
 
 ```ts
 const sm = new StateMachine(config, adapter, { clock, scheduler, transitionTimeout: 500 })

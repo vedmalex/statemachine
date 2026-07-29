@@ -189,6 +189,7 @@ export interface CheckOptions<T extends object> {
     readonly failOn?: readonly FailCause[];
     // (undocumented)
     readonly invariants?: readonly MachineInvariant<T>[];
+    readonly maxTurns?: number;
     // (undocumented)
     readonly mode?: 'safety' | 'liveness' | 'both';
     // (undocumented)
@@ -433,6 +434,7 @@ export interface DriverConfig<T extends object> {
     // (undocumented)
     readonly logger: ILogger;
     readonly maxQueueDepth?: number;
+    readonly maxTurns?: number;
     // (undocumented)
     readonly monitor: SimMonitor;
     readonly onFrame?: (frame: TraceFrame) => void;
@@ -879,7 +881,6 @@ export interface LiteralCallback {
 // @public
 export interface LivenessParams {
     readonly budgetVirtualMs: number;
-    readonly microtaskBudgetExhausted?: boolean;
     readonly stateCount: number;
 }
 
@@ -1269,6 +1270,9 @@ export const PRNG_VERSION: "splitmix64-bigint-v1";
 export const PROGRESS_BLOCKING_FAULTS: ReadonlySet<FaultKind | 'corrupt-state'>;
 
 // @public
+export const PROGRESS_RECENCY_WINDOW: number;
+
+// @public
 export interface ProgressFingerprint {
     readonly config: string;
     // (undocumented)
@@ -1278,6 +1282,9 @@ export interface ProgressFingerprint {
     // (undocumented)
     readonly queueDepth: number;
 }
+
+// @public
+export function progressRecencyWindow(maxTurns: number): number;
 
 // @public
 export const PUBLIC_PACKAGE = "@vedmalex/statemachine";
@@ -1542,6 +1549,7 @@ export interface SimOptions {
     // (undocumented)
     readonly invariants?: readonly Invariant[];
     readonly maxQueueDepth?: number;
+    readonly maxTurns?: number;
     readonly mode?: 'safety' | 'liveness' | 'both';
     // (undocumented)
     readonly onTrace?: (frame: TraceFrame) => void;
@@ -1647,7 +1655,20 @@ export interface SimWarning {
     * run simply did not get to watch it finish. Emitted at most ONCE per run;
     * `count` carries how many boundaries hit it.
     */
-    | 'budget-progressing';
+    | 'budget-progressing'
+    /**
+    * The HARNESS ran out of per-macrostep turn budget and the machine had
+    * ALREADY stopped moving before it did (`settleReason:'microtask-budget'`).
+    *
+    * Advisory only, and for the same reason as its sibling: this is a TRUNCATED
+    * observation. A genuine wedge and a hook doing a large but finite amount of
+    * internal microtask work leave byte-identical prefixes — an awaited
+    * `onEnter`/`onExit` is not counted in `inFlightAsyncCount`, so while one runs
+    * the settle fingerprint is frozen either way. Raising `maxTurns` separates
+    * them: a finite hook eventually completes. Emitted at most ONCE per run;
+    * `count` carries how many boundaries hit it.
+    */
+    | 'budget-frozen';
     // (undocumented)
     readonly message: string;
 }
@@ -1976,10 +1997,23 @@ export type WarningKind = 'no-payload' | 'timer-escape' | 'dead-events-at-platea
 * still observably working (`settleReason:'budget-progressing'`). The machine
 * did nothing wrong — the run just stopped watching before it settled, so the
 * remainder of that macrostep went unchecked. The drain resumes on the next
-* step, so raise `steps` to give the machine more total budget to finish in.
+* step, so raise `steps` (or {@link CheckOptions.maxTurns}) to give the machine
+* more budget to finish in.
 * Advisory (never a {@link FailCause}, never flips `ok`).
 */
-| 'budget-progressing';
+| 'budget-progressing'
+/**
+* The harness exhausted its per-macrostep TURN budget and the machine had
+* ALREADY stopped moving before it did (`settleReason:'microtask-budget'`).
+*
+* Also advisory, and deliberately so: the observation is TRUNCATED. A genuine
+* wedge and an `onEnter`/`onExit` hook doing a large but finite amount of
+* internal work leave the same frozen prefix, because an awaited hook is not
+* counted as in-flight async. Raise {@link CheckOptions.maxTurns} to tell them
+* apart — a finite hook eventually completes.
+* Advisory (never a {@link FailCause}, never flips `ok`).
+*/
+| 'budget-frozen';
 
 // @public
 export function wire<T extends object>(env: SimEnv, config: StateMachineConfig<T>, owner: T | Adapter<T>): StateMachine<T, StateMachineConfig<T>>;

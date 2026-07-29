@@ -157,10 +157,23 @@ export type WarningKind =
    * still observably working (`settleReason:'budget-progressing'`). The machine
    * did nothing wrong — the run just stopped watching before it settled, so the
    * remainder of that macrostep went unchecked. The drain resumes on the next
-   * step, so raise `steps` to give the machine more total budget to finish in.
+   * step, so raise `steps` (or {@link CheckOptions.maxTurns}) to give the machine
+   * more budget to finish in.
    * Advisory (never a {@link FailCause}, never flips `ok`).
    */
   | 'budget-progressing'
+  /**
+   * The harness exhausted its per-macrostep TURN budget and the machine had
+   * ALREADY stopped moving before it did (`settleReason:'microtask-budget'`).
+   *
+   * Also advisory, and deliberately so: the observation is TRUNCATED. A genuine
+   * wedge and an `onEnter`/`onExit` hook doing a large but finite amount of
+   * internal work leave the same frozen prefix, because an awaited hook is not
+   * counted as in-flight async. Raise {@link CheckOptions.maxTurns} to tell them
+   * apart — a finite hook eventually completes.
+   * Advisory (never a {@link FailCause}, never flips `ok`).
+   */
+  | 'budget-frozen'
 
 /**
  * The owner source. A SINGLE live owner reused across N runs breaks run
@@ -176,6 +189,24 @@ export interface CheckOptions<T extends object> {
   readonly runs?: number
   readonly invariants?: readonly MachineInvariant<T>[]
   readonly mode?: 'safety' | 'liveness' | 'both'
+  /**
+   * The per-macrostep microtask-pump budget every settle of every run uses.
+   * **Default: 1024.**
+   *
+   * Each step ends by draining the machine to quiescence; the drain pumps
+   * microtasks until it converges or this budget runs out. Running out is never a
+   * failure — it is a TRUNCATED observation, surfaced as a `budget-progressing` or
+   * `budget-frozen` {@link CheckWarning} — and this is the knob those warnings
+   * point at. An `onEnter`/`onExit` hook doing a large but FINITE amount of
+   * internal microtask work freezes exactly the same observables as a wedged one
+   * (an awaited hook is not tracked as in-flight async), so no fixed window can
+   * tell them apart; raising the budget can, because a finite hook completes.
+   *
+   * Raise it when a report carries either budget warning and you need to know
+   * which reading is real. Cost is bounded by the value: one
+   * `await Promise.resolve()` per turn.
+   */
+  readonly maxTurns?: number
   /** Default: STRICT — every {@link FailCause}. */
   readonly failOn?: readonly FailCause[]
   /** Point-relax `degradation` by warning KIND instead of surrendering the class. */
@@ -740,6 +771,8 @@ interface RunOneCheckParams<T extends object> {
   readonly seed: string
   readonly steps: number
   readonly mode: 'safety' | 'liveness' | 'both'
+  /** The per-macrostep settle budget (CheckOptions.maxTurns); undefined ⇒ 1024. */
+  readonly maxTurns?: number
   readonly invariants: readonly MachineInvariant<T>[]
   readonly events: readonly CheckEventSpec<T>[]
   /**
@@ -790,7 +823,7 @@ interface RunOneCheckResult {
  * invariant should snapshot what it needs.
  */
 async function runOneCheck<T extends object>(params: RunOneCheckParams<T>): Promise<RunOneCheckResult> {
-  const { config, owner, seed, steps, mode, invariants, events, foldGuard, script } = params
+  const { config, owner, seed, steps, mode, maxTurns, invariants, events, foldGuard, script } = params
   const data = ownerData(owner)
 
   const userViolations: UserFinding[] = []
@@ -863,6 +896,7 @@ async function runOneCheck<T extends object>(params: RunOneCheckParams<T>): Prom
       steps,
       mode,
       onTrace,
+      ...(maxTurns !== undefined ? { maxTurns } : {}),
       ...(eventPayload !== undefined ? { eventPayload } : {}),
       ...(script !== undefined ? { script } : {}),
     },
@@ -970,7 +1004,7 @@ export async function checkMachine<T extends object>(
   // A consumer asserting `retries <= 3` was NOT told that the machine STARTED at
   // `retries === 5`. This closes that hole. See {@link checkInitialConfiguration}
   // for why it is a separate zero-step run and when it must abstain.
-  const initFindings = await checkInitialConfiguration(config, owner, userInvariants, canonicalSeed)
+  const initFindings = await checkInitialConfiguration(config, owner, userInvariants, canonicalSeed, options.maxTurns)
   for (const w of initFindings.warnings) {
     warnings.push(w)
   }
@@ -1000,6 +1034,7 @@ export async function checkMachine<T extends object>(
       seed,
       steps,
       mode,
+      ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
       invariants: userInvariants,
       events: eventSpecs,
       foldGuard: foldGuardRecord,
@@ -1108,6 +1143,7 @@ export async function checkMachine<T extends object>(
         target: shrinkTarget,
         steps,
         mode,
+        ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
         invariants: userInvariants,
         events: eventSpecs,
         budget: shrinkBudget,
@@ -1422,6 +1458,12 @@ interface MinimizeParams<T extends object> {
   /** The sweep's step budget — used only for the fallback repro snippet. */
   readonly steps: number
   readonly mode: 'safety' | 'liveness' | 'both'
+  /**
+   * The sweep's per-macrostep settle budget. Forwarded to every replay so the
+   * acceptance predicate answers the SAME question the sweep asked — a replay at
+   * a different budget could re-classify the very boundary the finding rests on.
+   */
+  readonly maxTurns?: number
   readonly invariants: readonly MachineInvariant<T>[]
   readonly events: readonly CheckEventSpec<T>[]
   readonly budget: OpShrinkBudget
@@ -1451,7 +1493,7 @@ interface MinimizeParams<T extends object> {
 async function minimizeViolation<T extends object>(
   p: MinimizeParams<T>,
 ): Promise<{ minimal?: CheckMinimalRepro; warning?: CheckWarning }> {
-  const { config, ownerSource, target, mode, invariants, events, budget } = p
+  const { config, ownerSource, target, mode, maxTurns, invariants, events, budget } = p
 
   if (ownerSource.kind === 'abstain') {
     return { warning: { kind: 'shrink-skipped', detail: `minimization was skipped: ${ownerSource.reason}` } }
@@ -1475,6 +1517,7 @@ async function minimizeViolation<T extends object>(
       // The candidate stream IS the budget: exactly these ops, nothing after.
       steps: ops.length,
       mode,
+      ...(maxTurns !== undefined ? { maxTurns } : {}),
       invariants,
       events,
       // No `foldGuard` — a replay must not contribute to guard coverage.
@@ -1792,6 +1835,7 @@ async function checkInitialConfiguration<T extends object>(
   owner: OwnerSource<T>,
   invariants: readonly MachineInvariant<T>[],
   seed: string,
+  maxTurns?: number,
 ): Promise<{ violations: Array<{ name: string; witness: string }>; warnings: CheckWarning[] }> {
   const violations: Array<{ name: string; witness: string }> = []
   const warnings: CheckWarning[] = []
@@ -1818,7 +1862,14 @@ async function checkInitialConfiguration<T extends object>(
   try {
     // mode 'safety' (not the caller's mode): the liveness plane may jump the
     // clock, and there is no step budget here for it to analyze anyway.
-    const probe = await runSimulation<T>(() => ({ config, owner: probeOwner }), { seed, steps: 0, mode: 'safety' })
+    const probe = await runSimulation<T>(() => ({ config, owner: probeOwner }), {
+      seed,
+      steps: 0,
+      mode: 'safety',
+      // The construction drain is a settle like any other: a machine whose enter
+      // hooks do a lot of work must get the caller's budget here too.
+      ...(maxTurns !== undefined ? { maxTurns } : {}),
+    })
     trace = probe.trace
   } catch (error) {
     warnings.push({
@@ -1864,12 +1915,13 @@ function mapSimWarning(w: SimWarning): CheckWarning {
   if (w.kind === 'timer-escape') {
     return { kind: 'timer-escape', detail: w.message }
   }
-  // W9 remediation: keep the two warning surfaces consistent — a
-  // `budget-progressing` finding must not be laundered into the
-  // 'residual-rejection' catch-all, which would name a completely different
-  // (and much more alarming) condition than the one observed.
-  if (w.kind === 'budget-progressing') {
-    return { kind: 'budget-progressing', detail: w.message }
+  // Keep the two warning surfaces consistent — neither budget finding may be
+  // laundered into the 'residual-rejection' catch-all, which would name a
+  // completely different (and much more alarming) condition than the one
+  // observed. Both stay ADVISORY: neither kind is in DEGRADATION_KINDS, so
+  // neither can reach the `degradation` FailCause either.
+  if (w.kind === 'budget-progressing' || w.kind === 'budget-frozen') {
+    return { kind: w.kind, detail: w.message }
   }
   return { kind: 'residual-rejection', detail: w.message }
 }

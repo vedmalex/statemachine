@@ -914,6 +914,6 @@ export interface ValidationWarning extends ValidationError {
 // types/monitoring.d.ts:207:9 - (ae-forgotten-export) The symbol "HealthCheckResult" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:208:9 - (ae-forgotten-export) The symbol "PerformanceMonitor" needs to be exported by the entry point index.d.ts
 // types/monitoring.d.ts:209:9 - (ae-forgotten-export) The symbol "MetricsCollector" needs to be exported by the entry point index.d.ts
-// types/types.d.ts:508:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
+// types/types.d.ts:540:5 - (ae-forgotten-export) The symbol "WildcardFrom" needs to be exported by the entry point index.d.ts
 
 ```

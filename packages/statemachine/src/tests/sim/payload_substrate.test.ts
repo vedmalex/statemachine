@@ -170,7 +170,7 @@ describe('W8 §1: an object payload reaches the machine callbacks VERBATIM', () 
   })
 
   it('the explicit-Adapter contract holds: an ADAPTER-SHAPED payload ({get,set}) is NOT mistaken for the adapter', async () => {
-    // The `isAdapter` duck-check is `'set' in inp && 'get' in inp` (types.ts:301).
+    // The `isAdapter` duck-check is `'set' in inp && 'get' in inp` (types.ts `isAdapter`, ~:725-726).
     // The driver passes the wrapped Adapter EXPLICITLY at position 2, so a payload
     // that happens to look like an Adapter lands at position 3 and is delivered as
     // a plain argument — it must NOT be unshifted (state_machine.ts:469-471) nor
@@ -417,18 +417,36 @@ describe('W8 §3: the fault path is payload-IDENTICAL to the no-fault path', () 
  * to '4' the previous table passes UNCHANGED (32/32), which proves the progress
  * discriminator added to the settle pump does not alter behaviour on any corpus
  * run — only the schema version moved.
+ *
+ * ## REBASED AGAIN ('5' -> '6') — settleReason on the init and pre-fire drains
+ * The driver now records the settle REASON on two paths that always dropped it:
+ * the mandatory post-construction drain (frame 0 and every during-drain init
+ * frame) and the step's PRE-fire drain (whose result was discarded outright).
+ * `settleReason` is a hashed `TraceFrame` field, so populating it on a new path is
+ * corpus-breaking by the same rule as before.
+ *
+ * Attribution VERIFIED by the SAME experiment: with `version` pinned back to '5'
+ * and NOTHING else reverted, this file passes 32/32 with the '5' table above
+ * restored EXACTLY. That is a stronger result than the previous two rebases —
+ * it proves the new stamps changed no corpus hash AT ALL, because no corpus run
+ * is ever non-quiescent on its init or pre-fire drain. The only moving part was
+ * the version string itself.
+ *
+ * The same observation is load-bearing elsewhere: the corpus provably never
+ * enters the budget-exhaustion path, so it is NOT evidence that the exhaustion
+ * classification is false-positive-free (see docs/dynamic-check.md).
  */
 const CORPUS_HASHES: ReadonlyArray<readonly [bigint, string]> = [
-  [0n, 'd93f984b365b8cdc'],
-  [1n, '7c56cb7a6d199296'],
-  [3n, '0b7090d495b71b48'],
-  [4n, 'dd43af4dbb4ece67'],
-  [5n, '18cb8fe02258588b'],
-  [6n, 'd57b4e15064fba82'],
-  [7n, '38d89edc3348febc'],
-  [8n, '430c335966f3443c'],
-  [42n, 'ecbd7ad3f08a3330'],
-  [12345n, 'bfed0e6348e5945b'],
+  [0n, '70ff65b42191b8e1'],
+  [1n, 'fcab6c8579db4979'],
+  [3n, '00571deb78c07da5'],
+  [4n, '97d84c02f42430ea'],
+  [5n, '810bc2777642d6ce'],
+  [6n, '900feaca33a2ecb7'],
+  [7n, '68a9fcb3e81d46d7'],
+  [8n, 'c530684eb816d0e9'],
+  [42n, 'bcec1cfc061d41b1'],
+  [12345n, '901bb08cdb0547ba'],
 ]
 
 describe('W8 §4: the generated corpus replays to its PINNED traceHash', () => {

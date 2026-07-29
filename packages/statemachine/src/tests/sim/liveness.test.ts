@@ -163,10 +163,36 @@ describe('five-kind quiescence classifier (DoD 8)', () => {
 // ── budget overruns surface as TIMEOUT_BUDGET_EXCEEDED (never throw) ───────────
 
 describe('liveness budget findings', () => {
-  it('settleMacrostep microtask-budget exhaustion surfaces as TIMEOUT_BUDGET_EXCEEDED', () => {
-    const r = analyzeLiveness([sample({})], { ...PARAMS, microtaskBudgetExhausted: true })
-    expect(r.verdict).toBe('TIMEOUT_BUDGET_EXCEEDED')
-    expect(r.reason).toMatch(/microtask-budget/)
+  /**
+   * CHANGED BY DESIGN. This case used to assert that `LivenessParams
+   * .microtaskBudgetExhausted: true` returns TIMEOUT_BUDGET_EXCEEDED. Both the
+   * field and its branch are GONE, and the assertion is not merely obsolete —
+   * it pinned an UNSOUND rule.
+   *
+   * The settle pump's budget exhaustion is a TRUNCATED observation. When the pump
+   * stops at `maxTurns`, the prefix left by an `onEnter` hook that finishes at
+   * turn 2000 is byte-identical to the prefix left by one that never finishes
+   * (an awaited hook is not counted in `inFlightAsyncCount`, so the settle
+   * fingerprint is frozen either way, with no timer armed). Feeding that into a
+   * verdict convicted a CORRECT machine: `slow.onEnter = async () => { for (let
+   * i=0;i<N;i++) await Promise.resolve() }` reaches `slow` for every N, yet
+   * failed at N>=1000 and passed at N<=100 — the deciding variable was the
+   * internal `DEFAULT_MAX_TURNS`, never the machine.
+   *
+   * What replaces it: the exhaustion is surfaced as an advisory `SimWarning`
+   * (`budget-progressing` / `budget-frozen`) that never touches `ok`. This test
+   * now pins the ABSENCE of the verdict path, so re-wiring it fails here.
+   */
+  it('a budget-exhausted settle reaches NO liveness verdict (the unsound wiring is gone)', () => {
+    const r = analyzeLiveness([sample({})], PARAMS)
+    expect(r.verdict).toBe('PROGRESSED')
+    // No spelling of the removed flag can re-enter through the params object.
+    const withRemovedFlag = analyzeLiveness([sample({})], {
+      ...PARAMS,
+      microtaskBudgetExhausted: true,
+    } as unknown as typeof PARAMS)
+    expect(withRemovedFlag.verdict).toBe('PROGRESSED')
+    expect(withRemovedFlag.reason).toBeUndefined()
   })
 
   it('a virtual-time budget overrun surfaces as TIMEOUT_BUDGET_EXCEEDED', () => {

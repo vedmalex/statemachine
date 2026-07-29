@@ -8,10 +8,21 @@
  * break — so a CORRECT machine failed the verdict, and I-3 sits in the DEFAULT
  * builtin set, meaning every consumer would have hit it.
  *
- * The discriminator is whether the observable fingerprint EVER moved: a wedged
- * drain never moves, a working one does. Exhaustion WITH progress is now
- * `budget-progressing` (a budget/liveness concern, excluded by I-3); exhaustion
- * with NO progress stays `microtask-budget` and stays an I-3 witness.
+ * The discriminator is RECENCY, not the sticky "EVER moved" flag this comment
+ * used to describe. A sticky flag marked the whole settle "progressing" as soon
+ * as anything moved anywhere — and since `prev` is sampled with the fired event
+ * already queued, the first pump turn always moved it, so every fire-initiated
+ * settle was `progressing` forever. The live rule is: exhaustion counts as
+ * `budget-progressing` only if the fingerprint moved WITHIN the recency window of
+ * the cutoff (`progressRecencyWindow(maxTurns)`, nominally 64 and capped at half
+ * the budget); otherwise `microtask-budget`. A machine that hops once and THEN
+ * freezes is therefore `microtask-budget`, which `budget_wedge.test.ts` pins.
+ *
+ * NEITHER value is a verdict any more. Both are advisory warnings: a budget
+ * exhaustion is a truncated observation and cannot convict. I-3 excludes both,
+ * and this file's assertions are about CLASSIFICATION and about the run staying
+ * `ok:true` — the latter now holds for the wedged flavour too, which is
+ * `budget_wedge.test.ts`'s business rather than this file's.
  */
 import { describe, expect, it } from 'vitest'
 import { runSimulation } from '../../sim/public'

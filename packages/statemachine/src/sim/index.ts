@@ -80,7 +80,12 @@ export type { CapturedWrite, CaptureSink } from './capture'
 // --- Step-3 driver + settle primitive + harness env (VALUE symbols) ---
 export { SimDriver } from './driver'
 export type { DriverConfig, DriverOp, DriverStepResult } from './driver'
-export { DEFAULT_MAX_TURNS, settleMacrostep } from './settle'
+export {
+  DEFAULT_MAX_TURNS,
+  PROGRESS_RECENCY_WINDOW,
+  progressRecencyWindow,
+  settleMacrostep,
+} from './settle'
 export type {
   SettleArgs,
   SettlePolicy,

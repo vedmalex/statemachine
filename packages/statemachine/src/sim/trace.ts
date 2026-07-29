@@ -71,13 +71,25 @@ export interface TraceFrame {
   readonly faultApplied?: FaultKind
   readonly fireOutcome?: FireOutcome
   /**
-   * Why the settle did NOT reach quiescence (only populated when
-   * `quiescent === false`) — the {@link SettleReason} the macrostep returned. This
-   * is DETERMINISTIC content (never wall-clock): a WAITING_ON_* boundary is a
-   * DOCUMENTED, legitimate non-quiescence (a concurrent region's own future timer /
-   * transitionTimeout), which the I-3 RTC-serialization oracle MUST NOT mistake for
-   * a real serialization break. Absent on quiescent frames — so it perturbs the
-   * content hash ONLY for scenarios that were genuinely non-quiescent. (C1 fix.)
+   * Why a settle of this step did NOT reach quiescence — the {@link SettleReason}
+   * the macrostep returned. This is DETERMINISTIC content (never wall-clock): a
+   * WAITING_ON_* boundary is a DOCUMENTED, legitimate non-quiescence (a concurrent
+   * region's own future timer / transitionTimeout), which the I-3
+   * RTC-serialization oracle MUST NOT mistake for a real serialization break.
+   * Absent on a step whose every settle converged — so it perturbs the content
+   * hash ONLY for scenarios that were genuinely non-quiescent. (C1 fix.)
+   *
+   * WHICH settle. Normally the one whose outcome {@link quiescent} also reports:
+   * the step's post-fire drain, or the construction drain for a `cause:'init'`
+   * frame. A step also runs a PRE-fire drain (after any clock advance, before the
+   * op) whose result was previously discarded entirely; when THAT one failed to
+   * converge and the post-fire one succeeded, its reason is recorded here instead
+   * — otherwise a budget exhaustion that the following fire happened to clear
+   * would leave no trace at all, and the advisory budget warnings would
+   * under-count. In that case (and only that case) `quiescent` is `true` while
+   * this field is present: the step DID end settled, and the reason describes an
+   * earlier drain within the same step. Oracles key on `quiescent === false`
+   * first, so the combination cannot manufacture a violation.
    */
   readonly settleReason?: SettleReason
   /**

@@ -146,20 +146,35 @@ export interface LivenessParams {
    * TIMEOUT_BUDGET_EXCEEDED. Exceeding it ⇒ TIMEOUT_BUDGET_EXCEEDED.
    */
   readonly budgetVirtualMs: number
-  /**
-   * If the underlying settleMacrostep returned a `microtask-budget`
-   * non-quiescence, the harness sets this so the liveness verdict surfaces it.
-   */
-  readonly microtaskBudgetExhausted?: boolean
+  // REMOVED — `microtaskBudgetExhausted`. It carried the settle pump's
+  // `'microtask-budget'` exhaustion into a TIMEOUT_BUDGET_EXCEEDED verdict, which
+  // forces `ok:false` and is a HARD `FailCause` that `failOn` cannot relax.
+  //
+  // WHY IT CANNOT BE FED AGAIN. A budget exhaustion is a TRUNCATED observation,
+  // and a truncated observation cannot support a verdict. When the pump stops at
+  // `maxTurns` the prefix it saw from an `onEnter` hook that finishes at turn 2000
+  // is byte-identical to the prefix from a hook that never finishes: enter/exit
+  // hooks are deliberately excluded from `inFlightAsyncCount` (driver.ts), so
+  // while one runs `queueTotal|isProcessingEvents|inFlightAsyncCount` is frozen
+  // and no timer is armed. The producer that used to live in `public.ts`
+  // convicted exactly such a correct machine. This is the same indistinguishability
+  // argument the zero-delay livelock already rests on (docs/dynamic-check.md).
+  //
+  // Both budget outcomes are now surfaced as advisory WARNINGS on `SimResult`
+  // (`budget-progressing` / `budget-frozen`) and reach no verdict path. The field
+  // is deleted rather than left unfed so it cannot read as a wiring gap someone
+  // is invited to close.
 }
 
 /**
  * Analyze a sequence of per-step liveness samples into a {@link LivenessResult}.
  *
  * Rules (ADR-6):
- *  - The settleMacrostep `microtask-budget` non-quiescence surfaces as
- *    TIMEOUT_BUDGET_EXCEEDED (a liveness finding, never a throw).
- *  - A virtual-time budget overrun ⇒ TIMEOUT_BUDGET_EXCEEDED.
+ *  - A virtual-time budget overrun ⇒ TIMEOUT_BUDGET_EXCEEDED. The settle pump's
+ *    microtask-budget exhaustion deliberately does NOT reach this analyzer — it
+ *    is a truncated observation, not a liveness fact (see {@link LivenessParams}).
+ *    Virtual TIME, by contrast, only advances when the machine actually armed the
+ *    deadlines that moved it, so an overrun there is a positive observation.
  *  - A configuration cycle within the healthy window — the SAME normalized
  *    fingerprint recurs after K = stateCount + 1 distinct steps while
  *    `resolve-true` keeps firing without terminal progress ⇒ STUCK
@@ -180,14 +195,11 @@ export function analyzeLiveness(
   const last = samples[samples.length - 1]
   const finalQuiescence = last !== undefined ? classifyQuiescence(last) : 'QUIESCENT_NO_WORK'
 
-  // (0) microtask-budget livelock from settleMacrostep → liveness finding.
-  if (params.microtaskBudgetExhausted === true) {
-    return {
-      verdict: 'TIMEOUT_BUDGET_EXCEEDED',
-      quiescence: finalQuiescence,
-      reason: 'macrostep microtask-budget exhausted',
-    }
-  }
+  // (0) REMOVED — the settle pump's microtask-budget exhaustion used to return
+  // TIMEOUT_BUDGET_EXCEEDED here. See the note on LivenessParams: a
+  // budget-truncated observation cannot support a verdict, and this branch
+  // convicted a correct machine whose `onEnter` hook simply did a lot of finite
+  // internal work.
 
   // (1) virtual-time budget overrun.
   if (last !== undefined && last.t > params.budgetVirtualMs) {

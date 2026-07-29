@@ -228,6 +228,23 @@ export interface SimOptions {
    *    violation fingerprint / a user-invariant witness), never the hash.
    */
   readonly script?: readonly DriverOp[]
+  /**
+   * The per-macrostep microtask-pump budget handed to EVERY settle of this run
+   * (`settleMacrostep`'s `maxTurns`). **Default: 1024** ({@link DEFAULT_MAX_TURNS}).
+   *
+   * The drain pumps microtasks until the machine reaches a joint fixed point or
+   * this budget runs out. Exhaustion is never a verdict — it is a TRUNCATED
+   * observation, reported as a `budget-progressing` / `budget-frozen`
+   * {@link SimWarning} — and this is the knob those warnings' advice presupposes:
+   * an `onEnter` hook doing a large but FINITE amount of internal microtask work
+   * looks exactly like a wedged one over any fixed window, and raising the budget
+   * is what separates them (a finite hook eventually completes).
+   *
+   * Raise it when a run reports either budget warning and you want to know which
+   * of the two readings is the real one. Cost is bounded by the value itself:
+   * each turn is one `await Promise.resolve()`.
+   */
+  readonly maxTurns?: number
   readonly onTrace?: (frame: TraceFrame) => void
 }
 
@@ -280,6 +297,19 @@ export interface SimWarning {
      * `count` carries how many boundaries hit it.
      */
     | 'budget-progressing'
+    /**
+     * The HARNESS ran out of per-macrostep turn budget and the machine had
+     * ALREADY stopped moving before it did (`settleReason:'microtask-budget'`).
+     *
+     * Advisory only, and for the same reason as its sibling: this is a TRUNCATED
+     * observation. A genuine wedge and a hook doing a large but finite amount of
+     * internal microtask work leave byte-identical prefixes — an awaited
+     * `onEnter`/`onExit` is not counted in `inFlightAsyncCount`, so while one runs
+     * the settle fingerprint is frozen either way. Raising `maxTurns` separates
+     * them: a finite hook eventually completes. Emitted at most ONCE per run;
+     * `count` carries how many boundaries hit it.
+     */
+    | 'budget-frozen'
   readonly message: string
   readonly count?: number
 }
@@ -523,11 +553,12 @@ function emptyHeader(seed: string): CanonicalHeader {
     seed,
     configHash: '',
     engine: '@vedmalex/statemachine',
-    // '5': kept in lockstep with the driver's canonical header (C1 settleReason +
+    // '6': kept in lockstep with the driver's canonical header (C1 settleReason +
     // U1 WAITING_ON_INTERNAL re-semantization + W8/V5b doneDelta now populated on
-    // the verdict path + W9/Г2 the SettleReason union gaining 'budget-progressing').
+    // the verdict path + W9/Г2 the SettleReason union gaining 'budget-progressing'
+    // + settleReason now populated on the init and pre-fire drains).
     // See driver.ts for the full version rationale.
-    version: '5',
+    version: '6',
     runtime: 'node-sim-v1',
     prngVersion: 'splitmix64-bigint-v1',
     errorHandlerEnabled: true,
@@ -593,6 +624,8 @@ export class Simulator<T extends object = object> {
    * the SAME bound). Absent ⇒ I-9 vacuous (A3).
    */
   private readonly maxQueueDepth: number | undefined
+  /** The per-macrostep settle budget (SimOptions.maxTurns); undefined ⇒ the default. */
+  private readonly maxTurns: number | undefined
   /**
    * W8: the consumer-supplied payload generator (opts.eventPayload). Absent ⇒ the
    * arg-free pre-W8 behavior AND zero payload PRNG work.
@@ -666,6 +699,8 @@ export class Simulator<T extends object = object> {
     // CheckerContext (I-9 reads the SAME bound) so a flood past the bound is caught,
     // not silently accepted. Absent ⇒ I-9 stays vacuous (documented, not fake).
     this.maxQueueDepth = opts.maxQueueDepth
+    // Absent ⇒ settleMacrostep's DEFAULT_MAX_TURNS (1024), unchanged behaviour.
+    this.maxTurns = opts.maxTurns
     // W8: absent ⇒ arg-free fuzzing, and `pickOp` makes ZERO extra PRNG draws.
     this.eventPayload = opts.eventPayload
     // W9/Г3: absent ⇒ PRNG-driven op selection, unchanged.
@@ -714,6 +749,8 @@ export class Simulator<T extends object = object> {
       ...(this.faults.faults.length > 0 ? { faults: this.faults } : {}),
       // A3 (I-9): forward the queue-depth bound so the engine enforces it.
       ...(this.maxQueueDepth !== undefined ? { maxQueueDepth: this.maxQueueDepth } : {}),
+      // Forward the settle budget to EVERY drain the driver makes.
+      ...(this.maxTurns !== undefined ? { maxTurns: this.maxTurns } : {}),
     })
     this.driver = driver
     this.machine = driver.machine
@@ -880,22 +917,16 @@ export class Simulator<T extends object = object> {
     // becomes a livelocks[] headline and forces ok:false. C2 (progress-aware
     // self-loop) must precede this so a legitimate progressing self-loop is not a
     // false STUCK once analyzeLiveness is authoritative for the verdict.
-    // W9 remediation: `LivenessParams.microtaskBudgetExhausted` had NO producer —
-    // `analyzeLiveness` consumed a flag nobody ever set, so a wedged drain never
-    // reached the liveness verdict. It is fed HERE, from the trace the run
-    // actually produced.
-    //
-    // CRITICAL — read `'microtask-budget'` ONLY, NEVER `'budget-progressing'`.
-    // They are both budget exhaustions, but they mean opposite things: the first
-    // is a wedged drain (no recent observable movement), the second is a long yet
-    // perfectly LEGAL delay-0 chain that simply outran the turn budget. Routing
-    // `'budget-progressing'` in here would re-create exactly the false positive
-    // this whole wave removed — a correct machine convicted of a livelock. The
-    // budget-progressing case is surfaced as an advisory WARNING below instead.
-    const microtaskBudgetExhausted = trace.frames.some(
-      (f) => f.settleReason === 'microtask-budget',
-    )
-
+    // NO budget→verdict producer here, deliberately. A `'microtask-budget'`
+    // exhaustion used to be routed into `LivenessParams.microtaskBudgetExhausted`,
+    // which returns TIMEOUT_BUDGET_EXCEEDED — an `ok:false` livelock headline and,
+    // through `checkMachine`, the HARD non-relaxable `livelock` FailCause. It
+    // convicted a CORRECT machine: `slow.onEnter = async () => { for (let
+    // i=0;i<N;i++) await Promise.resolve() }` reaches `slow` for every N, but
+    // failed at N>=1000 and passed at N<=100 — the deciding variable was
+    // `DEFAULT_MAX_TURNS`, not the machine. A budget-truncated window cannot
+    // distinguish a hook that finishes late from one that never finishes, so it
+    // cannot convict either. Both flavours are surfaced as WARNINGS below.
     let liveness: LivenessResult | undefined
     let livelocks: readonly LivenessResult[] | undefined
     if (this.livenessEnabled) {
@@ -903,7 +934,6 @@ export class Simulator<T extends object = object> {
       liveness = analyzeLiveness(samples, {
         stateCount: this.stateCount,
         budgetVirtualMs: LIVENESS_VIRTUAL_BUDGET_MS,
-        microtaskBudgetExhausted,
       })
       if (liveness.verdict !== 'PROGRESSED') {
         livelocks = [liveness]
@@ -934,13 +964,13 @@ export class Simulator<T extends object = object> {
           'the RAISE observation buffer was truncated: the parallel-join oracle (I-5) went VACUOUS for this run because a counting predicate over a truncated raise stream cannot distinguish a dropped record from a missing raise',
       })
     }
-    // W9 remediation: a `budget-progressing` boundary is NOT a defect — the machine
-    // was still observably moving when the harness ran out of per-macrostep turns.
-    // It is also not nothing: the run stopped watching before the machine finished,
-    // so anything that would have happened later went unchecked. Surfaced as an
-    // advisory warning (never a verdict — `ok` is untouched) and DEDUPED to one per
-    // run: a long chain trips it on every step, and N identical warnings would bury
-    // the report without adding information. `count` carries the multiplicity.
+    // BOTH budget exhaustions are surfaced, as warnings, and NEITHER reaches a
+    // verdict. They are the entire signal a truncated observation can carry, so
+    // suppressing one of them would leave the consumer with nothing where the
+    // harness previously (and wrongly) gave a verdict. They stay DISTINCT kinds
+    // because the follow-up question differs. Each is DEDUPED to one warning per
+    // run — a long chain trips its boundary on every step, and N identical
+    // warnings would bury the report — with `count` carrying the multiplicity.
     const progressingFrames = trace.frames.filter(
       (f) => f.settleReason === 'budget-progressing',
     ).length
@@ -948,8 +978,17 @@ export class Simulator<T extends object = object> {
       warnings.push({
         kind: 'budget-progressing',
         message:
-          'the per-macrostep turn budget was exhausted while the machine was still making observable progress, so this run stopped watching before the machine settled. The drain resumes on the NEXT step, so raising `steps` gives the machine more total budget to finish in: a finite chain of zero-delay hops does eventually settle that way, a real livelock reports this at every `steps` value you try — which is the signal to go looking for one.',
+          'the per-macrostep turn budget was exhausted while the machine was still making observable progress: it was working when this run stopped watching it. The drain resumes on the NEXT step, so raising `steps` gives the machine more total budget to finish in, and `maxTurns` raises the per-macrostep budget directly (default 1024). A finite chain of zero-delay hops does eventually settle that way; a real livelock reports this at every value you try — which is the signal to go looking for one.',
         count: progressingFrames,
+      })
+    }
+    const frozenFrames = trace.frames.filter((f) => f.settleReason === 'microtask-budget').length
+    if (frozenFrames > 0) {
+      warnings.push({
+        kind: 'budget-frozen',
+        message:
+          'the per-macrostep turn budget was exhausted and the machine had already stopped moving before it ran out: no queue, processing-flag or in-flight-async change was observed in the turns leading up to the cutoff. This harness CANNOT tell a genuine wedge from a hook doing a large amount of internal work — an awaited `onEnter`/`onExit` is not tracked as in-flight async, so a finite one freezes exactly the same observables as an infinite one. Raise `maxTurns` (default 1024) to distinguish them: a finite hook eventually completes and the run goes quiescent, a genuine wedge reports this at every budget you try.',
+        count: frozenFrames,
       })
     }
     if (guardReport.timerEscapes > 0) {
